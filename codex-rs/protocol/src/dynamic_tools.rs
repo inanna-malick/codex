@@ -12,6 +12,7 @@ use ts_rs::TS;
 #[ts(tag = "type", export_to = "v2/")]
 pub enum DynamicToolSpec {
     Function(DynamicToolFunctionSpec),
+    Custom(DynamicToolCustomSpec),
     Namespace(DynamicToolNamespaceSpec),
 }
 
@@ -29,6 +30,28 @@ pub struct DynamicToolFunctionSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct DynamicToolCustomSpec {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer_loading: bool,
+    #[serde(default)]
+    #[ts(optional)]
+    pub format: Option<DynamicToolCustomFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct DynamicToolCustomFormat {
+    pub r#type: String,
+    pub syntax: String,
+    pub definition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct DynamicToolNamespaceSpec {
     pub name: String,
     pub description: String,
@@ -40,6 +63,7 @@ pub struct DynamicToolNamespaceSpec {
 #[ts(tag = "type", export_to = "v2/")]
 pub enum DynamicToolNamespaceTool {
     Function(DynamicToolFunctionSpec),
+    Custom(DynamicToolCustomSpec),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]

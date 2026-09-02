@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::app::reconnect::ReconnectPresentation;
+use crate::app::reconnect::ReconnectTooling;
 use crate::app::reconnect::reconnect;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -203,7 +204,10 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             app.local_settings.clone(),
             Some(id),
             /*remote_cwd*/ None,
-            transport,
+            ReconnectTooling {
+                task_tools: transport,
+                host_dynamic_tools: None,
+            },
             ReconnectPresentation::Conversation,
         )
         .await?;
@@ -340,7 +344,10 @@ async fn reconnect_exhaustion_and_unknown_initial_thread_stay_offline() -> Resul
                 app.local_settings.clone(),
                 id,
                 /*remote_cwd*/ None,
-                crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+                ReconnectTooling {
+                    task_tools: crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+                    host_dynamic_tools: None,
+                },
                 ReconnectPresentation::Conversation
             )
             .await
@@ -392,7 +399,10 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
             app.local_settings.clone(),
             Some(id),
             /*remote_cwd*/ None,
-            crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+            ReconnectTooling {
+                task_tools: crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+                host_dynamic_tools: None,
+            },
             ReconnectPresentation::Conversation,
         )
         .await;

@@ -1,6 +1,7 @@
 use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
@@ -36,6 +37,14 @@ pub struct Cli {
     /// Internal: include non-interactive sessions in resume listings.
     #[clap(skip)]
     pub resume_include_non_interactive: bool,
+
+    /// Connect to an experimental host dynamic-tool service over HTTP on this Unix socket.
+    #[arg(
+        long = "host-dynamic-tools-socket",
+        value_name = "ABSOLUTE_PATH",
+        value_parser = parse_absolute_socket_path
+    )]
+    pub host_dynamic_tools_socket: Option<AbsolutePathBuf>,
 
     /// Internal: open the daemon-wide agents overview instead of starting a thread.
     #[clap(skip)]
@@ -77,6 +86,11 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+fn parse_absolute_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
+    AbsolutePathBuf::from_absolute_path_checked(raw)
+        .map_err(|err| format!("invalid host dynamic-tools socket path `{raw}`: {err}"))
 }
 
 impl std::ops::Deref for Cli {

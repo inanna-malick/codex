@@ -154,6 +154,8 @@ impl AppServerSession {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
         }
+        self.attach_host_primary_if_applicable(started.session.thread_id)
+            .await?;
         Ok(started)
     }
 }

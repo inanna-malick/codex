@@ -5,6 +5,7 @@
 use super::*;
 use crate::app_server_session::ResumeModelSettings;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
+use crate::host_dynamic_tools::HostDynamicTools;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum ReconnectPresentation {
@@ -26,15 +27,24 @@ pub(super) struct Reconnected {
     thread: Option<AppServerStartedThread>,
 }
 
+pub(super) struct ReconnectTooling {
+    pub(super) task_tools: ThreadToolTransport,
+    pub(super) host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+}
+
 pub(super) async fn reconnect(
     target: AppServerTarget,
     config: Config,
     local_settings: crate::local_settings::LocalSettings,
     thread_id: Option<ThreadId>,
     remote_cwd: Option<PathBuf>,
-    task_tools: ThreadToolTransport,
+    tooling: ReconnectTooling,
     presentation: ReconnectPresentation,
 ) -> Result<Reconnected> {
+    let ReconnectTooling {
+        task_tools,
+        host_dynamic_tools,
+    } = tooling;
     let mode = target.thread_params_mode();
     let endpoint = match target {
         AppServerTarget::Remote { endpoint } | AppServerTarget::LocalDaemon { endpoint } => {
@@ -62,8 +72,12 @@ pub(super) async fn reconnect(
             let mut session = AppServerSession::new(client, mode)
                 .with_startup_config(&config)
                 .with_remote_cwd_override(remote_cwd.clone())
-                .with_thread_tool_transport(task_tools.clone());
+                .with_thread_tool_transport(task_tools.clone())
+                .with_host_dynamic_tools(host_dynamic_tools.clone());
             let bootstrap = session.bootstrap(&config).await?;
+            if let Some(host) = &host_dynamic_tools {
+                host.revalidate_registration().await?;
+            }
             let thread = if let Some(thread_id) = thread_id {
                 match session
                     .resume_thread(

@@ -4,12 +4,14 @@ use super::ResponsesApiNamespace;
 use super::ResponsesApiNamespaceTool;
 use super::ResponsesApiTool;
 use super::agent_plugin_mcp_tool_to_responses_api_tool;
+use super::dynamic_custom_tool_to_responses_api_tool;
 use super::dynamic_tool_to_responses_api_tool;
 use super::mcp_tool_to_deferred_responses_api_tool;
 use super::tool_definition_to_responses_api_tool;
 use crate::JsonSchema;
 use crate::ToolDefinition;
 use crate::ToolName;
+use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -111,6 +113,30 @@ fn dynamic_tool_to_responses_api_tool_preserves_defer_loading() {
                 Some(false.into())
             ),
             output_schema: None,
+        }
+    );
+}
+
+#[test]
+fn dynamic_custom_tool_defaults_to_unrestricted_freeform_grammar() {
+    let tool = DynamicToolCustomSpec {
+        name: "tidepool".to_string(),
+        description: "Evaluate a Tidepool Haskell program".to_string(),
+        defer_loading: false,
+        format: None,
+    };
+
+    assert_eq!(
+        dynamic_custom_tool_to_responses_api_tool(&tool),
+        FreeformTool {
+            name: "tidepool".to_string(),
+            description: "Evaluate a Tidepool Haskell program".to_string(),
+            defer_loading: None,
+            format: super::FreeformToolFormat {
+                r#type: "grammar".to_string(),
+                syntax: "lark".to_string(),
+                definition: "start: SOURCE\nSOURCE: /[\\s\\S]+/".to_string(),
+            },
         }
     );
 }

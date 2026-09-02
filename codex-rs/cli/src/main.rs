@@ -2821,6 +2821,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         web_search,
         no_alt_screen,
         prompt,
+        host_dynamic_tools_socket,
         mut config_overrides,
         ..
     } = subcommand_cli;
@@ -2840,6 +2841,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         interactive.web_search = true;
     }
     interactive.no_alt_screen |= no_alt_screen;
+    if let Some(socket_path) = host_dynamic_tools_socket {
+        interactive.host_dynamic_tools_socket = Some(socket_path);
+    }
     if strict_config {
         interactive.strict_config = true;
     }
@@ -3940,6 +3944,38 @@ mod tests {
             assert!(finalize(&["codex", command, "--no-alt-screen"]).no_alt_screen);
             assert!(finalize(&["codex", "--no-alt-screen", command]).no_alt_screen);
             assert!(!finalize(&["codex", command]).no_alt_screen);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_and_fork_preserve_host_dynamic_tools_socket() {
+        for (command, finalize) in [
+            ("resume", finalize_resume_from_args as fn(&[&str]) -> TuiCli),
+            ("fork", finalize_fork_from_args as fn(&[&str]) -> TuiCli),
+        ] {
+            for args in [
+                vec![
+                    "codex",
+                    command,
+                    "--host-dynamic-tools-socket",
+                    "/tmp/host.sock",
+                ],
+                vec![
+                    "codex",
+                    "--host-dynamic-tools-socket",
+                    "/tmp/host.sock",
+                    command,
+                ],
+            ] {
+                assert_eq!(
+                    finalize(&args)
+                        .host_dynamic_tools_socket
+                        .as_ref()
+                        .map(AbsolutePathBuf::as_path),
+                    Some(std::path::Path::new("/tmp/host.sock"))
+                );
+            }
         }
     }
 

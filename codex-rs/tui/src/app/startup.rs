@@ -29,6 +29,7 @@ fn spawn_startup_thread_start(
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
     let thread_tool_transport = app_server.thread_tool_transport();
+    let host_dynamic_tools = app_server.host_dynamic_tools();
     tokio::spawn(async move {
         let result = crate::app_server_session::start_thread_with_request_handle(
             request_handle,
@@ -36,6 +37,7 @@ fn spawn_startup_thread_start(
             thread_params_mode,
             remote_cwd_override,
             thread_tool_transport,
+            host_dynamic_tools,
         )
         .await;
         app_event_tx.send(AppEvent::StartupThreadStarted { result });
@@ -746,7 +748,10 @@ See the Codex keymap documentation for supported actions and examples."
                         app.local_settings.clone(),
                         app.current_displayed_thread_id(),
                         app_server.remote_cwd_override().map(Path::to_path_buf),
-                        app_server.thread_tool_transport(),
+                        reconnect::ReconnectTooling {
+                            task_tools: app_server.thread_tool_transport(),
+                            host_dynamic_tools: app_server.host_dynamic_tools(),
+                        },
                         app.reconnect.presentation,
                     )));
                 }

@@ -123,6 +123,8 @@ export type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputCo
 export type { DynamicToolCallParams } from "./DynamicToolCallParams";
 export type { DynamicToolCallResponse } from "./DynamicToolCallResponse";
 export type { DynamicToolCallStatus } from "./DynamicToolCallStatus";
+export type { DynamicToolCustomFormat } from "./DynamicToolCustomFormat";
+export type { DynamicToolCustomSpec } from "./DynamicToolCustomSpec";
 export type { DynamicToolFunctionSpec } from "./DynamicToolFunctionSpec";
 export type { DynamicToolNamespaceSpec } from "./DynamicToolNamespaceSpec";
 export type { DynamicToolNamespaceTool } from "./DynamicToolNamespaceTool";

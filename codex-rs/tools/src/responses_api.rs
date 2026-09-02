@@ -5,12 +5,14 @@ use crate::parse_agent_plugin_mcp_tool;
 use crate::parse_dynamic_tool;
 use crate::parse_mcp_tool;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
+use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
 const MAX_SERIALIZED_MCP_TOOL_BYTES: usize = 8_000;
+const DEFAULT_FREEFORM_GRAMMAR: &str = "start: SOURCE\nSOURCE: /[\\s\\S]+/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FreeformTool {
@@ -85,6 +87,28 @@ pub fn dynamic_tool_to_responses_api_tool(
     Ok(tool_definition_to_responses_api_tool(parse_dynamic_tool(
         tool,
     )?))
+}
+
+pub fn dynamic_custom_tool_to_responses_api_tool(tool: &DynamicToolCustomSpec) -> FreeformTool {
+    let format = tool
+        .format
+        .as_ref()
+        .map(|format| FreeformToolFormat {
+            r#type: format.r#type.clone(),
+            syntax: format.syntax.clone(),
+            definition: format.definition.clone(),
+        })
+        .unwrap_or_else(|| FreeformToolFormat {
+            r#type: "grammar".to_string(),
+            syntax: "lark".to_string(),
+            definition: DEFAULT_FREEFORM_GRAMMAR.to_string(),
+        });
+    FreeformTool {
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        defer_loading: tool.defer_loading.then_some(true),
+        format,
+    }
 }
 
 pub fn coalesce_loadable_tool_specs(

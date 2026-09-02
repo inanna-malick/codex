@@ -736,6 +736,25 @@
       ],
       "type": "string"
     },
+    "DynamicToolCustomFormat": {
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "definition",
+        "syntax",
+        "type"
+      ],
+      "type": "object"
+    },
     "DynamicToolNamespaceTool": {
       "oneOf": [
         {
@@ -765,6 +784,44 @@
             "type"
           ],
           "title": "FunctionDynamicToolNamespaceTool",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DynamicToolCustomFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "title": "CustomDynamicToolNamespaceToolType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "type"
+          ],
+          "title": "CustomDynamicToolNamespaceTool",
           "type": "object"
         }
       ]
@@ -798,6 +855,44 @@
             "type"
           ],
           "title": "FunctionDynamicToolSpec",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DynamicToolCustomFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "title": "CustomDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "type"
+          ],
+          "title": "CustomDynamicToolSpec",
           "type": "object"
         },
         {

@@ -1368,19 +1368,31 @@ fn append_dynamic_tool_runtimes(dynamic_tools: &[DynamicToolSpec], registry: &mu
                 };
                 registry.register_external(Arc::new(handler));
             }
+            DynamicToolSpec::Custom(tool) => {
+                registry.register_external(Arc::new(DynamicToolHandler::new_custom(tool)));
+            }
             DynamicToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
-                    let DynamicToolNamespaceTool::Function(tool) = tool;
-                    let Some(handler) = DynamicToolHandler::new_in_namespace(namespace, tool)
-                    else {
-                        tracing::error!(
-                            "Failed to convert dynamic tool {:?}.{:?} to OpenAI tool",
-                            namespace.name,
-                            tool.name
-                        );
-                        continue;
-                    };
-                    registry.register_external(Arc::new(handler));
+                    match tool {
+                        DynamicToolNamespaceTool::Function(tool) => {
+                            let Some(handler) =
+                                DynamicToolHandler::new_in_namespace(namespace, tool)
+                            else {
+                                tracing::error!(
+                                    "Failed to convert dynamic tool {:?}.{:?} to OpenAI tool",
+                                    namespace.name,
+                                    tool.name
+                                );
+                                continue;
+                            };
+                            registry.register_external(Arc::new(handler));
+                        }
+                        DynamicToolNamespaceTool::Custom(tool) => {
+                            registry.register_external(Arc::new(
+                                DynamicToolHandler::new_custom_in_namespace(namespace, tool),
+                            ));
+                        }
+                    }
                 }
             }
         }
