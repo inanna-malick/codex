@@ -9,6 +9,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
+use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -23,6 +24,7 @@ use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
+use codex_tools::dynamic_custom_tool_to_responses_api_tool;
 use codex_tools::dynamic_tool_to_responses_api_tool;
 use serde_json::Value;
 use std::time::Instant;
@@ -33,21 +35,39 @@ pub struct DynamicToolHandler {
     tool_name: ToolName,
     spec: ToolSpec,
     exposure: ToolExposure,
+    payload_kind: DynamicToolPayloadKind,
+}
+
+#[derive(Clone, Copy)]
+enum DynamicToolPayloadKind {
+    Function,
+    Custom,
 }
 
 impl DynamicToolHandler {
     pub fn new(tool: &DynamicToolFunctionSpec) -> Option<Self> {
-        Self::from_parts(tool, /*namespace*/ None)
+        Self::from_function_parts(tool, /*namespace*/ None)
     }
 
     pub fn new_in_namespace(
         namespace: &DynamicToolNamespaceSpec,
         tool: &DynamicToolFunctionSpec,
     ) -> Option<Self> {
-        Self::from_parts(tool, Some(namespace))
+        Self::from_function_parts(tool, Some(namespace))
     }
 
-    fn from_parts(
+    pub fn new_custom(tool: &DynamicToolCustomSpec) -> Self {
+        Self::from_custom_parts(tool, /*namespace*/ None)
+    }
+
+    pub fn new_custom_in_namespace(
+        namespace: &DynamicToolNamespaceSpec,
+        tool: &DynamicToolCustomSpec,
+    ) -> Self {
+        Self::from_custom_parts(tool, Some(namespace))
+    }
+
+    fn from_function_parts(
         tool: &DynamicToolFunctionSpec,
         namespace: Option<&DynamicToolNamespaceSpec>,
     ) -> Option<Self> {
@@ -70,15 +90,61 @@ impl DynamicToolHandler {
             }),
             None => ToolSpec::Function(output_tool),
         };
-        Some(Self {
+        Some(Self::from_spec(
             tool_name,
             spec,
-            exposure: if tool.defer_loading {
+            tool.defer_loading,
+            DynamicToolPayloadKind::Function,
+        ))
+    }
+
+    fn from_custom_parts(
+        tool: &DynamicToolCustomSpec,
+        namespace: Option<&DynamicToolNamespaceSpec>,
+    ) -> Self {
+        let tool_name = ToolName::new(
+            namespace.map(|namespace| namespace.name.clone()),
+            tool.name.clone(),
+        );
+        let mut output_tool = dynamic_custom_tool_to_responses_api_tool(tool);
+        // Exposure controls deferral; tool search restores this marker for deferred results.
+        output_tool.defer_loading = None;
+        let spec = match namespace {
+            Some(namespace) => ToolSpec::Namespace(ResponsesApiNamespace {
+                name: namespace.name.clone(),
+                description: if namespace.description.trim().is_empty() {
+                    default_namespace_description(&namespace.name)
+                } else {
+                    namespace.description.clone()
+                },
+                tools: vec![ResponsesApiNamespaceTool::Custom(output_tool)],
+            }),
+            None => ToolSpec::Freeform(output_tool),
+        };
+        Self::from_spec(
+            tool_name,
+            spec,
+            tool.defer_loading,
+            DynamicToolPayloadKind::Custom,
+        )
+    }
+
+    fn from_spec(
+        tool_name: ToolName,
+        spec: ToolSpec,
+        defer_loading: bool,
+        payload_kind: DynamicToolPayloadKind,
+    ) -> Self {
+        Self {
+            tool_name,
+            spec,
+            exposure: if defer_loading {
                 ToolExposure::Deferred
             } else {
                 ToolExposure::Direct
             },
-        })
+            payload_kind,
+        }
     }
 }
 
@@ -127,21 +193,21 @@ impl DynamicToolHandler {
         } = invocation;
 
         let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
-            _ => {
+            ToolPayload::Function { arguments } => parse_arguments(&arguments)?,
+            ToolPayload::Custom { input } => Value::String(input),
+            ToolPayload::ToolSearch { .. } => {
                 return Err(FunctionCallError::RespondToModel(
                     "dynamic tool handler received unsupported payload".to_string(),
                 ));
             }
         };
 
-        let args: Value = parse_arguments(&arguments)?;
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),
             call_id,
             self.tool_name.clone(),
-            args,
+            arguments,
         )
         .await
         .ok_or_else(|| {
@@ -165,7 +231,17 @@ impl DynamicToolHandler {
     }
 }
 
-impl CoreToolRuntime for DynamicToolHandler {}
+impl CoreToolRuntime for DynamicToolHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(
+            (self.payload_kind, payload),
+            (
+                DynamicToolPayloadKind::Function,
+                ToolPayload::Function { .. }
+            ) | (DynamicToolPayloadKind::Custom, ToolPayload::Custom { .. })
+        )
+    }
+}
 
 #[expect(
     clippy::await_holding_invalid_type,

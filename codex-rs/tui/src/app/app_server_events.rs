@@ -394,6 +394,49 @@ impl App {
         request: ServerRequest,
     ) {
         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
+            if let Some(host) = app_server_client.host_dynamic_tools() {
+                match host.routing(params) {
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Unregistered => {}
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Reject => {
+                        self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                            request_id: request_id.clone(),
+                            response: crate::host_dynamic_tools::infrastructure_failure(),
+                        });
+                        return;
+                    }
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Forward => {
+                        if self.dynamic_tool_tasks.contains_key(request_id) {
+                            return;
+                        }
+                        let app_event_tx = self.app_event_tx.clone();
+                        let request_id = request_id.clone();
+                        let task_request_id = request_id.clone();
+                        let source_thread_id = params.thread_id.clone();
+                        let params = params.clone();
+                        let task = tokio::spawn(async move {
+                            let call = tokio::spawn(async move { host.call(&params).await });
+                            let response = match call.await {
+                                Ok(Ok(response)) => response,
+                                Ok(Err(error)) => {
+                                    tracing::warn!(%error, "host dynamic-tool call failed");
+                                    crate::host_dynamic_tools::infrastructure_failure()
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "host dynamic-tool call task terminated");
+                                    crate::host_dynamic_tools::infrastructure_failure()
+                                }
+                            };
+                            app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                request_id,
+                                response,
+                            });
+                        });
+                        self.dynamic_tool_tasks
+                            .insert(task_request_id, (source_thread_id, task));
+                        return;
+                    }
+                }
+            }
             if self.dynamic_tool_tasks.contains_key(request_id)
                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
                     && !app_server_client.uses_embedded_app_server())

@@ -21,6 +21,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::FeedbackAudience;
 use crate::dynamic_tools_mcp::DynamicToolMcpServer;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
+use crate::host_dynamic_tools::HostDynamicTools;
 use crate::legacy_core::config::Config;
 use crate::local_settings::LocalSettings;
 use crate::service_tier_resolution;
@@ -218,6 +219,7 @@ pub(crate) async fn request_thread_start_with_history_fallback(
     request_handle: &AppServerRequestHandle,
     mut request_id: RequestId,
     mut params: ThreadStartParams,
+    tool_policy: ThreadStartToolPolicy,
 ) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
     let mut history_support = ThreadHistorySupport::Paginated;
     loop {
@@ -229,11 +231,12 @@ pub(crate) async fn request_thread_start_with_history_fallback(
             .await
         {
             Ok(response) => {
-                let task_tools_available = params.dynamic_tools.is_some()
-                    || params
-                        .config
-                        .as_ref()
-                        .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
+                let task_tools_available = tool_policy.task_tools_available
+                    && (params.dynamic_tools.is_some()
+                        || params
+                            .config
+                            .as_ref()
+                            .is_some_and(|config| config.contains_key("mcp_servers.codex_tui")));
                 return Ok((response, history_support, task_tools_available));
             }
             Err(TypedRequestError::Server { source, .. })
@@ -245,6 +248,7 @@ pub(crate) async fn request_thread_start_with_history_fallback(
             }
             Err(TypedRequestError::Server { source, .. })
                 if params.dynamic_tools.is_some()
+                    && tool_policy.dynamic_tool_fallback == DynamicToolFallback::Optional
                     && matches!(
                         source.code,
                         JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS
@@ -266,6 +270,18 @@ pub(crate) async fn request_thread_start_with_history_fallback(
             Err(err) => return Err(err),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicToolFallback {
+    Optional,
+    Required,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadStartToolPolicy {
+    pub(crate) dynamic_tool_fallback: DynamicToolFallback,
+    pub(crate) task_tools_available: bool,
 }
 
 fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -314,6 +330,7 @@ pub(crate) struct AppServerSession {
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_completion_pending: AtomicBool,
     dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
+    host_dynamic_tools: Option<Arc<HostDynamicTools>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,7 +428,32 @@ impl AppServerSession {
             managed_new_thread_defaults: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
             dynamic_tool_mcp: None,
+            host_dynamic_tools: None,
         }
+    }
+
+    pub(crate) fn with_host_dynamic_tools(
+        mut self,
+        host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+    ) -> Self {
+        self.host_dynamic_tools = host_dynamic_tools;
+        self
+    }
+
+    pub(crate) fn host_dynamic_tools(&self) -> Option<Arc<HostDynamicTools>> {
+        self.host_dynamic_tools.clone()
+    }
+
+    pub(crate) async fn attach_host_primary_if_applicable(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<()> {
+        if let Some(host) = &self.host_dynamic_tools
+            && host.should_attach(thread_id)
+        {
+            host.attach_primary(thread_id).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn start_dynamic_tool_mcp(
@@ -796,13 +838,34 @@ impl AppServerSession {
             params.history_mode = None;
         }
         self.thread_tool_transport().configure(&mut params);
+        let task_tools_available = params.dynamic_tools.is_some()
+            || params
+                .config
+                .as_ref()
+                .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
+        let host_tools_required = self
+            .host_dynamic_tools
+            .as_ref()
+            .is_some_and(|host| host.configure_primary_start(&mut params));
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
-            request_thread_start_with_history_fallback(&request_handle, request_id, params)
-                .await
-                .map_err(|err| {
-                    bootstrap_request_error("thread/start failed during TUI bootstrap", err)
-                })?;
+            request_thread_start_with_history_fallback(
+                &request_handle,
+                request_id,
+                params,
+                ThreadStartToolPolicy {
+                    dynamic_tool_fallback: if host_tools_required {
+                        DynamicToolFallback::Required
+                    } else {
+                        DynamicToolFallback::Optional
+                    },
+                    task_tools_available,
+                },
+            )
+            .await
+            .map_err(|err| {
+                bootstrap_request_error("thread/start failed during TUI bootstrap", err)
+            })?;
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
@@ -816,6 +879,9 @@ impl AppServerSession {
         started.task_tools_available = task_tools_available;
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
+        }
+        if host_tools_required && let Some(host) = &self.host_dynamic_tools {
+            host.attach_primary(started.session.thread_id).await?;
         }
         Ok(started)
     }
@@ -979,6 +1045,8 @@ impl AppServerSession {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
+        self.attach_host_primary_if_applicable(started.session.thread_id)
+            .await?;
         Ok(started)
     }
 
@@ -1641,6 +1709,7 @@ pub(crate) async fn start_thread_with_request_handle(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
     thread_tool_transport: ThreadToolTransport,
+    host_dynamic_tools: Option<Arc<HostDynamicTools>>,
 ) -> Result<AppServerStartedThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_from_config(
@@ -1650,16 +1719,37 @@ pub(crate) async fn start_thread_with_request_handle(
         /*session_start_source*/ None,
     );
     thread_tool_transport.configure(&mut params);
+    let task_tools_available = params.dynamic_tools.is_some()
+        || params
+            .config
+            .as_ref()
+            .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
+    let host_tools_required = host_dynamic_tools
+        .as_ref()
+        .is_some_and(|host| host.configure_primary_start(&mut params));
     let (response, _history_support, task_tools_available) =
-        request_thread_start_with_history_fallback(&request_handle, request_id, params)
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("thread/start failed during TUI bootstrap", err)
-            })?;
+        request_thread_start_with_history_fallback(
+            &request_handle,
+            request_id,
+            params,
+            ThreadStartToolPolicy {
+                dynamic_tool_fallback: if host_tools_required {
+                    DynamicToolFallback::Required
+                } else {
+                    DynamicToolFallback::Optional
+                },
+                task_tools_available,
+            },
+        )
+        .await
+        .map_err(|err| bootstrap_request_error("thread/start failed during TUI bootstrap", err))?;
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;
     started.task_tools_available = task_tools_available;
+    if host_tools_required && let Some(host) = host_dynamic_tools {
+        host.attach_primary(started.session.thread_id).await?;
+    }
     Ok(started)
 }
 

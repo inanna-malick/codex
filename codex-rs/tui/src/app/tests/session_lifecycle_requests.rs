@@ -537,6 +537,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
+        /*host_dynamic_tools*/ None,
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -696,6 +697,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
+        /*host_dynamic_tools*/ None,
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -1057,6 +1059,7 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
+        /*host_dynamic_tools*/ None,
     )
     .await?;
     assert!(!startup.task_tools_available);
@@ -1074,6 +1077,152 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_dynamic_tools_are_not_removed_for_an_older_server() -> Result<()> {
+    let (app, _codex_home) = make_history_test_app().await?;
+    let (app_server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::LegacyDynamicToolsAndHistory,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await?;
+    let mut params = crate::app_server_session::thread_start_params_from_config(
+        &app.config,
+        app_server.thread_params_mode(),
+        /*remote_cwd_override*/ None,
+        /*session_start_source*/ None,
+    );
+    app_server.thread_tool_transport().configure(&mut params);
+    let error = crate::app_server_session::request_thread_start_with_history_fallback(
+        &app_server.request_handle(),
+        AppServerRequestId::String("required-host-tools".to_string()),
+        params,
+        crate::app_server_session::ThreadStartToolPolicy {
+            dynamic_tool_fallback: crate::app_server_session::DynamicToolFallback::Required,
+            task_tools_available: false,
+        },
+    )
+    .await
+    .expect_err("required dynamic tools must fail instead of being removed");
+    assert_matches!(
+        error,
+        codex_app_server_client::TypedRequestError::Server { .. }
+    );
+    assert_eq!(recorded_params(&requests, "thread/start").len(), 1);
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fresh_primary_registers_host_tool_and_attaches_before_returning() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (app, _codex_home) = make_history_test_app().await?;
+    let socket_dir = tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = socket_dir.path().join("host.sock");
+    let (host_requests, host_task) = crate::host_dynamic_tools::spawn_host(&socket_path, 2)?;
+    let host = crate::host_dynamic_tools::HostDynamicTools::connect(Some(
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&socket_path)?,
+    ))
+    .await?
+    .expect("configured host");
+    let (app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut app_server = app_server.with_host_dynamic_tools(Some(host));
+    let started = app_server.start_thread(&app.config).await?;
+
+    let starts = recorded_params(&requests, "thread/start");
+    assert_eq!(starts.len(), 1);
+    let registered = starts[0]["dynamicTools"]
+        .as_array()
+        .expect("dynamic tools array");
+    assert!(
+        registered
+            .iter()
+            .any(|tool| tool["type"] == "custom" && tool["name"] == "evaluate")
+    );
+    let registration = host_requests.recv()?;
+    assert_eq!(registration.path, "/v1/dynamic-tools/registration");
+    let session = host_requests.recv()?;
+    assert_eq!(
+        session.body["threadId"],
+        started.session.thread_id.to_string()
+    );
+    host_task.join().expect("host thread panicked")?;
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_primary_reattaches_host_tool_before_calls_are_authorized() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (app, _codex_home) = make_history_test_app().await?;
+    let thread_id = create_history_rollout(
+        &app.config,
+        ThreadHistoryMode::Paginated,
+        "Persisted host-tool thread",
+    )?;
+    let socket_dir = tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+
+    let resumed_socket_path = socket_dir.path().join("host.sock");
+    let (resumed_host_requests, resumed_host_task) =
+        crate::host_dynamic_tools::spawn_host(&resumed_socket_path, 2)?;
+    let resumed_host = crate::host_dynamic_tools::HostDynamicTools::connect(Some(
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&resumed_socket_path)?,
+    ))
+    .await?
+    .expect("configured host");
+    let (resumed_server, _, resumed_proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut resumed_server = resumed_server.with_host_dynamic_tools(Some(resumed_host.clone()));
+    let resumed = resumed_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            thread_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await?;
+    assert_eq!(resumed.session.thread_id, thread_id);
+
+    let registration = resumed_host_requests.recv()?;
+    assert_eq!(registration.path, "/v1/dynamic-tools/registration");
+    let session = resumed_host_requests.recv()?;
+    assert_eq!(session.body["threadId"], thread_id.to_string());
+    assert_eq!(
+        resumed_host.routing(&codex_app_server_protocol::DynamicToolCallParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-resumed".to_string(),
+            call_id: "call-resumed".to_string(),
+            tool: "evaluate".to_string(),
+            namespace: None,
+            arguments: serde_json::Value::String("main = pure ()".to_string()),
+        }),
+        crate::host_dynamic_tools::HostDynamicToolRouting::Forward
+    );
+    resumed_host_task.join().expect("host thread panicked")?;
+    resumed_server.shutdown().await?;
+    resumed_proxy.await??;
     Ok(())
 }
 
@@ -1500,6 +1649,105 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
     assert_eq!(cancelled["success"], false);
     assert!(app.dynamic_tool_tasks.is_empty());
 
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_custom_tool_call_preserves_payload_and_resolves_original_request() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    let socket_dir = tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = socket_dir.path().join("host.sock");
+    let (host_requests, host_task) = crate::host_dynamic_tools::spawn_host(&socket_path, 3)?;
+    let host = crate::host_dynamic_tools::HostDynamicTools::connect(Some(
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&socket_path)?,
+    ))
+    .await?
+    .expect("configured host");
+    let thread_id = ThreadId::new();
+    host.attach_primary(thread_id).await?;
+    let (app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut app_server = app_server.with_host_dynamic_tools(Some(host));
+    let source =
+        "module Main where\nquoted = \"{\\\"json\\\":true}\"\npath = \"C:\\\\tmp\"\nλ = \"🌊\"\n";
+    let request_id = AppServerRequestId::Integer(701);
+    app.handle_app_server_event(
+        &app_server,
+        AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
+            request_id: request_id.clone(),
+            params: codex_app_server_protocol::DynamicToolCallParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-host".to_string(),
+                call_id: "call-host".to_string(),
+                namespace: None,
+                tool: "evaluate".to_string(),
+                arguments: serde_json::Value::String(source.to_string()),
+            },
+        })),
+    )
+    .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv())
+        .await?
+        .expect("host call completion");
+    let AppEvent::DynamicToolCallCompleted {
+        request_id: completed_request_id,
+        response,
+    } = event
+    else {
+        panic!("expected host call completion")
+    };
+    assert_eq!(completed_request_id, request_id);
+    assert!(response.success);
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::DynamicToolCallCompleted {
+            request_id,
+            response,
+        },
+    )
+    .await?;
+    let resolved = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if let Some(response) = recorded_params(&requests, "server/request/response").pop() {
+                break response;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(resolved["success"], true);
+
+    let registration = host_requests.recv()?;
+    assert_eq!(registration.path, "/v1/dynamic-tools/registration");
+    let session = host_requests.recv()?;
+    assert_eq!(session.body["threadId"], thread_id.to_string());
+    let call = host_requests.recv()?;
+    assert_eq!(
+        call.body,
+        serde_json::json!({
+            "protocolVersion": 1,
+            "threadId": thread_id,
+            "turnId": "turn-host",
+            "callId": "call-host",
+            "namespace": null,
+            "tool": "evaluate",
+            "arguments": source,
+        })
+    );
+    host_task.join().expect("host thread panicked")?;
     app_server.shutdown().await?;
     proxy.await??;
     Ok(())

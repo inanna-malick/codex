@@ -10,6 +10,8 @@ use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::DynamicToolCallStatus;
+use codex_app_server_protocol::DynamicToolCustomFormat;
+use codex_app_server_protocol::DynamicToolCustomSpec;
 use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolNamespaceSpec;
 use codex_app_server_protocol::DynamicToolNamespaceTool;
@@ -21,6 +23,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -573,6 +577,241 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn custom_dynamic_tool_round_trip_preserves_raw_input() -> Result<()> {
+    let call_id = "custom-dyn-call-1";
+    let tool_name = "tidepool";
+    let tool_input = r#"module Main where
+
+main = putStrLn "λ and 日本語"
+jsonLooking = "{\"program\":\"not wrapped\"}"
+windowsPath = "C:\\tmp\\source.hs"
+nested = "putStrLn \"inner string\""
+"#;
+    let response_sequence = vec![
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_custom_tool_call(call_id, tool_name, tool_input),
+            responses::ev_completed("resp-1"),
+        ]),
+        create_final_assistant_message_sse_response("Done")?,
+    ];
+    let server = create_mock_responses_server_sequence_unchecked(response_sequence).await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let dynamic_tool = DynamicToolSpec::Custom(DynamicToolCustomSpec {
+        name: tool_name.to_string(),
+        description: "Evaluate a Tidepool Haskell program".to_string(),
+        defer_loading: false,
+        format: None,
+    });
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            dynamic_tools: Some(vec![dynamic_tool]),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "Run the Tidepool program".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+
+    let started = wait_for_dynamic_tool_started(&mut mcp, call_id).await?;
+    assert_eq!(started.thread_id, thread.id);
+    assert_eq!(started.turn_id, turn.id);
+    let ThreadItem::DynamicToolCall { arguments, .. } = started.item else {
+        panic!("expected dynamic tool call item");
+    };
+    assert_eq!(arguments, Value::String(tool_input.to_string()));
+
+    let request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let (request_id, params) = match request {
+        ServerRequest::DynamicToolCall { request_id, params } => (request_id, params),
+        other => panic!("expected DynamicToolCall request, got {other:?}"),
+    };
+    assert_eq!(
+        params,
+        DynamicToolCallParams {
+            thread_id: thread.id,
+            turn_id: turn.id,
+            call_id: call_id.to_string(),
+            namespace: None,
+            tool: tool_name.to_string(),
+            arguments: Value::String(tool_input.to_string()),
+        }
+    );
+
+    mcp.send_response(
+        request_id,
+        serde_json::to_value(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "tidepool-ok".to_string(),
+            }],
+            success: true,
+        })?,
+    )
+    .await?;
+    let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
+    let ThreadItem::DynamicToolCall {
+        arguments,
+        status,
+        success,
+        ..
+    } = completed.item
+    else {
+        panic!("expected dynamic tool call item");
+    };
+    assert_eq!(arguments, Value::String(tool_input.to_string()));
+    assert_eq!(status, DynamicToolCallStatus::Completed);
+    assert_eq!(success, Some(true));
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let bodies = responses_bodies(&server).await?;
+    assert_eq!(
+        find_tool(&bodies[0], tool_name),
+        Some(&json!({
+            "type": "custom",
+            "name": tool_name,
+            "description": "Evaluate a Tidepool Haskell program",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+            }
+        }))
+    );
+    assert_eq!(
+        bodies
+            .iter()
+            .find_map(|body| custom_tool_call_output_raw_output(body, call_id)),
+        Some(json!("tidepool-ok"))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_restores_custom_dynamic_tool() -> Result<()> {
+    let format = DynamicToolCustomFormat {
+        r#type: "grammar".to_string(),
+        syntax: "lark".to_string(),
+        definition: "start: module\nmodule: /[\\s\\S]+/".to_string(),
+    };
+    let responses = vec![
+        create_final_assistant_message_sse_response("Persisted")?,
+        create_final_assistant_message_sse_response("Restored")?,
+    ];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let thread_id = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .build_initialized()
+            .await?;
+        let ThreadStartResponse { thread, .. } = mcp
+            .start_thread(ThreadStartParams {
+                dynamic_tools: Some(vec![DynamicToolSpec::Custom(DynamicToolCustomSpec {
+                    name: "tidepool".to_string(),
+                    description: "Evaluate a Tidepool Haskell program".to_string(),
+                    defer_loading: false,
+                    format: Some(format.clone()),
+                })]),
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "Persist the thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+        )
+        .await??;
+        thread.id
+    };
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id,
+            input: vec![V2UserInput::Text {
+                text: "Use the restored tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let bodies = responses_bodies(&server).await?;
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        find_tool(&bodies[1], "tidepool"),
+        Some(&json!({
+            "type": "custom",
+            "name": "tidepool",
+            "description": "Evaluate a Tidepool Haskell program",
+            "format": format,
+        }))
+    );
+
+    Ok(())
+}
+
 struct PendingDynamicToolCall {
     mcp: TestAppServer,
     server: MockServer,
@@ -954,6 +1193,19 @@ fn function_call_output_raw_output(body: &Value, call_id: &str) -> Option<Value>
         .and_then(|items| {
             items.iter().find(|item| {
                 item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+            })
+        })
+        .and_then(|item| item.get("output"))
+        .cloned()
+}
+
+fn custom_tool_call_output_raw_output(body: &Value, call_id: &str) -> Option<Value> {
+    body.get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
                     && item.get("call_id").and_then(Value::as_str) == Some(call_id)
             })
         })

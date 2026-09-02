@@ -477,6 +477,31 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
     }
 }
 
+fn custom_dynamic_tool(
+    namespace: Option<&str>,
+    name: &str,
+    defer_loading: bool,
+) -> DynamicToolSpec {
+    let custom = codex_protocol::dynamic_tools::DynamicToolCustomSpec {
+        name: name.to_string(),
+        description: format!("{name} custom dynamic tool"),
+        defer_loading,
+        format: None,
+    };
+    match namespace {
+        Some(namespace) => {
+            DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+                name: namespace.to_string(),
+                description: format!("{namespace} dynamic tools"),
+                tools: vec![
+                    codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Custom(custom),
+                ],
+            })
+        }
+        None => DynamicToolSpec::Custom(custom),
+    }
+}
+
 fn plugin_candidates(presentation: ToolSuggestPresentation) -> ToolSuggestCandidates {
     ToolSuggestCandidates {
         tools: vec![DiscoverableTool::Plugin(Box::new(DiscoverablePluginInfo {
@@ -1078,6 +1103,88 @@ async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
     assert_eq!(
         plan.namespace_function_names("client"),
         &["exec_command".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn custom_dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
+    let plan = probe_with(
+        duplicate_primary_environment,
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                /*namespace*/ None,
+                "exec_command",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["exec_command"]);
+    plan.assert_registered_contains(&["exec_command"]);
+    assert!(
+        plan.visible_specs
+            .iter()
+            .all(|spec| !matches!(spec, ToolSpec::Freeform(tool) if tool.name == "exec_command"))
+    );
+}
+
+#[tokio::test]
+async fn namespaced_custom_dynamic_tools_support_direct_and_deferred_exposure() {
+    let namespace = "languages";
+    let visible_name = "haskell";
+    let deferred_name = "idris";
+    let mut dynamic_tool =
+        custom_dynamic_tool(Some(namespace), visible_name, /*defer_loading*/ false);
+    let DynamicToolSpec::Namespace(dynamic_namespace) = &mut dynamic_tool else {
+        panic!("expected namespace");
+    };
+    dynamic_namespace.tools.push(
+        codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Custom(
+            codex_protocol::dynamic_tools::DynamicToolCustomSpec {
+                name: deferred_name.to_string(),
+                description: "Deferred Idris evaluator".to_string(),
+                defer_loading: true,
+                format: None,
+            },
+        ),
+    );
+
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&[namespace]);
+    assert_eq!(
+        plan.namespace_function_names(namespace),
+        &[visible_name.to_string()]
+    );
+    let visible_spec = plan
+        .visible_specs
+        .iter()
+        .find(|spec| spec.name() == namespace)
+        .expect("visible custom namespace");
+    let ToolSpec::Namespace(namespace_spec) = visible_spec else {
+        panic!("expected namespace spec");
+    };
+    assert!(matches!(
+        namespace_spec.tools.as_slice(),
+        [ResponsesApiNamespaceTool::Custom(tool)] if tool.name == visible_name
+    ));
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced(namespace, visible_name).to_string(),
+        &ToolName::namespaced(namespace, deferred_name).to_string(),
+    ]);
+    assert_eq!(
+        plan.exposures
+            .get(&ToolName::namespaced(namespace, deferred_name).to_string()),
+        Some(&ToolExposure::Deferred)
     );
 }
 

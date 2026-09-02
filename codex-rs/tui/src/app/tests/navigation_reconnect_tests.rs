@@ -4,6 +4,7 @@ use super::active_reconnect::drain_history;
 use super::disconnect::serve_reconnect_requests;
 use super::*;
 use crate::app::reconnect::ReconnectPresentation;
+use crate::app::reconnect::ReconnectTooling;
 use crate::app::reconnect::reconnect;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::app_server_session::ThreadParamsMode;
@@ -302,7 +303,10 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             app.local_settings.clone(),
             previous_thread,
             /*remote_cwd*/ None,
-            session.thread_tool_transport(),
+            ReconnectTooling {
+                task_tools: session.thread_tool_transport(),
+                host_dynamic_tools: None,
+            },
             ReconnectPresentation::Overview,
         )
         .await?;

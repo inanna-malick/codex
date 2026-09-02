@@ -145,6 +145,7 @@ mod goal_display;
 mod goal_files;
 mod history_cell;
 mod hooks_rpc;
+mod host_dynamic_tools;
 mod ide_context;
 mod inline_visualization;
 pub(crate) mod insert_history;
@@ -1015,6 +1016,10 @@ async fn run_ratatui_app(
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
 
+    let host_dynamic_tools =
+        host_dynamic_tools::HostDynamicTools::connect(cli.host_dynamic_tools_socket.clone())
+            .await?;
+
     tooltips::announcement::prewarm(initial_config.http_client_factory());
 
     // Forward panic reports through tracing so they appear in the UI status
@@ -1078,6 +1083,7 @@ async fn run_ratatui_app(
         Ok(Ok(app_server)) => {
             AppServerSession::new(app_server, app_server_target.thread_params_mode())
                 .with_startup_config(&initial_config)
+                .with_host_dynamic_tools(host_dynamic_tools.clone())
         }
         Ok(Err(err)) => {
             terminal_restore_guard.restore_silently();
@@ -1688,6 +1694,7 @@ async fn run_ratatui_app(
                 AppServerSession::new(app_server, app_server_target.thread_params_mode())
                     .with_startup_config(&config)
                     .with_remote_cwd_override(remote_cwd_override.clone())
+                    .with_host_dynamic_tools(host_dynamic_tools.clone())
             }
             Ok(Err(err)) => {
                 terminal_restore_guard.restore_silently();

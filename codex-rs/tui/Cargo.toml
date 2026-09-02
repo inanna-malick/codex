@@ -130,6 +130,7 @@ tokio-util = { workspace = true, features = ["time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 which = { workspace = true }

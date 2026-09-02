@@ -2133,14 +2133,33 @@ If the session approval policy uses `Granular` with `request_permissions: false`
 
 `dynamicTools` on `thread/start` and the corresponding `item/tool/call` request/response flow are experimental APIs. To enable them, set `initialize.params.capabilities.experimentalApi = true`.
 
-Each entry in `dynamicTools` is either a top-level function or a namespace containing function tools. Dynamic tool identifiers follow the same constraints as Responses tools:
+Each entry in `dynamicTools` is a top-level function, a top-level custom tool, or a namespace containing either kind. Custom tools use the Responses API free-form payload mechanism: the model emits raw text rather than JSON arguments. Dynamic tool identifiers follow the same constraints as Responses tools:
 
 - `name` must match `^[a-zA-Z0-9_-]+$` and be between 1 and 128 characters.
 - Namespace names must match `^[a-zA-Z0-9_-]+$` and be between 1 and 64 characters.
 - Namespace descriptions must be at most 1,024 characters.
 - Namespace names must not collide with reserved Responses runtime namespaces such as `functions`, `multi_tool_use`, `file_search`, `web`, `browser`, `image_gen`, `computer`, `container`, `terminal`, `python`, `python_user_visible`, `api_tool`, `tool_search`, or `submodel_delegator`.
 
-Each function may set `deferLoading`. When omitted, it defaults to `false`. Deferred functions must belong to a namespace. Set it to `true` to keep the function registered and callable by runtime features such as `code_mode`, while excluding it from the model-facing tool list sent on ordinary turns. When `tool_search` is available, deferred dynamic tools are searchable and can be exposed by a matching search result.
+Each function or custom tool may set `deferLoading`. When omitted, it defaults to `false`. Deferred tools must belong to a namespace. Set it to `true` to keep the tool registered and callable by runtime features such as `code_mode`, while excluding it from the model-facing tool list sent on ordinary turns. When `tool_search` is available, deferred dynamic tools are searchable and can be exposed by a matching search result.
+
+A custom tool does not have an `inputSchema`. With no `format`, it accepts unrestricted non-empty text. An optional Responses-compatible grammar format can be provided with `type`, `syntax`, and `definition`:
+
+```json
+{
+  "method": "thread/start",
+  "id": 10,
+  "params": {
+    "dynamicTools": [
+      {
+        "type": "custom",
+        "name": "tidepool",
+        "description": "Evaluate a Tidepool Haskell program",
+        "deferLoading": false
+      }
+    ]
+  }
+}
+```
 
 When a dynamic tool is invoked during a turn, the server sends an `item/tool/call` JSON-RPC request to the client:
 
@@ -2168,14 +2187,29 @@ The server also emits item lifecycle notifications around the request:
 
 The client must respond with content items. Use `inputText` for text, `inputImage` for inline image data URLs, and `inputAudio` for inline audio data URLs. Audio data URLs accept wav, mp3, m4a, webm, and ogg media types. Remote HTTP(S) image URLs and non-data audio URLs make the dynamic tool response invalid.
 
+For a custom tool, `arguments` is a JSON string containing the exact decoded model payload. The JSON-RPC transport escapes the string as necessary, but the model emits the source directly and does not produce a JSON object or quoted JSON string:
+
 ```json
 {
-  "id": 60,
+  "method": "item/tool/call",
+  "id": 61,
+  "params": {
+    "threadId": "thr_123",
+    "turnId": "turn_123",
+    "callId": "call_456",
+    "namespace": null,
+    "tool": "tidepool",
+    "arguments": "module Main where\n\nmain = putStrLn \"hello\"\n"
+  }
+}
+```
+
+```json
+{
+  "id": 61,
   "result": {
     "contentItems": [
-      { "type": "inputText", "text": "Ticket ABC-123 is open." },
-      { "type": "inputImage", "imageUrl": "data:image/png;base64,AAA" },
-      { "type": "inputAudio", "audioUrl": "data:audio/wav;base64,AAA" }
+      { "type": "inputText", "text": "Program completed successfully." }
     ],
     "success": true
   }

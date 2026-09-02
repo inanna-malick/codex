@@ -337,41 +337,49 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     }
 
     fn validate_dynamic_tool<'a>(
-        tool: &'a DynamicToolFunctionSpec,
+        name: &'a str,
+        defer_loading: bool,
+        input_schema: Option<&serde_json::Value>,
         namespace: Option<&str>,
         seen: &mut HashSet<&'a str>,
     ) -> Result<(), String> {
-        let name = tool.name.trim();
-        if name.is_empty() {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
             return Err("dynamic tool name must not be empty".to_string());
         }
-        if name != tool.name {
+        if trimmed_name != name {
             return Err(format!(
                 "dynamic tool name has leading/trailing whitespace: {}",
-                escape_identifier_for_error(&tool.name),
+                escape_identifier_for_error(name),
             ));
         }
-        validate_dynamic_tool_identifier(name, "dynamic tool name", DYNAMIC_TOOL_NAME_MAX_LEN)?;
-        if name == "mcp" || name.starts_with("mcp__") {
-            return Err(format!("dynamic tool name is reserved: {name}"));
+        validate_dynamic_tool_identifier(
+            trimmed_name,
+            "dynamic tool name",
+            DYNAMIC_TOOL_NAME_MAX_LEN,
+        )?;
+        if trimmed_name == "mcp" || trimmed_name.starts_with("mcp__") {
+            return Err(format!("dynamic tool name is reserved: {trimmed_name}"));
         }
-        if !seen.insert(name) {
+        if !seen.insert(trimmed_name) {
             if let Some(namespace) = namespace {
                 return Err(format!(
-                    "duplicate dynamic tool name in namespace {namespace}: {name}"
+                    "duplicate dynamic tool name in namespace {namespace}: {trimmed_name}"
                 ));
             }
-            return Err(format!("duplicate dynamic tool name: {name}"));
+            return Err(format!("duplicate dynamic tool name: {trimmed_name}"));
         }
-        if tool.defer_loading && namespace.is_none() {
+        if defer_loading && namespace.is_none() {
             return Err(format!(
-                "deferred dynamic tool must include a namespace: {name}"
+                "deferred dynamic tool must include a namespace: {trimmed_name}"
             ));
         }
 
-        if let Err(err) = codex_tools::parse_tool_input_schema(&tool.input_schema) {
+        if let Some(input_schema) = input_schema
+            && let Err(err) = codex_tools::parse_tool_input_schema(input_schema)
+        {
             return Err(format!(
-                "dynamic tool input schema is not supported for {name}: {err}"
+                "dynamic tool input schema is not supported for {trimmed_name}: {err}"
             ));
         }
         Ok(())
@@ -382,7 +390,22 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     for spec in tools {
         match spec {
             DynamicToolSpec::Function(tool) => {
-                validate_dynamic_tool(tool, /*namespace*/ None, &mut seen_tools)?;
+                validate_dynamic_tool(
+                    &tool.name,
+                    tool.defer_loading,
+                    Some(&tool.input_schema),
+                    /*namespace*/ None,
+                    &mut seen_tools,
+                )?;
+            }
+            DynamicToolSpec::Custom(tool) => {
+                validate_dynamic_tool(
+                    &tool.name,
+                    tool.defer_loading,
+                    /*input_schema*/ None,
+                    /*namespace*/ None,
+                    &mut seen_tools,
+                )?;
             }
             DynamicToolSpec::Namespace(namespace) => {
                 let name = namespace.name.trim();
@@ -425,8 +448,22 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                 }
                 let mut seen_namespace_tools = HashSet::new();
                 for tool in &namespace.tools {
-                    let DynamicToolNamespaceTool::Function(tool) = tool;
-                    validate_dynamic_tool(tool, Some(name), &mut seen_namespace_tools)?;
+                    match tool {
+                        DynamicToolNamespaceTool::Function(tool) => validate_dynamic_tool(
+                            &tool.name,
+                            tool.defer_loading,
+                            Some(&tool.input_schema),
+                            Some(name),
+                            &mut seen_namespace_tools,
+                        )?,
+                        DynamicToolNamespaceTool::Custom(tool) => validate_dynamic_tool(
+                            &tool.name,
+                            tool.defer_loading,
+                            /*input_schema*/ None,
+                            Some(name),
+                            &mut seen_namespace_tools,
+                        )?,
+                    }
                 }
             }
         }
@@ -1427,7 +1464,7 @@ impl ThreadRequestProcessor {
         let dynamic_tool_count: usize = dynamic_tools
             .iter()
             .map(|tool| match tool {
-                DynamicToolSpec::Function(_) => 1,
+                DynamicToolSpec::Function(_) | DynamicToolSpec::Custom(_) => 1,
                 DynamicToolSpec::Namespace(namespace) => namespace.tools.len(),
             })
             .sum();
