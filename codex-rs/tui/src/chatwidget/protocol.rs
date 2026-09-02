@@ -360,6 +360,14 @@ impl ChatWidget {
                 self.on_patch_apply_begin(file_update_changes_to_display(changes));
             }
             item @ ThreadItem::McpToolCall { .. } => self.on_mcp_tool_call_started(item),
+            item @ ThreadItem::DynamicToolCall { .. } => {
+                let ThreadItem::DynamicToolCall { namespace, .. } = &item else {
+                    unreachable!("dynamic tool pattern must match");
+                };
+                if namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE) {
+                    self.on_dynamic_tool_call_started(item);
+                }
+            }
             ThreadItem::WebSearch(item) => {
                 self.on_web_search_begin(item.id);
             }

@@ -238,6 +238,7 @@ mod backend_banners_tests;
 mod composer_submission;
 #[path = "tests/config_errors_tests.rs"]
 mod config_errors;
+mod dynamic_tool_rendering;
 mod exec_flow;
 mod goal_menu;
 mod goal_validation;

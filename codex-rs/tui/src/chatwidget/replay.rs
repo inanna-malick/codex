@@ -170,6 +170,24 @@ impl ChatWidget {
                 ..
             } => self.on_mcp_tool_call_started(item),
             item @ ThreadItem::McpToolCall { .. } => self.on_mcp_tool_call_completed(item),
+            item @ ThreadItem::DynamicToolCall { .. } => {
+                let ThreadItem::DynamicToolCall {
+                    namespace, status, ..
+                } = &item
+                else {
+                    unreachable!("dynamic tool pattern must match");
+                };
+                if namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE) {
+                    if matches!(
+                        status,
+                        codex_app_server_protocol::DynamicToolCallStatus::InProgress
+                    ) {
+                        self.on_dynamic_tool_call_started(item);
+                    } else {
+                        self.on_dynamic_tool_call_completed(item);
+                    }
+                }
+            }
             ThreadItem::WebSearch(item) => {
                 self.on_web_search_begin(item.id.clone());
                 self.on_web_search_end(
@@ -244,7 +262,6 @@ impl ChatWidget {
                 agents_states,
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
-            ThreadItem::DynamicToolCall { .. } => {}
             ThreadItem::Sleep(_) => {}
         }
 
