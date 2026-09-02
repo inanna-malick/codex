@@ -295,3 +295,17 @@ Use `success: false` for infrastructure failures.
 Codex never retries `/call`. If the socket closes after execution begins, the outcome is
 indeterminate and the model must not assume that no effects occurred. Later foreground threads,
 background agents, helper threads, and derived forks do not receive this authority in v1.
+
+## Nix package layout
+
+The repository's default `codex-rs` Nix package installs both runtime executables into the same
+output:
+
+```text
+$out/bin/codex
+$out/bin/codex-code-mode-host
+```
+
+`codex` remains the package's main program. Keeping the code-mode host beside it allows Codex to
+resolve the host automatically when `features.code_mode_host` is enabled; callers do not need to
+add the package to the ambient `PATH` or configure a separate host executable.
