@@ -68,6 +68,22 @@ impl ChatWidget {
         );
     }
 
+    pub(super) fn on_dynamic_tool_call_started(&mut self, item: ThreadItem) {
+        self.defer_or_handle(
+            item,
+            InterruptManager::push_item_started,
+            Self::handle_dynamic_tool_call_started_now,
+        );
+    }
+
+    pub(super) fn on_dynamic_tool_call_completed(&mut self, item: ThreadItem) {
+        self.defer_or_handle(
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_dynamic_tool_call_completed_now,
+        );
+    }
+
     pub(super) fn on_web_search_begin(&mut self, call_id: String) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
@@ -255,6 +271,78 @@ impl ChatWidget {
         self.transcript.had_work_activity = true;
     }
 
+    pub(crate) fn handle_dynamic_tool_call_started_now(&mut self, item: ThreadItem) {
+        let ThreadItem::DynamicToolCall {
+            id,
+            namespace,
+            tool,
+            arguments,
+            ..
+        } = item
+        else {
+            return;
+        };
+        self.flush_answer_stream_with_separator();
+        self.flush_active_cell();
+        self.transcript.active_cell = Some(Box::new(DynamicToolCallCell::new(
+            id,
+            namespace,
+            tool,
+            arguments,
+            self.local_settings.tui.animations,
+        )));
+        self.bump_active_cell_revision();
+        self.request_redraw();
+    }
+
+    pub(crate) fn handle_dynamic_tool_call_completed_now(&mut self, item: ThreadItem) {
+        self.flush_answer_stream_with_separator();
+        let ThreadItem::DynamicToolCall {
+            id,
+            namespace,
+            tool,
+            arguments,
+            status,
+            content_items,
+            success,
+            duration_ms,
+        } = item
+        else {
+            return;
+        };
+        let duration = Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64);
+        let success = success.unwrap_or(matches!(
+            status,
+            codex_app_server_protocol::DynamicToolCallStatus::Completed
+        ));
+
+        match self
+            .transcript
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<DynamicToolCallCell>())
+        {
+            Some(cell) if cell.call_id() == id => {
+                cell.complete(duration, content_items.unwrap_or_default(), success);
+                self.bump_active_cell_revision();
+            }
+            _ => {
+                self.flush_active_cell();
+                let mut cell = DynamicToolCallCell::new(
+                    id,
+                    namespace,
+                    tool,
+                    arguments,
+                    self.local_settings.tui.animations,
+                );
+                cell.complete(duration, content_items.unwrap_or_default(), success);
+                self.transcript.active_cell = Some(Box::new(cell));
+            }
+        }
+        self.flush_active_cell();
+        self.transcript.had_work_activity = true;
+    }
+
     pub(crate) fn handle_queued_item_started_now(&mut self, item: ThreadItem) {
         match item {
             item @ ThreadItem::CommandExecution { .. } => {
@@ -262,6 +350,9 @@ impl ChatWidget {
             }
             item @ ThreadItem::McpToolCall { .. } => {
                 self.handle_mcp_tool_call_started_now(item);
+            }
+            item @ ThreadItem::DynamicToolCall { .. } => {
+                self.handle_dynamic_tool_call_started_now(item);
             }
             _ => {}
         }
@@ -274,6 +365,9 @@ impl ChatWidget {
             }
             item @ ThreadItem::FileChange { .. } => self.handle_file_change_completed_now(item),
             item @ ThreadItem::McpToolCall { .. } => self.handle_mcp_tool_call_completed_now(item),
+            item @ ThreadItem::DynamicToolCall { .. } => {
+                self.handle_dynamic_tool_call_completed_now(item);
+            }
             _ => {}
         }
     }
