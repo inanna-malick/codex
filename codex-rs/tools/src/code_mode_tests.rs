@@ -1,4 +1,5 @@
 use super::augment_tool_spec_for_code_mode;
+use super::augment_tool_spec_for_code_mode_with_output_schema;
 use super::code_mode_name_for_tool_name;
 use super::tool_spec_to_code_mode_tool_definition;
 use crate::AdditionalProperties;
@@ -106,6 +107,31 @@ fn augment_tool_spec_for_code_mode_preserves_exec_tool_description() {
                 definition: "start: \"exec\"".to_string(),
             },
         })
+    );
+}
+
+#[test]
+fn augment_freeform_tool_can_declare_a_string_result() {
+    let spec = ToolSpec::Freeform(FreeformTool {
+        name: "evaluate".to_string(),
+        description: "Evaluate source.".to_string(),
+        defer_loading: None,
+        format: FreeformToolFormat {
+            r#type: "text".to_string(),
+            syntax: String::new(),
+            definition: String::new(),
+        },
+    });
+
+    let ToolSpec::Freeform(tool) =
+        augment_tool_spec_for_code_mode_with_output_schema(spec, json!({ "type": "string" }))
+    else {
+        panic!("expected freeform tool");
+    };
+
+    assert!(
+        tool.description
+            .contains("evaluate(input: string): Promise<string>;")
     );
 }
 

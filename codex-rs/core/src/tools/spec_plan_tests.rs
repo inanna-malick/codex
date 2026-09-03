@@ -1189,6 +1189,55 @@ async fn namespaced_custom_dynamic_tools_support_direct_and_deferred_exposure() 
 }
 
 #[tokio::test]
+async fn code_mode_describes_dynamic_custom_tool_results_as_text() {
+    let direct_plan = probe_with(
+        |turn| set_features(turn, &[Feature::CodeMode]),
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                Some("tidepool_actor"),
+                "haskell",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    let ToolSpec::Namespace(namespace) = direct_plan.visible_spec("tidepool_actor") else {
+        panic!("expected dynamic tool namespace");
+    };
+    let ResponsesApiNamespaceTool::Custom(tool) = &namespace.tools[0] else {
+        panic!("expected custom dynamic tool");
+    };
+    assert!(
+        tool.description
+            .contains("tidepool_actor__haskell(input: string): Promise<string>;")
+    );
+
+    let plan = probe_with(
+        |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                Some("tidepool_actor"),
+                "haskell",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(
+        exec.description
+            .contains("tidepool_actor__haskell(input: string): Promise<string>;"),
+        "{}",
+        exec.description
+    );
+}
+
+#[tokio::test]
 async fn shell_zsh_fork_keeps_unified_exec_available() {
     let without_composition = probe(|turn| {
         set_features(turn, &[Feature::ShellTool]);

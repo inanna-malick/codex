@@ -27,6 +27,7 @@ use codex_tools::default_namespace_description;
 use codex_tools::dynamic_custom_tool_to_responses_api_tool;
 use codex_tools::dynamic_tool_to_responses_api_tool;
 use serde_json::Value;
+use serde_json::json;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -232,6 +233,11 @@ impl DynamicToolHandler {
 }
 
 impl CoreToolRuntime for DynamicToolHandler {
+    fn code_mode_output_schema(&self) -> Option<Value> {
+        matches!(self.payload_kind, DynamicToolPayloadKind::Custom)
+            .then(|| json!({ "type": "string" }))
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(
             (self.payload_kind, payload),

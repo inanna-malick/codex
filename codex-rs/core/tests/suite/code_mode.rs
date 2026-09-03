@@ -719,15 +719,8 @@ text(JSON.stringify(await tools.exec_command({ cmd: "printf code_mode_exec_marke
     .await?;
 
     let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    let parsed: Value = serde_json::from_str(text_item(&items, /*index*/ 1))?;
+    assert_eq!(items.len(), 1);
+    let parsed: Value = serde_json::from_str(text_item(&items, /*index*/ 0))?;
     assert!(
         parsed
             .get("chunk_id")
@@ -2171,25 +2164,17 @@ throw new Error("boom");
 
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
-    assert_eq!(items.len(), 4);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&items, /*index*/ 1), "before crash");
-    assert_eq!(text_item(&items, /*index*/ 2), "still before crash");
+    assert_eq!(items.len(), 3);
+    assert_eq!(text_item(&items, /*index*/ 0), "before crash");
+    assert_eq!(text_item(&items, /*index*/ 1), "still before crash");
     assert_regex_match(
         r#"(?sx)
 \A
-Script\ error:\n
 Error:\ boom\n
 (?:\s+at\ .+\n?)+
 \z
 "#,
-        text_item(&items, /*index*/ 3),
+        text_item(&items, /*index*/ 2),
     );
 
     Ok(())
@@ -2505,15 +2490,8 @@ text("phase 3");
 
     let third_request = third_completion.single_request();
     let third_items = function_tool_output_items(&third_request, "call-3");
-    assert_eq!(third_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&third_items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&third_items, /*index*/ 1), "phase 3");
+    assert_eq!(third_items.len(), 1);
+    assert_eq!(text_item(&third_items, /*index*/ 0), "phase 3");
 
     Ok(())
 }
@@ -2733,15 +2711,8 @@ text("session b done");
 
     let third_request = third_completion.single_request();
     let third_items = function_tool_output_items(&third_request, "call-3");
-    assert_eq!(third_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&third_items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&third_items, /*index*/ 1), "session a done");
+    assert_eq!(third_items.len(), 1);
+    assert_eq!(text_item(&third_items, /*index*/ 0), "session a done");
 
     fs::write(&session_b_gate, "ready")?;
     responses::mount_sse_once(
@@ -2773,15 +2744,8 @@ text("session b done");
 
     let fourth_request = fourth_completion.single_request();
     let fourth_items = function_tool_output_items(&fourth_request, "call-4");
-    assert_eq!(fourth_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&fourth_items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&fourth_items, /*index*/ 1), "session b done");
+    assert_eq!(fourth_items.len(), 1);
+    assert_eq!(text_item(&fourth_items, /*index*/ 0), "session b done");
     for (output, originating_call_id, expected_command) in [
         (
             first_request.custom_tool_call_output("call-1"),
@@ -3091,15 +3055,8 @@ text("after terminate");
 
     let third_request = third_completion.single_request();
     let third_items = custom_tool_output_items(&third_request, "call-3");
-    assert_eq!(third_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&third_items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&third_items, /*index*/ 1), "after terminate");
+    assert_eq!(third_items.len(), 1);
+    assert_eq!(text_item(&third_items, /*index*/ 0), "after terminate");
 
     Ok(())
 }
@@ -3148,18 +3105,8 @@ async fn code_mode_wait_returns_error_for_unknown_session() -> Result<()> {
     assert_ne!(success, Some(true));
 
     let items = function_tool_output_items(&request, "call-1");
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        "Script error:\nexec cell 999999 not found"
-    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(text_item(&items, /*index*/ 0), "exec cell 999999 not found");
 
     Ok(())
 }
@@ -3336,19 +3283,22 @@ text("session b done");
     let fourth_items = function_tool_output_items(&fourth_request, "call-4");
     match fourth_items.len() {
         1 => {
-            assert_regex_match(
-                concat!(
-                    r"(?s)\A",
-                    r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
-                ),
-                text_item(&fourth_items, /*index*/ 0),
-            );
+            let text = text_item(&fourth_items, /*index*/ 0);
+            if text != "session a done" {
+                assert_regex_match(
+                    concat!(
+                        r"(?s)\A",
+                        r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
+                    ),
+                    text,
+                );
+            }
         }
         2 => {
             assert_regex_match(
                 concat!(
                     r"(?s)\A",
-                    r"Script (?:completed|terminated)\nWall time \d+\.\d seconds\nOutput:\n\z"
+                    r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
                 ),
                 text_item(&fourth_items, /*index*/ 0),
             );
@@ -3735,14 +3685,7 @@ text("token one token two token three token four token five token six token seve
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&second_items, /*index*/ 0),
-    );
+    assert_eq!(second_items.len(), 1);
     let expected_pattern = r#"(?sx)
 \A
 Warning:\ truncated\ output\ \(original\ token\ count:\ \d+\)\n
@@ -3751,7 +3694,7 @@ Total\ output\ lines:\ 1\n
 .*…\d+\ tokens\ truncated….*
 \z
 "#;
-    assert_regex_match(expected_pattern, text_item(&second_items, /*index*/ 1));
+    assert_regex_match(expected_pattern, text_item(&second_items, /*index*/ 0));
 
     Ok(())
 }
@@ -3843,15 +3786,8 @@ text("after");
         Some(false),
         "exec exit helper call failed unexpectedly: {output}"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&items, /*index*/ 1), "before");
+    assert_eq!(items.len(), 1);
+    assert_eq!(text_item(&items, /*index*/ 0), "before");
     assert_eq!(output, "before");
 
     Ok(())
@@ -4260,21 +4196,14 @@ image(out);
         Some(false),
         "code_mode view_image call failed unexpectedly"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
+    assert_eq!(items.len(), 1);
 
     assert_eq!(
-        items[1].get("type").and_then(Value::as_str),
+        items[0].get("type").and_then(Value::as_str),
         Some("input_image")
     );
 
-    let emitted_image_url = items[1]
+    let emitted_image_url = items[0]
         .get("image_url")
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
@@ -4331,27 +4260,20 @@ image(imageItem);
         Some(false),
         "code_mode mcp image scenario call failed unexpectedly"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
+    assert_eq!(items.len(), 1);
 
     assert_eq!(
-        items[1].get("type").and_then(Value::as_str),
+        items[0].get("type").and_then(Value::as_str),
         Some("input_image")
     );
 
-    let emitted_image_url = items[1]
+    let emitted_image_url = items[0]
         .get("image_url")
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
     assert!(emitted_image_url.starts_with("data:image/png;base64,"));
     assert_eq!(
-        items[1].get("detail").and_then(Value::as_str),
+        items[0].get("detail").and_then(Value::as_str),
         Some("original")
     );
 
@@ -4382,15 +4304,8 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         Some(false),
         "exec apply_patch call failed unexpectedly: {items:?}"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(text_item(&items, /*index*/ 1), "{}");
+    assert_eq!(items.len(), 1);
+    assert_eq!(text_item(&items, /*index*/ 0), "{}");
 
     let file_path = test.cwd_path().join(file_name);
     assert_eq!(fs::read_to_string(&file_path)?, "hello from code_mode\n");

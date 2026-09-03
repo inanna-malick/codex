@@ -253,21 +253,27 @@ pub(super) async fn handle_runtime_response(
     max_output_tokens: Option<usize>,
     wall_time: Duration,
 ) -> Result<FunctionToolOutput, String> {
-    let script_status = format_script_status(&response);
-
     match response {
-        RuntimeResponse::Yielded { content_items, .. } => {
+        RuntimeResponse::Yielded {
+            cell_id,
+            content_items,
+            ..
+        } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
+            prepend_script_status(
+                &mut content_items,
+                &format!("Script running with cell ID {cell_id}"),
+                wall_time,
+            );
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
+            prepend_script_status(&mut content_items, "Script terminated", wall_time);
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
         RuntimeResponse::Result {
@@ -277,40 +283,30 @@ pub(super) async fn handle_runtime_response(
         } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
-            let success = error_text.is_none();
-            if let Some(error_text) = error_text {
-                content_items.push(FunctionCallOutputContentItem::InputText {
-                    text: format!("Script error:\n{error_text}"),
-                });
-            }
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
-            prepend_script_status(&mut content_items, &script_status, wall_time);
-            Ok(FunctionToolOutput::from_content(
+            Ok(completed_runtime_output(
                 content_items,
-                Some(success),
+                error_text,
+                max_output_tokens,
             ))
         }
     }
 }
 
-fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
-    sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
+fn completed_runtime_output(
+    mut content_items: Vec<FunctionCallOutputContentItem>,
+    error_text: Option<String>,
+    max_output_tokens: Option<usize>,
+) -> FunctionToolOutput {
+    let success = error_text.is_none();
+    if let Some(error_text) = error_text {
+        content_items.push(FunctionCallOutputContentItem::InputText { text: error_text });
+    }
+    let content_items = truncate_code_mode_result(content_items, max_output_tokens);
+    FunctionToolOutput::from_content(content_items, Some(success))
 }
 
-fn format_script_status(response: &RuntimeResponse) -> String {
-    match response {
-        RuntimeResponse::Yielded { cell_id, .. } => {
-            format!("Script running with cell ID {cell_id}")
-        }
-        RuntimeResponse::Terminated { .. } => "Script terminated".to_string(),
-        RuntimeResponse::Result { error_text, .. } => {
-            if error_text.is_none() {
-                "Script completed".to_string()
-            } else {
-                "Script failed".to_string()
-            }
-        }
-    }
+fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
+    sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
 }
 
 fn prepend_script_status(
@@ -444,6 +440,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::build_nested_tool_payload;
+    use super::completed_runtime_output;
     use super::truncate_code_mode_result;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
@@ -455,6 +452,7 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::openai_models::ToolMode;
     use codex_tools::ToolName;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     #[tokio::test]
@@ -518,6 +516,40 @@ mod tests {
             }
             other => panic!("expected freeform payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completed_output_preserves_host_text_without_a_status_wrapper() {
+        let diagnostic = "src/Main.hs:7:3: error:\n  Ambiguous type variable ‘a₀’\n  literal: {\\\"json\\\": true}\n";
+        let output = completed_runtime_output(
+            vec![FunctionCallOutputContentItem::InputText {
+                text: diagnostic.to_string(),
+            }],
+            None,
+            Some(10_000),
+        );
+
+        assert_eq!(
+            output.body,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: diagnostic.to_string(),
+            }]
+        );
+        assert_eq!(output.success, Some(true));
+    }
+
+    #[test]
+    fn runtime_error_text_is_not_prefixed() {
+        let output =
+            completed_runtime_output(Vec::new(), Some("Error: boom".to_string()), Some(10_000));
+
+        assert_eq!(
+            output.body,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: "Error: boom".to_string(),
+            }]
+        );
+        assert_eq!(output.success, Some(false));
     }
 
     #[test]
