@@ -68,6 +68,11 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         None
     }
 
+    /// Overrides the value returned by a nested Code Mode tool declaration.
+    fn code_mode_output_schema(&self) -> Option<Value> {
+        None
+    }
+
     /// Returns a readiness wait for this exact tool before taking the execution gate.
     fn wait_until_ready<'a>(&'a self, _session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
         None

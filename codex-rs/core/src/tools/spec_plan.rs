@@ -555,6 +555,7 @@ fn build_model_visible_specs(
             &tool_name,
             code_mode_tool_names,
             spec,
+            tool.runtime.code_mode_output_schema(),
         ));
     }
     specs.extend(hosted_specs);
@@ -574,6 +575,7 @@ fn spec_for_model_request(
     tool_name: &ToolName,
     code_mode_tool_names: &BTreeMap<String, ToolName>,
     spec: ToolSpec,
+    output_schema: Option<serde_json::Value>,
 ) -> ToolSpec {
     let tool_mode = effective_tool_mode(turn_context, model_info);
     if matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
@@ -586,7 +588,12 @@ fn spec_for_model_request(
             ))
             .is_some_and(|winner| winner == tool_name)
     {
-        codex_tools::augment_tool_spec_for_code_mode(spec)
+        match output_schema {
+            Some(output_schema) => {
+                codex_tools::augment_tool_spec_for_code_mode_with_output_schema(spec, output_schema)
+            }
+            None => codex_tools::augment_tool_spec_for_code_mode(spec),
+        }
     } else {
         spec
     }
@@ -802,6 +809,7 @@ fn register_code_mode_executors(
     let mut code_mode_nested_tool_specs = Vec::new();
     let mut exec_prompt_tool_specs = Vec::new();
     let mut deferred_exec_prompt_tool_specs = Vec::new();
+    let mut code_mode_output_schema_overrides = BTreeMap::new();
     let mut included_deferred_mcp_output_schema = false;
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context, model_info);
     for tool in registry.entries() {
@@ -817,6 +825,10 @@ fn register_code_mode_executors(
 
         let immutable_spec = tool.runtime.immutable_spec();
         let cached_runtime = immutable_spec.map(|_| Arc::clone(&tool.runtime));
+        let output_schema = tool.runtime.code_mode_output_schema();
+        if let Some(output_schema) = &output_schema {
+            code_mode_output_schema_overrides.insert(tool_name.clone(), output_schema.clone());
+        }
         let spec = immutable_spec
             .map(Arc::clone)
             .unwrap_or_else(|| Arc::new(tool.runtime.spec()));
@@ -863,15 +875,20 @@ fn register_code_mode_executors(
         } else {
             exec_prompt_tool_specs.push(spec.as_ref().clone());
         }
-        code_mode_nested_tool_specs.push((spec, cached_runtime));
+        code_mode_nested_tool_specs.push((spec, cached_runtime, output_schema));
     }
 
     let namespace_descriptions = code_mode_namespace_descriptions(&exec_prompt_tool_specs);
     let mut enabled_tools =
         collect_code_mode_exec_prompt_tool_definitions(exec_prompt_tool_specs.iter());
-    let deferred_tools = collect_code_mode_exec_prompt_tool_definitions(
+    let mut deferred_tools = collect_code_mode_exec_prompt_tool_definitions(
         deferred_exec_prompt_tool_specs.iter().map(Arc::as_ref),
     );
+    for definition in enabled_tools.iter_mut().chain(&mut deferred_tools) {
+        if let Some(output_schema) = code_mode_output_schema_overrides.get(&definition.tool_name) {
+            definition.output_schema = Some(output_schema.clone());
+        }
+    }
     enabled_tools
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
     let execute_handler = CodeModeExecuteHandler::new(

@@ -6,23 +6,40 @@ use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 
 /// Augment tool descriptions with code-mode-specific exec samples.
 pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
+    augment_tool_spec_for_code_mode_inner(spec, None)
+}
+
+/// Augment a tool description while overriding its Code Mode return type.
+pub fn augment_tool_spec_for_code_mode_with_output_schema(
+    spec: ToolSpec,
+    output_schema: serde_json::Value,
+) -> ToolSpec {
+    augment_tool_spec_for_code_mode_inner(spec, Some(output_schema))
+}
+
+fn augment_tool_spec_for_code_mode_inner(
+    spec: ToolSpec,
+    output_schema: Option<serde_json::Value>,
+) -> ToolSpec {
     match spec {
         ToolSpec::Function(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Function(tool.clone()))
+            let Some(mut definition) =
+                code_mode_tool_definition_for_spec(&ToolSpec::Function(tool.clone()))
             else {
                 return ToolSpec::Function(tool);
             };
-            tool.description = description;
+            definition.output_schema = output_schema.or(definition.output_schema);
+            tool.description = codex_code_mode::augment_tool_definition(definition).description;
             ToolSpec::Function(tool)
         }
         ToolSpec::Freeform(mut tool) => {
-            let Some(description) =
-                augmented_description_for_spec(&ToolSpec::Freeform(tool.clone()))
+            let Some(mut definition) =
+                code_mode_tool_definition_for_spec(&ToolSpec::Freeform(tool.clone()))
             else {
                 return ToolSpec::Freeform(tool);
             };
-            tool.description = description;
+            definition.output_schema = output_schema;
+            tool.description = codex_code_mode::augment_tool_definition(definition).description;
             ToolSpec::Freeform(tool)
         }
         ToolSpec::Namespace(mut namespace) => {
@@ -37,7 +54,9 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
-                            output_schema: tool.output_schema.clone(),
+                            output_schema: output_schema
+                                .clone()
+                                .or_else(|| tool.output_schema.clone()),
                         };
                         tool.description =
                             codex_code_mode::augment_tool_definition(definition).description;
@@ -51,7 +70,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Freeform,
                             input_schema: None,
-                            output_schema: None,
+                            output_schema: output_schema.clone(),
                         };
                         tool.description =
                             codex_code_mode::augment_tool_definition(definition).description;
@@ -109,12 +128,6 @@ pub fn collect_code_mode_exec_prompt_tool_definitions<'a>(
     tool_definitions.sort_by(|left, right| left.name.cmp(&right.name));
     tool_definitions.dedup_by(|left, right| left.name == right.name);
     tool_definitions
-}
-
-fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
-    code_mode_tool_definition_for_spec(spec)
-        .map(codex_code_mode::augment_tool_definition)
-        .map(|definition| definition.description)
 }
 
 fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
