@@ -43,6 +43,7 @@ use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadSettingsUpdateResponse;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartPersistence;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -423,6 +424,36 @@ async fn idle_queue_dispatch_preserves_client_id() -> Result<()> {
         Some(completed.turn.id.as_str())
     );
     assert_eq!(metadata["turn_trigger"].as_str(), Some("queue"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn immediate_thread_accepts_a_persisted_queue_submission_after_restart() -> Result<()> {
+    let (mut first, codex_home, _server) = queue_app(Vec::new()).await?;
+    let thread_id = first
+        .start_thread(ThreadStartParams {
+            persistence: Some(ThreadStartPersistence::Immediate),
+            ..Default::default()
+        })
+        .await?
+        .thread
+        .id;
+    drop(first);
+
+    let mut restarted = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let queued = queue_item(
+        &mut restarted,
+        submission(&thread_id, "queue without a bootstrap turn"),
+    )
+    .await?;
+    assert_eq!(
+        list_queue(&mut restarted, &thread_id).await?.data,
+        vec![queued]
+    );
     Ok(())
 }
 

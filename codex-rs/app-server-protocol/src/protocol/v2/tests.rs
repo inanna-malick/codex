@@ -4661,6 +4661,31 @@ fn thread_start_params_preserve_explicit_null_service_tier() {
 }
 
 #[test]
+fn thread_start_persistence_defaults_to_lazy() {
+    let params: ThreadStartParams =
+        serde_json::from_value(json!({})).expect("params should deserialize");
+    assert_eq!(
+        params.persistence.unwrap_or_default(),
+        ThreadStartPersistence::Lazy
+    );
+
+    let serialized = serde_json::to_value(params).expect("params should serialize");
+    assert_eq!(
+        serialized.get("persistence"),
+        Some(&serde_json::Value::Null)
+    );
+
+    let immediate: ThreadStartParams = serde_json::from_value(json!({
+        "persistence": "immediate"
+    }))
+    .expect("immediate persistence should deserialize");
+    assert_eq!(
+        immediate.persistence,
+        Some(ThreadStartPersistence::Immediate)
+    );
+}
+
+#[test]
 fn thread_lifecycle_responses_default_missing_optional_fields() {
     let response = json!({
         "thread": {

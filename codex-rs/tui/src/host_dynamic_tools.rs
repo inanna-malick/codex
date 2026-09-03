@@ -1,6 +1,7 @@
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartPersistence;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 const SESSION_PATH: &str = "/v1/dynamic-tools/session";
 const CALL_PATH: &str = "/v1/dynamic-tools/call";
@@ -133,6 +134,8 @@ impl HostDynamicTools {
             .dynamic_tools
             .get_or_insert_default()
             .extend(self.registration.dynamic_tools.clone());
+        params.ephemeral = Some(false);
+        params.persistence = Some(ThreadStartPersistence::Immediate);
         true
     }
 

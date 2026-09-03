@@ -232,9 +232,10 @@ with:
 codex --host-dynamic-tools-socket /absolute/private/actor/dynamic-tools.sock
 ```
 
-This v1 bridge is available on Linux and macOS, is restricted to the bootstrap primary thread, and
-uses HTTP only for framing over the Unix socket. Codex never creates or removes the socket. The host
-must bind it before launch in an owner-only directory and retire the endpoint with the actor.
+This protocol-version 2 bridge is available on Linux and macOS, is restricted to the bootstrap
+primary thread, and uses HTTP only for framing over the Unix socket. The route names retain their
+`/v1` prefix. Codex never creates or removes the socket. The host must bind it before launch in an
+owner-only directory and retire the endpoint with the actor.
 
 The service implements three routes:
 
@@ -248,7 +249,7 @@ Registration returns the dynamic tool definitions before Codex starts its App Se
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "dynamicTools": [
     {
       "type": "custom",
@@ -261,11 +262,12 @@ Registration returns the dynamic tool definitions before Codex starts its App Se
 }
 ```
 
-After `thread/start`, `thread/resume`, or the initial CLI `thread/fork`, Codex attaches the resulting
-thread before submitting its first turn:
+For a new primary thread, Codex requests immediate non-ephemeral persistence and waits for the
+rollout durability barrier before attaching it. After `thread/start`, `thread/resume`, or the initial
+CLI `thread/fork`, Codex attaches the resulting thread before submitting its first turn:
 
 ```json
-{"protocolVersion":1,"threadId":"019..."}
+{"protocolVersion":2,"threadId":"019..."}
 ```
 
 The endpoint returns HTTP 204 only after validating that the thread belongs to the actor. The
@@ -277,7 +279,7 @@ Calls contain the existing callback fields plus the bridge version:
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "threadId": "019...",
   "turnId": "turn-123",
   "callId": "call-456",

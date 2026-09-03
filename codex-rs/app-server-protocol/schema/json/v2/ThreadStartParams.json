@@ -362,6 +362,13 @@
     "ThreadSource": {
       "type": "string"
     },
+    "ThreadStartPersistence": {
+      "enum": [
+        "lazy",
+        "immediate"
+      ],
+      "type": "string"
+    },
     "ThreadStartSource": {
       "enum": [
         "startup",
