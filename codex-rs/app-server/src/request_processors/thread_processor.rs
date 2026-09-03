@@ -15,6 +15,7 @@ use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
+use codex_app_server_protocol::ThreadStartPersistence;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::SanitizedGitUrl;
@@ -1186,6 +1187,7 @@ impl ThreadRequestProcessor {
             personality,
             multi_agent_mode: _multi_agent_mode,
             ephemeral,
+            persistence,
             history_mode,
             session_start_source,
             thread_source,
@@ -1282,6 +1284,7 @@ impl ThreadRequestProcessor {
                 service_name,
                 allow_provider_model_fallback,
                 experimental_raw_events,
+                persistence.unwrap_or_default(),
                 request_trace,
                 initial_config_warnings,
             )
@@ -1361,6 +1364,7 @@ impl ThreadRequestProcessor {
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
         experimental_raw_events: bool,
+        persistence: ThreadStartPersistence,
         request_trace: Option<W3cTraceContext>,
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
     ) -> Result<(), JSONRPCErrorError> {
@@ -1492,6 +1496,10 @@ impl ThreadRequestProcessor {
             .await?
         };
         start_options.reserved_thread_id = reserved_thread_id;
+        start_options.persistence = match persistence {
+            ThreadStartPersistence::Lazy => codex_core::ThreadStartPersistence::Lazy,
+            ThreadStartPersistence::Immediate => codex_core::ThreadStartPersistence::Immediate,
+        };
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager

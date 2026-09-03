@@ -23843,6 +23843,13 @@
         "title": "ThreadStartParams",
         "type": "object"
       },
+      "ThreadStartPersistence": {
+        "enum": [
+          "lazy",
+          "immediate"
+        ],
+        "type": "string"
+      },
       "ThreadStartResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {

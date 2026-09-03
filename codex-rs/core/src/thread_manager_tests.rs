@@ -119,6 +119,40 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
     assert_eq!(generated.thread_id, generated_ids[2]);
 }
 
+#[tokio::test]
+async fn immediate_persistence_rejects_resumed_history() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let mut options = StartThreadOptions::new(config);
+    options.initial_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: ThreadId::new(),
+        history: Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    options.persistence = ThreadStartPersistence::Immediate;
+
+    let error = manager
+        .start_thread(options)
+        .await
+        .err()
+        .expect("immediate resume must be rejected");
+
+    assert!(matches!(
+        error.details(),
+        codex_protocol::error::CodexErrorDetails::InvalidRequest(message)
+            if message == "immediate persistence cannot be used when resuming a thread"
+    ));
+}
+
 /// One custom ID factory supplies identifiers for roots, actual child agents, and forks.
 #[tokio::test]
 async fn thread_id_generator_applies_to_roots_children_and_forks() {
@@ -2049,6 +2083,161 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         .shutdown_and_wait()
         .await
         .expect("shutdown forked thread");
+}
+
+enum ImmediateRequesterExit {
+    Cancelled,
+    ShutdownTimeout,
+}
+
+#[tokio::test]
+async fn cancelled_immediate_start_finishes_cleanup_before_releasing_same_id() {
+    assert_failed_immediate_start_holds_same_id_gate(ImmediateRequesterExit::Cancelled).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_immediate_start_holds_same_id_gate_until_shutdown_finishes() {
+    assert_failed_immediate_start_holds_same_id_gate(ImmediateRequesterExit::ShutdownTimeout).await;
+}
+
+async fn assert_failed_immediate_start_holds_same_id_gate(requester_exit: ImmediateRequesterExit) {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("immediate-flush-failure-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        passthrough_image_store(),
+        thread_store.clone(),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    in_memory_store.fail_flush_for_testing();
+    in_memory_store.pause_shutdown_for_testing();
+    let thread_id = manager.reserve_thread_id();
+    let contender_config = config.clone();
+    let mut options = StartThreadOptions::new(config);
+    options.reserved_thread_id = Some(thread_id);
+    options.persistence = ThreadStartPersistence::Immediate;
+
+    let immediate_manager = Arc::clone(&manager);
+    let mut requester = Some(tokio::spawn(async move {
+        immediate_manager.start_thread(options).await
+    }));
+    in_memory_store.wait_for_shutdown_for_testing().await;
+    if matches!(requester_exit, ImmediateRequesterExit::Cancelled) {
+        let requester = requester.take().expect("requester is running");
+        requester.abort();
+        let requester_error = match requester.await {
+            Ok(_) => panic!("aborted requester must not complete"),
+            Err(error) => error,
+        };
+        assert!(requester_error.is_cancelled());
+    }
+    let calls_before_contender = in_memory_store.calls().await;
+    let mut options = StartThreadOptions::new(contender_config);
+    options.reserved_thread_id = Some(thread_id);
+    let mut contender = Box::pin(manager.start_thread(options));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), contender.as_mut())
+            .await
+            .is_err(),
+        "contender must wait while the detached transaction finishes cleanup"
+    );
+    if matches!(requester_exit, ImmediateRequesterExit::ShutdownTimeout) {
+        let error = requester
+            .take()
+            .expect("requester is running")
+            .await
+            .expect("owned startup task must finish after the shutdown timeout")
+            .err()
+            .expect("injected flush failure must fail startup");
+        assert!(error.to_string().contains("injected rollout flush failure"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), contender.as_mut())
+                .await
+                .is_err(),
+            "the timed-out cleanup must retain the gate until shutdown finishes"
+        );
+    }
+    let calls_while_blocked = in_memory_store.calls().await;
+    let state_preserved_until_shutdown = thread_store
+        .read_thread(ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await
+        .is_ok();
+    in_memory_store.resume_shutdown_for_testing();
+    let contender = contender.await.expect("start contender after cleanup");
+
+    assert!(Arc::ptr_eq(
+        &manager
+            .get_thread(thread_id)
+            .await
+            .expect("contender is registered after cleanup"),
+        &contender.thread
+    ));
+    assert_eq!(
+        (
+            calls_while_blocked.create_thread,
+            calls_while_blocked.persist_thread,
+        ),
+        (
+            calls_before_contender.create_thread,
+            calls_before_contender.persist_thread,
+        ),
+        "the blocked contender must not create or persist store state"
+    );
+    assert!(state_preserved_until_shutdown);
+    let calls = in_memory_store.calls().await;
+    assert_eq!(
+        (
+            calls.create_thread,
+            calls.persist_thread,
+            calls.flush_thread,
+            calls.delete_thread,
+        ),
+        (2, 1, 1, 1),
+        "cleanup must finish before the lazy contender creates its live store state"
+    );
+    assert!(
+        manager
+            .state
+            .start_transaction_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "completed start transactions must release their per-ID gates"
+    );
+    contender
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown contender");
 }
 
 #[tokio::test]

@@ -26,8 +26,11 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition;
 use codex_app_server_protocol::TextRange;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartPersistence;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
@@ -1123,6 +1126,75 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         "ephemeral threads should serialize `ephemeral: true`"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_immediate_persistence_rejects_ephemeral_threads() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            ephemeral: Some(true),
+            persistence: Some(ThreadStartPersistence::Immediate),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(
+        error.error.message,
+        "immediate persistence cannot be used for an ephemeral thread"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_immediate_persistence_failure_removes_the_runtime() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    std::fs::write(
+        codex_home.path().join(codex_core::SESSIONS_SUBDIR),
+        "blocked",
+    )?;
+
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            persistence: Some(ThreadStartPersistence::Immediate),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error
+            .error
+            .message
+            .contains("failed to persist thread before start completed"),
+        "unexpected error: {}",
+        error.error.message
+    );
+
+    let loaded_id = mcp
+        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+        .await?;
+    let loaded: ThreadLoadedListResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(loaded_id)).await??;
+    assert!(loaded.data.is_empty());
     Ok(())
 }
 

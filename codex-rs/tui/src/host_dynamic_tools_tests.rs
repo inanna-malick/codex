@@ -93,7 +93,7 @@ pub(crate) fn spawn_host(
                 REGISTRATION_PATH => Some((
                     "200 OK",
                     serde_json::to_vec(&json!({
-                        "protocolVersion": 1,
+                        "protocolVersion": 2,
                         "dynamicTools": [{
                             "type": "custom",
                             "name": "evaluate",
@@ -180,7 +180,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(session.path, SESSION_PATH);
     assert_eq!(
         session.body,
-        json!({"protocolVersion": 1, "threadId": thread_id})
+        json!({"protocolVersion": 2, "threadId": thread_id})
     );
     let call = requests.recv()?;
     assert_eq!(call.method, "POST");
@@ -188,7 +188,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(
         call.body,
         json!({
-            "protocolVersion": 1,
+            "protocolVersion": 2,
             "threadId": thread_id,
             "turnId": "turn-α",
             "callId": "call-1",

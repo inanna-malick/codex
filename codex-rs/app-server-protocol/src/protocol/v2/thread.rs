@@ -54,6 +54,15 @@ pub enum ThreadStartSource {
     Clear,
 }
 
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadStartPersistence {
+    #[default]
+    Lazy,
+    Immediate,
+}
+
 // === Threads, Turns, and Items ===
 // Thread APIs
 #[derive(
@@ -114,6 +123,10 @@ pub struct ThreadStartParams {
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    /// Controls when this thread's rollout becomes durably discoverable.
+    #[experimental("thread/start.persistence")]
+    #[ts(optional = nullable)]
+    pub persistence: Option<ThreadStartPersistence>,
     /// Persisted thread history contract to use for this new thread.
     #[experimental("thread/start.historyMode")]
     #[ts(optional = nullable)]

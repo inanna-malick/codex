@@ -1066,7 +1066,7 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
 
     let starts = recorded_params(&requests, "thread/start");
     assert_eq!(starts.len(), 6);
-    for attempts in starts.chunks_exact(3) {
+    for attempts in starts.as_chunks::<3>().0 {
         assert_eq!(attempts[0]["dynamicTools"][0]["type"], "namespace");
         assert_eq!(attempts[0]["historyMode"], "paginated");
         assert_eq!(attempts[1]["dynamicTools"], serde_json::Value::Null);
@@ -1153,6 +1153,8 @@ async fn fresh_primary_registers_host_tool_and_attaches_before_returning() -> Re
             .iter()
             .any(|tool| tool["type"] == "custom" && tool["name"] == "evaluate")
     );
+    assert_eq!(starts[0]["ephemeral"], false);
+    assert_eq!(starts[0]["persistence"], "immediate");
     let registration = host_requests.recv()?;
     assert_eq!(registration.path, "/v1/dynamic-tools/registration");
     let session = host_requests.recv()?;
@@ -1738,7 +1740,7 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
     assert_eq!(
         call.body,
         serde_json::json!({
-            "protocolVersion": 1,
+            "protocolVersion": 2,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",

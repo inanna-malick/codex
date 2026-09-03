@@ -560,6 +560,7 @@ export type { ThreadSortKey } from "./ThreadSortKey";
 export type { ThreadSource } from "./ThreadSource";
 export type { ThreadSourceKind } from "./ThreadSourceKind";
 export type { ThreadStartParams } from "./ThreadStartParams";
+export type { ThreadStartPersistence } from "./ThreadStartPersistence";
 export type { ThreadStartResponse } from "./ThreadStartResponse";
 export type { ThreadStartSource } from "./ThreadStartSource";
 export type { ThreadStartedNotification } from "./ThreadStartedNotification";
