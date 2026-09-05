@@ -22,6 +22,11 @@ def main() -> None:
         help="optional Prettier executable used to format TypeScript files",
     )
     parser.add_argument(
+        "--cargo-profile",
+        default="dev",
+        help="Cargo build profile used by the schema generator (default: dev)",
+    )
+    parser.add_argument(
         "--experimental",
         action="store_true",
         help="regenerate the precomputed experimental exports",
@@ -39,15 +44,17 @@ def main() -> None:
 
     subprocess.run(
         [
-            "cargo",
+            "just",
             "test",
+            "--cargo-profile",
+            args.cargo_profile,
             "-p",
             "codex-app-server-protocol",
             "--lib",
-            "schema_fixtures_tests::write_schema_fixtures_from_env",
-            "--",
-            "--exact",
-            "--ignored",
+            "-E",
+            "test(=schema_fixtures_tests::write_schema_fixtures_from_env)",
+            "--run-ignored",
+            "ignored-only",
         ],
         cwd=workspace_root,
         env=env,
