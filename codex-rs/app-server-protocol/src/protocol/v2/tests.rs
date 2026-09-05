@@ -3254,6 +3254,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let dynamic_tool_call_item = TurnItem::DynamicToolCall(DynamicToolCallItem {
+        context_call_id: None,
         id: "dynamic-1".to_string(),
         namespace: Some("apps".to_string()),
         tool: "lookup".to_string(),

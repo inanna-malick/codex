@@ -59,6 +59,7 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() -> 
     );
     store
         .create_thread(CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

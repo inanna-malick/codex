@@ -396,6 +396,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     });
     let namespace_description = "Demo namespace tools";
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: tool_namespace.to_string(),
         description: namespace_description.to_string(),
         tools: vec![
@@ -485,6 +486,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     };
 
     let expected = DynamicToolCallParams {
+        context_call_id: Some(call_id.to_string()),
         thread_id: thread_id.clone(),
         turn_id: turn_id.clone(),
         call_id: call_id.to_string(),
@@ -663,6 +665,7 @@ nested = "putStrLn \"inner string\""
     assert_eq!(
         params,
         DynamicToolCallParams {
+            context_call_id: Some(call_id.to_string()),
             thread_id: thread.id,
             turn_id: turn.id,
             call_id: call_id.to_string(),
@@ -910,6 +913,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
     };
 
     let params = DynamicToolCallParams {
+        context_call_id: Some(call_id.to_string()),
         thread_id,
         turn_id,
         call_id: call_id.to_string(),

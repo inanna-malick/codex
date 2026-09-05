@@ -1948,6 +1948,7 @@ mod tests {
 
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

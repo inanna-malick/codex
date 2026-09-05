@@ -235,6 +235,7 @@ pub(super) fn completed_item(
         )),
         EventMsg::DynamicToolCallResponse(event) => Some((
             TurnItem::DynamicToolCall(DynamicToolCallItem {
+                context_call_id: None,
                 id: event.call_id.clone(),
                 namespace: event.namespace.clone(),
                 tool: event.tool.clone(),

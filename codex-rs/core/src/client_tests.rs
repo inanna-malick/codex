@@ -759,6 +759,41 @@ fn internal_session_prompt_cache_key_is_scoped_to_parent_thread() {
     );
 }
 
+#[tokio::test]
+async fn inherited_cache_affinity_routes_both_transports_without_replacing_identity() {
+    let mut client = test_model_client(SessionSource::Cli);
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-routing"),
+        "window-routing".to_string(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let routing_session_id = codex_protocol::SessionId::from(ThreadId::new());
+    client.cache_affinity = Some(codex_protocol::protocol::ProviderCacheAffinity {
+        routing_session_id,
+        prompt_cache_key: "dedicated-cache-bucket".to_string(),
+    });
+    let headers = client.build_websocket_headers(&metadata).await;
+    assert_eq!(headers["session-id"], routing_session_id.to_string());
+    assert_eq!(headers["thread-id"], metadata.thread_id);
+    let provider_metadata = client.build_provider_client_metadata(&metadata);
+    assert_eq!(
+        provider_metadata["session_id"],
+        routing_session_id.to_string()
+    );
+    assert_eq!(provider_metadata["thread_id"], metadata.thread_id);
+    let identity: serde_json::Value =
+        serde_json::from_str(&provider_metadata["x-codex-turn-metadata"]).unwrap();
+    assert_eq!(identity["session_id"], metadata.session_id);
+    assert_eq!(identity["thread_id"], metadata.thread_id);
+    assert_eq!(client.prompt_cache_key(&metadata), "dedicated-cache-bucket");
+    assert_eq!(
+        client.build_ws_client_metadata(&metadata, false),
+        provider_metadata
+    );
+}
+
 #[test]
 fn build_subagent_headers_sets_internal_memory_consolidation_label() {
     let client = test_model_client(SessionSource::Internal(

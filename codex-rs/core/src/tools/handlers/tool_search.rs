@@ -359,6 +359,7 @@ mod tests {
     fn deferred_custom_dynamic_tools_are_searchable() {
         let cache = ToolSearchHandlerCache::default();
         let namespace = DynamicToolNamespaceSpec {
+            model_only: false,
             name: "languages".to_string(),
             description: "Language runtimes".to_string(),
             tools: Vec::new(),
@@ -399,6 +400,7 @@ mod tests {
     #[test]
     fn mixed_search_results_coalesce_mcp_namespaces() {
         let dynamic_namespace = DynamicToolNamespaceSpec {
+            model_only: false,
             name: "codex_app".to_string(),
             description: "Tools in the codex_app namespace.".to_string(),
             tools: Vec::new(),

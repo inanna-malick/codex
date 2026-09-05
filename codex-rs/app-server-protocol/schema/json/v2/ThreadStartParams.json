@@ -258,6 +258,10 @@
             "description": {
               "type": "string"
             },
+            "modelOnly": {
+              "description": "Keep this namespace on the model tool surface, excluding code-mode wrappers.",
+              "type": "boolean"
+            },
             "name": {
               "type": "string"
             },

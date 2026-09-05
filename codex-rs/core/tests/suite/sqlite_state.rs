@@ -197,6 +197,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
         "additionalProperties": false,
     });
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: namespace.to_string(),
         description: namespace_description.to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(
@@ -414,6 +415,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
             fs::create_dir_all(parent).expect("should create rollout directory");
             let session_meta_line = SessionMetaLine {
                 meta: SessionMeta {
+                    cache_affinity: None,
+                    require_client_readiness: false,
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,

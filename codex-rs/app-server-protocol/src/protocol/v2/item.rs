@@ -1639,6 +1639,8 @@ pub struct FileChangeRequestApprovalResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct DynamicToolCallParams {
+    /// Recorded model invocation owning this execution; absent for legacy events.
+    pub context_call_id: Option<String>,
     pub thread_id: String,
     pub turn_id: String,
     pub call_id: String,

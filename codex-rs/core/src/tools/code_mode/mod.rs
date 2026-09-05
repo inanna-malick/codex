@@ -45,6 +45,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
+pub(crate) use delegate::CellOrigin;
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
@@ -180,17 +181,14 @@ impl CodeModeService {
     pub(crate) fn mark_cell_ready_for_dispatch(
         &self,
         cell_id: &codex_code_mode::CellId,
-        originating_item_id: Option<codex_protocol::ResponseItemId>,
+        origin: CellOrigin,
     ) {
         self.dispatch_broker
-            .mark_cell_ready_for_dispatch(cell_id, originating_item_id);
+            .mark_cell_ready_for_dispatch(cell_id, origin);
     }
 
-    pub(crate) fn cell_originating_item_id(
-        &self,
-        cell_id: &codex_code_mode::CellId,
-    ) -> Option<codex_protocol::ResponseItemId> {
-        self.dispatch_broker.cell_originating_item_id(cell_id)
+    pub(crate) fn cell_origin(&self, cell_id: &codex_code_mode::CellId) -> Option<CellOrigin> {
+        self.dispatch_broker.cell_origin(cell_id)
     }
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {

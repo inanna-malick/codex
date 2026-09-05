@@ -444,6 +444,7 @@ mod tests {
     async fn create_metadata_records_originator_without_project() {
         let thread_id = ThreadId::new();
         let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

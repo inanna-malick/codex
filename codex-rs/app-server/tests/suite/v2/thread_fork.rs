@@ -743,13 +743,17 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     Ok(())
 }
 
-#[rstest::rstest]
-#[case::explicit_deferral(false)]
-#[case::readiness_gate(true)]
 #[tokio::test]
-async fn thread_fork_defers_inherited_active_goal_until_next_turn(
-    #[case] require_client_readiness: bool,
-) -> Result<()> {
+async fn thread_fork_explicitly_defers_inherited_active_goal() -> Result<()> {
+    check_fork_defers_inherited_active_goal(false).await
+}
+
+#[tokio::test]
+async fn thread_fork_readiness_gate_defers_inherited_active_goal() -> Result<()> {
+    check_fork_defers_inherited_active_goal(true).await
+}
+
+async fn check_fork_defers_inherited_active_goal(require_client_readiness: bool) -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("first-source-turn"),

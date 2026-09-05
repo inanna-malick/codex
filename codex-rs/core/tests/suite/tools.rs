@@ -94,6 +94,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
         .into_iter()
         .map(|(name, description)| {
             DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "shared".to_string(),
                 description: description.to_string(),
                 tools: vec![DynamicToolNamespaceTool::Function(

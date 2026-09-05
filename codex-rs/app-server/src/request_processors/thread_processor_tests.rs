@@ -159,6 +159,7 @@ mod thread_processor_behavior_tests {
         match namespace {
             Some(namespace) => {
                 DynamicToolSpec::Namespace(codex_app_server_protocol::DynamicToolNamespaceSpec {
+                    model_only: false,
                     name: namespace.to_string(),
                     description: "test namespace".to_string(),
                     tools: vec![DynamicToolNamespaceTool::Function(function)],
@@ -266,6 +267,7 @@ mod thread_processor_behavior_tests {
         };
         let tools = vec![DynamicToolSpec::Namespace(
             codex_app_server_protocol::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "codex_app".to_string(),
                 description: "test namespace".to_string(),
                 tools: vec![
@@ -283,6 +285,7 @@ mod thread_processor_behavior_tests {
     fn validate_dynamic_tools_rejects_mixed_kind_duplicate_name() {
         let tools = vec![DynamicToolSpec::Namespace(
             codex_app_server_protocol::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "codex_app".to_string(),
                 description: "test namespace".to_string(),
                 tools: vec![

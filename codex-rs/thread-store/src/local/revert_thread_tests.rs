@@ -149,6 +149,7 @@ async fn rollout_paths_for_thread(
 async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) {
     store
         .create_thread(CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

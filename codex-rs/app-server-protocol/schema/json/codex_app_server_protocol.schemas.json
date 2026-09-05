@@ -2818,6 +2818,13 @@
         "callId": {
           "type": "string"
         },
+        "contextCallId": {
+          "description": "Recorded model invocation owning this execution; absent for legacy events.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "namespace": {
           "type": [
             "string",
@@ -10759,6 +10766,10 @@
             "properties": {
               "description": {
                 "type": "string"
+              },
+              "modelOnly": {
+                "description": "Keep this namespace on the model tool surface, excluding code-mode wrappers.",
+                "type": "boolean"
               },
               "name": {
                 "type": "string"

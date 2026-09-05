@@ -2087,6 +2087,7 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
         "additionalProperties": false,
     });
     let dynamic_tools = vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "codex_app".to_string(),
         description: "Codex app tools.".to_string(),
         tools: vec![
@@ -2202,6 +2203,7 @@ async fn remote_compact_does_not_charge_inline_audio_payload_as_text() -> Result
         });
     let mut test = builder.build(&server).await?;
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "codex_app".to_string(),
         description: "Audio tools.".to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(
@@ -2791,6 +2793,7 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
         "additionalProperties": false,
     });
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "codex_app".to_string(),
         description: "Codex app tools.".to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(

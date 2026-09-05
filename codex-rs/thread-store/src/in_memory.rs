@@ -128,6 +128,7 @@ mod tests {
         ] {
             store
                 .create_thread(CreateThreadParams {
+                    cache_affinity: None,
                     session_id: thread_id.into(),
                     thread_id,
                     extra_config: None,
@@ -421,6 +422,7 @@ mod tests {
         history_mode: ThreadHistoryMode,
     ) -> CreateThreadParams {
         CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -568,6 +570,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
         let session_meta = SessionMeta {
+            cache_affinity: params.cache_affinity.clone(),
             session_id: params.session_id,
             id: params.thread_id,
             forked_from_id: params.forked_from_id,

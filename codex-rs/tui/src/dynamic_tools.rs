@@ -228,6 +228,7 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
     ];
 
     vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: NAMESPACE.to_string(),
         description: "Manage Codex tasks available through the connected app server.".to_string(),
         tools: definitions

@@ -455,6 +455,7 @@ impl ExternalAgentSessionImporter {
         };
         let now = Utc::now();
         let create_params = CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

@@ -1089,6 +1089,7 @@ async fn required_dynamic_tools_are_not_removed_for_an_older_server() -> Result<
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
         crate::app_server_session::ThreadParamsMode::Embedded,
+        LoaderOverrides::default(),
     )
     .await?;
     let mut params = crate::app_server_session::thread_start_params_from_config(
@@ -1213,6 +1214,7 @@ async fn resumed_primary_reattaches_host_tool_before_calls_are_authorized() -> R
     assert_eq!(session.body["threadId"], thread_id.to_string());
     assert_eq!(
         resumed_host.routing(&codex_app_server_protocol::DynamicToolCallParams {
+            context_call_id: None,
             thread_id: thread_id.to_string(),
             turn_id: "turn-resumed".to_string(),
             call_id: "call-resumed".to_string(),
@@ -1241,6 +1243,7 @@ async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
             ServerRequest::DynamicToolCall {
                 request_id: AppServerRequestId::Integer(100),
                 params: codex_app_server_protocol::DynamicToolCallParams {
+                    context_call_id: None,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-1".to_string(),
@@ -1297,6 +1300,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
                 ServerRequest::DynamicToolCall {
                     request_id: AppServerRequestId::Integer(100),
                     params: codex_app_server_protocol::DynamicToolCallParams {
+                        context_call_id: None,
                         thread_id: thread_id.clone(),
                         turn_id: "turn-1".to_string(),
                         call_id: "call-1".to_string(),
@@ -1317,6 +1321,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
             ServerRequest::DynamicToolCall {
                 request_id: AppServerRequestId::Integer(101),
                 params: codex_app_server_protocol::DynamicToolCallParams {
+                    context_call_id: None,
                     thread_id: thread_id.clone(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-2".to_string(),
@@ -1374,6 +1379,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
             ServerRequest::DynamicToolCall {
                 request_id: AppServerRequestId::Integer(102),
                 params: codex_app_server_protocol::DynamicToolCallParams {
+                    context_call_id: None,
                     thread_id: thread_id.clone(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-3".to_string(),
@@ -1408,6 +1414,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
                 ServerRequest::DynamicToolCall {
                     request_id: AppServerRequestId::String(format!("rejected-{index}")),
                     params: codex_app_server_protocol::DynamicToolCallParams {
+                        context_call_id: None,
                         thread_id: thread_id.clone(),
                         turn_id: "turn-1".to_string(),
                         call_id: format!("rejected-{index}"),
@@ -1484,6 +1491,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
         &app_server,
         AppServerRequestId::Integer(103),
         codex_app_server_protocol::DynamicToolCallParams {
+            context_call_id: None,
             thread_id: creation_source.to_string(),
             turn_id: "turn-1".to_string(),
             call_id: "call-4".to_string(),
@@ -1573,6 +1581,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
         &app_server,
         AppServerRequestId::Integer(104),
         codex_app_server_protocol::DynamicToolCallParams {
+            context_call_id: None,
             thread_id: thread_id.clone(),
             turn_id: "turn-1".to_string(),
             call_id: "call-5".to_string(),
@@ -1688,6 +1697,7 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
         AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
             request_id: request_id.clone(),
             params: codex_app_server_protocol::DynamicToolCallParams {
+                context_call_id: None,
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-host".to_string(),
                 call_id: "call-host".to_string(),
@@ -2201,6 +2211,7 @@ async fn remote_legacy_history_start_negotiates_once_for_resume_and_fork() -> Re
     let response = crate::dynamic_tools::execute(
         app_server.request_handle(),
         codex_app_server_protocol::DynamicToolCallParams {
+            context_call_id: None,
             thread_id: started.session.thread_id.to_string(),
             turn_id: "source-turn".to_string(),
             call_id: "legacy-wait".to_string(),

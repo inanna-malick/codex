@@ -70,6 +70,20 @@ pub struct ToolInvocation {
 }
 
 impl ToolInvocation {
+    /// The recorded model invocation that owns this execution, not its nested reply ID.
+    pub(crate) fn context_call_id(&self) -> Option<String> {
+        match &self.source {
+            ToolCallSource::Direct => Some(self.call_id.clone()),
+            ToolCallSource::DirectPlaintextMessage => None,
+            ToolCallSource::CodeMode { cell_id, .. } => self
+                .session
+                .services
+                .code_mode_service
+                .cell_origin(&codex_code_mode::CellId::new(cell_id.clone()))
+                .map(|origin| origin.call_id),
+        }
+    }
+
     /// Returns the Responses item that requested this call or started its code-mode cell.
     pub(crate) async fn originating_item_id(&self) -> Option<ResponseItemId> {
         if let ToolCallSource::CodeMode { cell_id, .. } = &self.source {
@@ -77,7 +91,8 @@ impl ToolInvocation {
                 .session
                 .services
                 .code_mode_service
-                .cell_originating_item_id(&codex_code_mode::CellId::new(cell_id.clone()));
+                .cell_origin(&codex_code_mode::CellId::new(cell_id.clone()))
+                .and_then(|origin| origin.item_id);
         }
 
         self.session

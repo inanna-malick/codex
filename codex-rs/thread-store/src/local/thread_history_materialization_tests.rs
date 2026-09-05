@@ -583,6 +583,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
     let legacy_thread_id = ThreadId::new();
     store
         .create_thread(CreateThreadParams {
+            cache_affinity: None,
             session_id: legacy_thread_id.into(),
             thread_id: legacy_thread_id,
             extra_config: None,
@@ -2570,6 +2571,7 @@ async fn create_paginated_subagent_thread(
 ) {
     store
         .create_thread(CreateThreadParams {
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

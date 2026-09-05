@@ -27,35 +27,33 @@ pub(super) async fn create_thread(
     };
     RolloutRecorder::new(
         &config,
-        RolloutRecorderParams::new(
-            params.thread_id,
-            params.forked_from_id,
-            params.parent_thread_id,
-            params.source,
-            params.thread_source,
-            params.originator,
-            params.base_instructions,
-            params.dynamic_tools,
-        )
-        .with_session_id(params.session_id)
-        .with_client_readiness(
-            params
-                .extra_config
-                .as_ref()
-                .is_some_and(|config| config.require_client_readiness),
-        )
-        .with_selected_capability_roots(params.selected_capability_roots)
-        .with_multi_agent_version(params.multi_agent_version)
-        .with_history_mode(params.history_mode)
-        .with_history_base(params.history_base)
-        .with_forked_from_ordinal_exclusive(
-            params
+        RolloutRecorderParams::Create {
+            cache_affinity: params.cache_affinity,
+            session_id: params.session_id,
+            conversation_id: params.thread_id,
+            rollout_id_override: None,
+            forked_from_id: params.forked_from_id,
+            forked_from_ordinal_exclusive: params
                 .forked_from_id
                 .and(params.history_base)
                 .map(|base| base.end_ordinal_exclusive),
-        )
-        .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
-        .with_initial_window_id(params.initial_window_id),
+            parent_thread_id: params.parent_thread_id,
+            source: Box::new(params.source),
+            thread_source: params.thread_source,
+            originator: params.originator,
+            base_instructions: params.base_instructions,
+            dynamic_tools: params.dynamic_tools,
+            require_client_readiness: params
+                .extra_config
+                .as_ref()
+                .is_some_and(|config| config.require_client_readiness),
+            selected_capability_roots: params.selected_capability_roots,
+            multi_agent_version: params.multi_agent_version,
+            history_mode: params.history_mode,
+            history_base: params.history_base,
+            subagent_history_start_ordinal: params.subagent_history_start_ordinal,
+            initial_window_id: Some(params.initial_window_id),
+        },
     )
     .await
     .map_err(|err| ThreadStoreError::Internal {

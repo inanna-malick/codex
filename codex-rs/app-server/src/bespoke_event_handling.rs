@@ -1095,6 +1095,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
             let dynamic_tool_call_params = match &event.item {
                 CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
+                    context_call_id: item.context_call_id.clone(),
                     thread_id: conversation_id.to_string(),
                     turn_id: event.turn_id.clone(),
                     call_id: item.id.clone(),
@@ -3496,6 +3497,7 @@ mod tests {
                     thread_id: conversation_id,
                     turn_id: "turn-1".to_string(),
                     item: CoreTurnItem::DynamicToolCall(DynamicToolCallItem {
+                        context_call_id: None,
                         id: "dynamic-1".to_string(),
                         namespace: Some("apps".to_string()),
                         tool: "lookup".to_string(),
@@ -3534,6 +3536,7 @@ mod tests {
         assert_eq!(
             params,
             DynamicToolCallParams {
+                context_call_id: None,
                 thread_id: conversation_id.to_string(),
                 turn_id: "turn-1".to_string(),
                 call_id: "dynamic-1".to_string(),

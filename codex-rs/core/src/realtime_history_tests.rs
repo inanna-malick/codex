@@ -74,6 +74,7 @@ fn completed_item(item: TurnItem) -> EventMsg {
 
 fn dynamic_tool_call(id: &str, status: DynamicToolCallStatus) -> TurnItem {
     TurnItem::DynamicToolCall(DynamicToolCallItem {
+        context_call_id: None,
         id: id.to_string(),
         namespace: Some("another_client".to_string()),
         tool: "any_dynamic_tool".to_string(),

@@ -196,6 +196,19 @@ async fn fork_effort_preserves_prefix_and_resume(history_mode: ThreadHistoryMode
     );
 
     let child_request = infer(&mut app, &server, &child.thread.id, "implement").await?;
+    let cache_key = parent_request.body_json()["prompt_cache_key"].clone();
+    assert!(cache_key.is_string());
+    assert_eq!(child_request.body_json()["prompt_cache_key"], cache_key);
+    let routing_id = parent_request.header("session-id").unwrap();
+    assert_eq!(child_request.header("session-id"), Some(routing_id.clone()));
+    assert_eq!(
+        child_request.body_json()["client_metadata"]["session_id"],
+        routing_id
+    );
+    assert_eq!(
+        child_request.header("thread-id"),
+        Some(child.thread.id.clone())
+    );
     let prefix = parent_request.input();
     assert_eq!(&child_request.input()[..prefix.len()], prefix.as_slice());
     assert_eq!(updates(&child_request), vec![high.clone(), low.clone()]);
@@ -243,6 +256,10 @@ async fn fork_effort_preserves_prefix_and_resume(history_mode: ThreadHistoryMode
     let grandchild: ThreadForkResponse = app.read_response(id).await?;
     let grandchild_request = infer(&mut app, &server, &grandchild.thread.id, "integrate").await?;
     assert_eq!(
+        grandchild_request.body_json()["prompt_cache_key"],
+        cache_key
+    );
+    assert_eq!(
         &grandchild_request.input()[..child_again.input().len()],
         child_again.input().as_slice()
     );
@@ -267,6 +284,19 @@ async fn fork_effort_preserves_prefix_and_resume(history_mode: ThreadHistoryMode
         .await?;
     let never_run: ThreadResumeResponse = app.read_response(id).await?;
     assert_eq!(never_run.reasoning_effort, Some(ReasoningEffort::Low));
+    let first_resumed = infer(
+        &mut app,
+        &server,
+        &never_run.thread.id,
+        "first resumed work",
+    )
+    .await?;
+    assert_eq!(first_resumed.body_json()["prompt_cache_key"], cache_key);
+    assert_eq!(first_resumed.header("session-id"), Some(routing_id.clone()));
+    assert_eq!(
+        first_resumed.body_json()["client_metadata"]["session_id"],
+        routing_id
+    );
     let id = app
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: child.thread.id.clone(),
@@ -278,6 +308,12 @@ async fn fork_effort_preserves_prefix_and_resume(history_mode: ThreadHistoryMode
     assert_eq!(resumed.reasoning_effort, Some(ReasoningEffort::Low));
     let request = infer(&mut app, &server, &child.thread.id, "resumed work").await?;
     assert_eq!(updates(&request), vec![high, low]);
+    assert_eq!(request.body_json()["prompt_cache_key"], cache_key);
+    assert_eq!(request.header("session-id"), Some(routing_id.clone()));
+    assert_eq!(
+        request.body_json()["client_metadata"]["session_id"],
+        routing_id
+    );
     assert_eq!(
         &request.input()[..child_again.input().len()],
         child_again.input().as_slice()

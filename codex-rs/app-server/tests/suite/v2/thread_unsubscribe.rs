@@ -307,6 +307,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> R
     assert_eq!(
         params,
         DynamicToolCallParams {
+            context_call_id: Some(call_id.to_string()),
             thread_id: thread_id.clone(),
             turn_id: started.turn_id,
             call_id: call_id.to_string(),

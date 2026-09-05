@@ -929,6 +929,7 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                 .thread_manager
                 .start_thread(StartThreadOptions {
                     dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                        model_only: false,
                         name: namespace.to_string(),
                         description: "An unrelated dynamic tool sharing the MCP namespace."
                             .to_string(),
@@ -5733,6 +5734,7 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "codex_app".to_string(),
                 description: "Codex app tools.".to_string(),
                 tools: vec![DynamicToolNamespaceTool::Function(
@@ -5900,6 +5902,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "excluded".to_string(),
                 description: "Excluded tools.".to_string(),
                 tools: vec![DynamicToolNamespaceTool::Function(

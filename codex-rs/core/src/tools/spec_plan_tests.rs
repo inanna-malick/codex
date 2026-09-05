@@ -466,6 +466,7 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
     match namespace {
         Some(namespace) => {
             DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: namespace.to_string(),
                 description: format!("{namespace} dynamic tools"),
                 tools: vec![
@@ -491,6 +492,7 @@ fn custom_dynamic_tool(
     match namespace {
         Some(namespace) => {
             DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: namespace.to_string(),
                 description: format!("{namespace} dynamic tools"),
                 tools: vec![
@@ -3496,4 +3498,47 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     .await;
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
+}
+
+#[tokio::test]
+async fn declared_model_only_custom_namespace_survives_model_tool_mode_changes() {
+    for tool_mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        let mut tool = custom_dynamic_tool(Some("resident"), "haskell", false);
+        let DynamicToolSpec::Namespace(namespace) = &mut tool else {
+            unreachable!()
+        };
+        namespace.model_only = true;
+        let plan = probe_with(
+            |turn| {
+                set_features(turn, &[Feature::CodeMode]);
+                update_turn_settings_for_test(turn, |settings| {
+                    Arc::make_mut(&mut settings.model_info).tool_mode = Some(tool_mode);
+                });
+            },
+            ToolPlanInputs {
+                dynamic_tools: vec![tool],
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        plan.assert_visible_contains(&["resident"]);
+        assert_eq!(
+            plan.exposure(&ToolName::namespaced("resident", "haskell").to_string()),
+            ToolExposure::DirectModelOnly
+        );
+        let ToolSpec::Namespace(namespace) = plan.visible_spec("resident") else {
+            panic!("missing resident namespace")
+        };
+        assert!(matches!(
+            &namespace.tools[0],
+            ResponsesApiNamespaceTool::Custom(_)
+        ));
+        if tool_mode != ToolMode::Direct {
+            let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
+            else {
+                panic!("missing exec")
+            };
+            assert!(!exec.description.contains("resident_haskell"));
+        }
+    }
 }

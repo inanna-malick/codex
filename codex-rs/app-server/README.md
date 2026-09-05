@@ -667,6 +667,33 @@ each child's worktree sentinel, while ancestor hosted calls remain unresolved.
 It reports lineage and a structural prefix digest; auxiliary title-generation
 requests are counted separately. These are not real-provider cache measurements.
 
+Hosted namespace declarations may set `modelOnly: true` to retain their native
+model tool surface and exclude code-mode wrapping, regardless of model tool-mode
+defaults. The default is false. This is persisted declaration metadata and must
+match across destination forks, like the namespace's tool definitions. Per-tool
+`deferLoading` still controls whether model-only tools are initially visible or
+discovered.
+
+Hosted call requests distinguish `callId` (individual execution/reply correlation)
+from nullable `contextCallId` (the recorded model invocation owning that execution).
+For direct calls these match; nested code-mode calls carry the original `exec`
+call ID as context provenance, including after a cell yields. Use `threadId` and
+`contextCallId` for destination-owned invocation forks. Never substitute `callId`
+when context provenance is unavailable. Older persisted events may lack it.
+
+Invocation forks retain a durable `cache_affinity` record containing a routing
+session UUID and a prompt cache key. The routing UUID is sent consistently in
+transport session headers and top-level request `client_metadata.session_id`. Thread/session identities and runtime ownership remain independent.
+Recursive forks and resumed children reuse that affinity; legacy metadata falls back
+to the source session's original cache selection. Cache affinity is a routing
+hint, not proof of a provider cache hit: measure the first child inference.
+
+For routing diagnostics, enable `RUST_LOG=warn,codex_core::cache_routing=info`.
+Events distinguish the actual thread/session IDs from the provider routing UUID
+and prompt cache key. `CODEX_ROLLOUT_TRACE_ROOT=/absolute/trace-directory`
+additionally records full request/response evidence through the existing rollout
+trace facility. Inspect the first child response's usage, not a later warm turn.
+
 ### Listing projects
 
 `project/list` accepts optional `sortKey` (`position` or `recencyAt`) and

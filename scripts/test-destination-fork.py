@@ -89,6 +89,9 @@ class Rpc:
 class Provider(http.server.BaseHTTPRequestHandler):
     requests = []
     auxiliary_requests = 0
+    code_mode = False
+    by_actor = {}
+    routing_headers = {}
     lock = threading.Lock()
 
     def log_message(self, *_args):
@@ -110,6 +113,14 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 type(self).auxiliary_requests += 1
             else:
                 self.requests.append(body)
+                self.by_actor.setdefault(actor, []).append(body)
+                self.routing_headers.setdefault(
+                    actor,
+                    {
+                        "session-id": self.headers.get("session-id"),
+                        "thread-id": self.headers.get("thread-id"),
+                    },
+                )
         if actor == "parent":
             item = {
                 "type": "custom_tool_call",
@@ -142,6 +153,20 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "done"}],
             }
+        if self.code_mode and item["type"] in ("custom_tool_call", "function_call"):
+            if item["name"] == "hosted_eval":
+                calls = [f"tools.hosted_eval({json.dumps(item['input'])})"]
+                if actor == "parent":
+                    calls.append('tools.hosted_eval("second independent execution")')
+                code = "await Promise.all([" + ",".join(calls) + "]);"
+            else:
+                code = f"text(await tools.exec_command({item['arguments']}));"
+            item = {
+                "type": "custom_tool_call",
+                "call_id": item["call_id"],
+                "name": "exec",
+                "input": '// @exec: {"yield_time_ms": 120000}\n' + code,
+            }
         events = [
             {"type": "response.created", "response": {"id": f"response_{actor}"}},
             {"type": "response.output_item.done", "item": item},
@@ -172,6 +197,7 @@ class Host(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.thread_id = None
         self.ready = threading.Event()
         self.pending = threading.Event()
+        self.invocations = []
         super().__init__(str(path), HostHandler)
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
@@ -199,6 +225,7 @@ class HostHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
         else:
+            self.server.invocations.append(payload)
             self.server.pending.set()
             # Keep the hosted invocation unresolved while descendants run.
             threading.Event().wait(120)
@@ -270,7 +297,9 @@ class Actor:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("codex", type=lambda value: str(Path(value).resolve()))
+    parser.add_argument("--code-mode", action="store_true")
     args = parser.parse_args()
+    Provider.code_mode = args.code_mode
     subprocess.run(
         ["unshare", "--user", "--map-root-user", "--mount", "true"], check=True
     )
@@ -287,7 +316,8 @@ def main():
         (home / "config.toml").write_text(
             'model="gpt-6-astra"\nmodel_provider="mock"\nmodel_reasoning_effort="high"\n'
             'approval_policy="never"\nsandbox_mode="danger-full-access"\n'
-            f'[model_providers.mock]\nname="Local test"\nbase_url="http://127.0.0.1:{provider.server_port}/v1"\n'
+            + ("[features]\ncode_mode_only=true\n" if args.code_mode else "")
+            + f'[model_providers.mock]\nname="Local test"\nbase_url="http://127.0.0.1:{provider.server_port}/v1"\n'
             'wire_api="responses"\nrequest_max_retries=0\nstream_max_retries=0\n'
             f'[projects.{json.dumps(str(workspace))}]\ntrust_level="trusted"\n'
         )
@@ -317,6 +347,33 @@ def main():
                 ),
                 "durable invocation",
             )
+            pending_calls = []
+            while len(pending_calls) < (2 if args.code_mode else 1):
+                message = source.messages.get(timeout=45)
+                if message.get("method") == "item/tool/call":
+                    pending_calls.append(message["params"])
+                    if args.code_mode and len(pending_calls) == 1:
+                        # Hosted tools serialize; settle the first nested execution while
+                        # the enclosing exec remains unresolved in its second invocation.
+                        source.send(
+                            {
+                                "id": message["id"],
+                                "result": {
+                                    "contentItems": [
+                                        {"type": "inputText", "text": "first settled"}
+                                    ],
+                                    "success": True,
+                                },
+                            }
+                        )
+            assert all(
+                call["contextCallId"] == "unfold_parent" for call in pending_calls
+            ), pending_calls
+            assert len({call["callId"] for call in pending_calls}) == len(pending_calls)
+            if args.code_mode:
+                assert all(
+                    call["callId"] != call["contextCallId"] for call in pending_calls
+                )
             prefixes = []
             sentinels = []
             namespaces = []
@@ -331,6 +388,10 @@ def main():
                         "child hosted call remains pending",
                     )
                     ancestor = actors[-1].host.thread_id
+                    invocation = actors[-1].host.invocations[0]
+                    assert invocation["contextCallId"] == call, invocation
+                    if args.code_mode:
+                        assert invocation["callId"] != call, invocation
                 actor = Actor(
                     args.codex, env, root, workspace, name, ancestor, call, effort
                 )
@@ -352,10 +413,10 @@ def main():
                 )
                 actor.host.ready.set()
                 wait(
-                    lambda: len(Provider.requests) >= before + 2,
+                    lambda: len(Provider.by_actor.get(name, [])) >= 2,
                     f"{name} first native execution",
                 )
-                first, continuation = Provider.requests[before : before + 2]
+                first, continuation = Provider.by_actor[name][:2]
                 index = next(
                     i
                     for i, item in enumerate(first["input"])
@@ -363,12 +424,28 @@ def main():
                     and item["type"] == "custom_tool_call"
                 )
                 if name != "recursive":
+                    parent_request = Provider.by_actor["parent"][0]
+                    assert (
+                        first["input"][: len(parent_request["input"])]
+                        == parent_request["input"]
+                    ), "child changed the sampled parent prefix"
+                    assert first.get("tools") == parent_request.get("tools"), (
+                        "child changed request-level tools"
+                    )
+                    assert first.get("instructions") == parent_request.get(
+                        "instructions"
+                    ), "child changed request-level instructions"
                     prefixes.append(first["input"][: index + 1])
                 outputs = [
                     item
                     for item in continuation["input"]
                     if item.get("call_id") == f"native_{name}"
-                    and item["type"] == "function_call_output"
+                    and item["type"]
+                    == (
+                        "custom_tool_call_output"
+                        if args.code_mode
+                        else "function_call_output"
+                    )
                 ]
                 assert outputs, {
                     "keys": list(continuation),
@@ -397,6 +474,31 @@ def main():
             assert prefixes[0] == prefixes[1], (
                 "siblings did not inherit an identical prefix"
             )
+            cache_keys = {
+                request[0].get("prompt_cache_key")
+                for request in Provider.by_actor.values()
+            }
+            assert cache_keys == {Provider.by_actor["parent"][0]["prompt_cache_key"]}, (
+                cache_keys
+            )
+            routing_id = Provider.routing_headers["parent"]["session-id"]
+            for actor, requests in Provider.by_actor.items():
+                assert Provider.routing_headers[actor]["session-id"] == routing_id
+                metadata = requests[0]["client_metadata"]
+                assert metadata["session_id"] == routing_id
+                assert (
+                    Provider.routing_headers[actor]["thread-id"]
+                    == metadata["thread_id"]
+                )
+            assert (
+                len(
+                    {
+                        headers["thread-id"]
+                        for headers in Provider.routing_headers.values()
+                    }
+                )
+                == 4
+            )
             assert len(set(sentinels)) == len(sentinels)
             assert len(set(namespaces)) == len(namespaces), namespaces
             print(
@@ -410,10 +512,21 @@ def main():
                         "nativeOutputs": sentinels,
                         "auxiliaryRequests": Provider.auxiliary_requests,
                         "providerCacheReuse": "unverified: mock provider",
+                        "promptCacheKeys": {
+                            name: requests[0].get("prompt_cache_key")
+                            for name, requests in Provider.by_actor.items()
+                        },
                     },
                     indent=2,
                 )
             )
+        except Exception:
+            with tempfile.NamedTemporaryFile(
+                mode="w", prefix="codex-fork-failure-", suffix=".json", delete=False
+            ) as report:
+                json.dump(Provider.by_actor, report)
+                print(f"Provider request evidence: {report.name}")
+            raise
         finally:
             for actor in actors:
                 if actor.process.poll() is None:

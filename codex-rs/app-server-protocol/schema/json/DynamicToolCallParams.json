@@ -5,6 +5,13 @@
     "callId": {
       "type": "string"
     },
+    "contextCallId": {
+      "description": "Recorded model invocation owning this execution; absent for legacy events.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "namespace": {
       "type": [
         "string",

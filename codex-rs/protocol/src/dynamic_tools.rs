@@ -53,6 +53,9 @@ pub struct DynamicToolCustomFormat {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct DynamicToolNamespaceSpec {
+    /// Keep this namespace on the model tool surface, excluding code-mode wrappers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_only: bool,
     pub name: String,
     pub description: String,
     pub tools: Vec<DynamicToolNamespaceTool>,
@@ -176,6 +179,7 @@ pub fn group_dynamic_tools_by_namespace(
         }
         namespace_indices.insert(namespace.clone(), grouped_tools.len());
         grouped_tools.push(DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+            model_only: false,
             name: namespace,
             description: String::new(),
             tools: vec![function],

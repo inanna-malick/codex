@@ -31,10 +31,16 @@ pub(super) struct CodeModeDispatchBroker {
     executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CellOrigin {
+    pub call_id: String,
+    pub item_id: Option<ResponseItemId>,
+}
+
 struct CellDispatchGate {
     ready: watch::Sender<bool>,
     // Keep the original exec item when later waits resume this cell.
-    originating_item_id: Option<ResponseItemId>,
+    origin: Option<CellOrigin>,
 }
 
 impl CodeModeDispatchBroker {
@@ -48,11 +54,7 @@ impl CodeModeDispatchBroker {
         }
     }
 
-    pub(super) fn mark_cell_ready_for_dispatch(
-        &self,
-        cell_id: &CellId,
-        originating_item_id: Option<ResponseItemId>,
-    ) {
+    pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId, origin: CellOrigin) {
         let ready = {
             let mut dispatch_gates = self
                 .dispatch_gates
@@ -62,20 +64,20 @@ impl CodeModeDispatchBroker {
                 .entry(cell_id.clone())
                 .or_insert_with(|| CellDispatchGate {
                     ready: watch::channel(false).0,
-                    originating_item_id: None,
+                    origin: None,
                 });
-            gate.originating_item_id = originating_item_id;
+            gate.origin = Some(origin);
             gate.ready.clone()
         };
         ready.send_replace(true);
     }
 
-    pub(super) fn cell_originating_item_id(&self, cell_id: &CellId) -> Option<ResponseItemId> {
+    pub(super) fn cell_origin(&self, cell_id: &CellId) -> Option<CellOrigin> {
         self.dispatch_gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(cell_id)
-            .and_then(|gate| gate.originating_item_id.clone())
+            .and_then(|gate| gate.origin.clone())
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
@@ -213,7 +215,7 @@ fn dispatch_gate(
         .entry(cell_id.clone())
         .or_insert_with(|| CellDispatchGate {
             ready: watch::channel(false).0,
-            originating_item_id: None,
+            origin: None,
         })
         .ready
         .clone()

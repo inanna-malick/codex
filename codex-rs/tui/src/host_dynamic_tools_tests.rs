@@ -138,6 +138,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     host.attach_primary(thread_id).await?;
     let source = "module Main where\n\nvalue = \"{\\\"nested\\\":true}\"\nemoji = \"λ🌊\"\n";
     let params = DynamicToolCallParams {
+        context_call_id: Some("outer-exec".into()),
         thread_id: thread_id.to_string(),
         turn_id: "turn-α".to_string(),
         call_id: "call-1".to_string(),
@@ -192,6 +193,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
             "threadId": thread_id,
             "turnId": "turn-α",
             "callId": "call-1",
+            "contextCallId": "outer-exec",
             "namespace": null,
             "tool": "evaluate",
             "arguments": source,

@@ -109,6 +109,7 @@ async fn call_tool(
     execute(
         server.request_handle(),
         DynamicToolCallParams {
+            context_call_id: None,
             thread_id: source.to_string(),
             turn_id: "persisted-turn".to_string(),
             call_id: "call-1".to_string(),

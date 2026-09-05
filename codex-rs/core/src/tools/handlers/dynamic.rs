@@ -45,6 +45,21 @@ enum DynamicToolPayloadKind {
     Custom,
 }
 
+fn dynamic_tool_exposure(
+    namespace: Option<&DynamicToolNamespaceSpec>,
+    defer_loading: bool,
+) -> ToolExposure {
+    match (
+        namespace.is_some_and(|namespace| namespace.model_only),
+        defer_loading,
+    ) {
+        (true, false) => ToolExposure::DirectModelOnly,
+        (true, true) => ToolExposure::DeferredModelOnly,
+        (false, false) => ToolExposure::Direct,
+        (false, true) => ToolExposure::Deferred,
+    }
+}
+
 impl DynamicToolHandler {
     pub fn new(tool: &DynamicToolFunctionSpec) -> Option<Self> {
         Self::from_function_parts(tool, /*namespace*/ None)
@@ -94,7 +109,7 @@ impl DynamicToolHandler {
         Some(Self::from_spec(
             tool_name,
             spec,
-            tool.defer_loading,
+            dynamic_tool_exposure(namespace, tool.defer_loading),
             DynamicToolPayloadKind::Function,
         ))
     }
@@ -125,7 +140,7 @@ impl DynamicToolHandler {
         Self::from_spec(
             tool_name,
             spec,
-            tool.defer_loading,
+            dynamic_tool_exposure(namespace, tool.defer_loading),
             DynamicToolPayloadKind::Custom,
         )
     }
@@ -133,17 +148,13 @@ impl DynamicToolHandler {
     fn from_spec(
         tool_name: ToolName,
         spec: ToolSpec,
-        defer_loading: bool,
+        exposure: ToolExposure,
         payload_kind: DynamicToolPayloadKind,
     ) -> Self {
         Self {
             tool_name,
             spec,
-            exposure: if defer_loading {
-                ToolExposure::Deferred
-            } else {
-                ToolExposure::Direct
-            },
+            exposure,
             payload_kind,
         }
     }
@@ -185,6 +196,7 @@ impl DynamicToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let context_call_id = invocation.context_call_id();
         let ToolInvocation {
             session,
             turn,
@@ -214,9 +226,12 @@ impl DynamicToolHandler {
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),
-            call_id,
-            self.tool_name.clone(),
-            arguments,
+            DynamicToolRequest {
+                call_id,
+                context_call_id,
+                tool_name: self.tool_name.clone(),
+                arguments,
+            },
         )
         .await
         .ok_or_else(|| {
@@ -257,6 +272,13 @@ impl CoreToolRuntime for DynamicToolHandler {
     }
 }
 
+struct DynamicToolRequest {
+    call_id: String,
+    context_call_id: Option<String>,
+    tool_name: ToolName,
+    arguments: Value,
+}
+
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "active turn checks and dynamic tool response registration must remain atomic"
@@ -264,10 +286,14 @@ impl CoreToolRuntime for DynamicToolHandler {
 async fn request_dynamic_tool(
     session: &Session,
     turn_context: &TurnContext,
-    call_id: String,
-    tool_name: ToolName,
-    arguments: Value,
+    request: DynamicToolRequest,
 ) -> Option<DynamicToolResponse> {
+    let DynamicToolRequest {
+        call_id,
+        context_call_id,
+        tool_name,
+        arguments,
+    } = request;
     let namespace = tool_name.namespace;
     let tool = tool_name.name;
     let (tx_response, rx_response) = oneshot::channel();
@@ -291,6 +317,7 @@ async fn request_dynamic_tool(
         .emit_turn_item_started(
             turn_context,
             &TurnItem::DynamicToolCall(DynamicToolCallItem {
+                context_call_id: context_call_id.clone(),
                 id: call_id.clone(),
                 namespace: namespace.clone(),
                 tool: tool.clone(),
@@ -307,6 +334,7 @@ async fn request_dynamic_tool(
 
     let item = match &response {
         Some(response) => DynamicToolCallItem {
+            context_call_id: context_call_id.clone(),
             id: call_id,
             namespace,
             tool,
@@ -322,6 +350,7 @@ async fn request_dynamic_tool(
             duration: Some(started_at.elapsed()),
         },
         None => DynamicToolCallItem {
+            context_call_id: context_call_id.clone(),
             id: call_id,
             namespace,
             tool,

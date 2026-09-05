@@ -3031,6 +3031,15 @@ pub struct HistoryPosition {
     pub end_byte_offset: u64,
 }
 
+/// Provider cache routing follows inherited context independently of runtime ownership.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct ProviderCacheAffinity {
+    /// UUID used by the provider's transport session routing.
+    pub routing_session_id: SessionId,
+    /// Prompt-level cache key, including dedicated internal cache buckets.
+    pub prompt_cache_key: String,
+}
+
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
 ///
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
@@ -3038,6 +3047,9 @@ pub struct HistoryPosition {
 /// and should be used when there is no config override.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
+    /// Provider cache affinity inherited independently of thread ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_affinity: Option<ProviderCacheAffinity>,
     /// Runtime attachment must be acknowledged before this thread can infer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_client_readiness: bool,
@@ -3108,6 +3120,7 @@ impl Default for SessionMeta {
     fn default() -> Self {
         let id = ThreadId::default();
         SessionMeta {
+            cache_affinity: None,
             session_id: id.into(),
             id,
             forked_from_id: None,
@@ -4531,6 +4544,7 @@ mod tests {
             meta.dynamic_tools,
             Some(vec![DynamicToolSpec::Namespace(
                 crate::dynamic_tools::DynamicToolNamespaceSpec {
+                    model_only: false,
                     name: "legacy_app".to_string(),
                     description: String::new(),
                     tools: vec![
@@ -5562,6 +5576,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 10,
             item: TurnItem::DynamicToolCall(DynamicToolCallItem {
+                context_call_id: None,
                 id: "dynamic-1".into(),
                 namespace: Some("apps".into()),
                 tool: "lookup".into(),
@@ -5579,6 +5594,7 @@ mod tests {
             started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::DynamicToolCall(DynamicToolCallItem {
+                context_call_id: None,
                 id: "dynamic-1".into(),
                 namespace: Some("apps".into()),
                 tool: "lookup".into(),

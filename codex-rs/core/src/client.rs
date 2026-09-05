@@ -293,7 +293,7 @@ impl RequestRouteTelemetry {
 pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
-    prompt_cache_key_override: Option<String>,
+    cache_affinity: Option<codex_protocol::protocol::ProviderCacheAffinity>,
     free_guardian_enabled: bool,
     event_sender: Option<Sender<ProtocolEvent>>,
     http_client_factory: HttpClientFactory,
@@ -515,7 +515,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
             agent_identity_policy,
-            prompt_cache_key_override: None,
+            cache_affinity: None,
             free_guardian_enabled: false,
             event_sender: None,
             http_client_factory,
@@ -529,26 +529,83 @@ impl ModelClient {
 
     pub(crate) fn with_session_context(
         mut self,
-        prompt_cache_key_override: Option<String>,
+        cache_affinity: codex_protocol::protocol::ProviderCacheAffinity,
         event_sender: Sender<ProtocolEvent>,
     ) -> Self {
-        self.prompt_cache_key_override = prompt_cache_key_override;
+        self.cache_affinity = Some(cache_affinity);
         self.event_sender = Some(event_sender);
         self
     }
 
     fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
-        if let Some(prompt_cache_key) = &self.prompt_cache_key_override {
-            return prompt_cache_key.clone();
+        if let Some(affinity) = &self.cache_affinity {
+            return affinity.prompt_cache_key.clone();
         }
 
-        if let SessionSource::Internal(source) = &self.state.session_source
-            && let Some(parent_thread_id) = responses_metadata.parent_thread_id
+        Self::default_prompt_cache_key(
+            &self.state.session_source,
+            responses_metadata.parent_thread_id,
+            &responses_metadata.session_id,
+        )
+    }
+
+    pub(crate) fn default_cache_affinity(
+        source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        session_id: codex_protocol::SessionId,
+    ) -> codex_protocol::protocol::ProviderCacheAffinity {
+        codex_protocol::protocol::ProviderCacheAffinity {
+            routing_session_id: session_id,
+            prompt_cache_key: Self::default_prompt_cache_key(
+                source,
+                parent_thread_id,
+                &session_id.to_string(),
+            ),
+        }
+    }
+
+    fn routing_session_id(&self, metadata: &CodexResponsesMetadata) -> String {
+        self.cache_affinity.as_ref().map_or_else(
+            || metadata.session_id.clone(),
+            |affinity| affinity.routing_session_id.to_string(),
+        )
+    }
+
+    fn build_provider_client_metadata(
+        &self,
+        metadata: &CodexResponsesMetadata,
+    ) -> HashMap<String, String> {
+        let mut result = metadata.client_metadata();
+        // The provider routes by this transport field; full Codex identity remains
+        // in x-codex-turn-metadata and thread_id.
+        result.insert("session_id".to_string(), self.routing_session_id(metadata));
+        tracing::info!(
+            target: "codex_core::cache_routing",
+            thread_id = %metadata.thread_id,
+            session_id = %metadata.session_id,
+            routing_session_id = %self.routing_session_id(metadata),
+            prompt_cache_key = %self.prompt_cache_key(metadata),
+            "provider request routing"
+        );
+        result
+    }
+
+    pub(crate) fn default_prompt_cache_key(
+        source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        session_id: &str,
+    ) -> String {
+        if let Some(key) =
+            crate::guardian::prompt_cache_key_override_for_review_session(source, parent_thread_id)
+        {
+            return key;
+        }
+        if let SessionSource::Internal(source) = source
+            && let Some(parent_thread_id) = parent_thread_id
         {
             return format!("{source}:{parent_thread_id}");
         }
-
-        responses_metadata.session_id.clone()
+        session_id.to_owned()
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -688,7 +745,7 @@ impl ModelClient {
         add_originator_header(&mut extra_headers, self.state.originator.as_str());
         extra_headers.extend(self.build_responses_compatibility_headers(responses_metadata));
         extra_headers.extend(build_session_headers(
-            Some(responses_metadata.session_id.to_string()),
+            Some(self.routing_session_id(responses_metadata)),
             Some(responses_metadata.thread_id.to_string()),
         ));
         if let Some(header_value) = self.generate_attestation_header_for().await {
@@ -862,7 +919,7 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         use_responses_lite: bool,
     ) -> HashMap<String, String> {
-        let mut client_metadata = responses_metadata.client_metadata();
+        let mut client_metadata = self.build_provider_client_metadata(responses_metadata);
         if use_responses_lite {
             client_metadata.insert(
                 WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY.to_string(),
@@ -1045,7 +1102,7 @@ impl ModelClient {
             service_tier,
             prompt_cache_key,
             text,
-            client_metadata: Some(responses_metadata.client_metadata()),
+            client_metadata: Some(self.build_provider_client_metadata(responses_metadata)),
             access_programs: None,
         };
         Ok(request)
@@ -1281,6 +1338,16 @@ impl ModelClient {
         &self,
         responses_metadata: &CodexResponsesMetadata,
     ) -> ApiHeaderMap {
+        let cache_key = self.prompt_cache_key(responses_metadata);
+        let routing_session_id = self.routing_session_id(responses_metadata);
+        tracing::info!(
+            target: "codex_core::cache_routing",
+            thread_id = %responses_metadata.thread_id,
+            session_id = %responses_metadata.session_id,
+            handshake_session_id = %routing_session_id,
+            prompt_cache_key = %cache_key,
+            "opening provider connection"
+        );
         let mut headers = build_responses_headers(
             self.state.beta_features_header.as_deref(),
             /*turn_state*/ None,
@@ -1290,7 +1357,7 @@ impl ModelClient {
             headers.insert("x-client-request-id", header_value);
         }
         headers.extend(build_session_headers(
-            Some(responses_metadata.session_id.to_string()),
+            Some(routing_session_id),
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -1349,7 +1416,7 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-            session_id: Some(responses_metadata.session_id.to_string()),
+            session_id: Some(self.client.routing_session_id(responses_metadata)),
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {

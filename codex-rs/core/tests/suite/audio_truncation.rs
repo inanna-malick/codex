@@ -79,6 +79,7 @@ async fn dynamic_tool_audio_exceeding_the_output_budget_is_omitted() -> Result<(
     });
     let base_test = builder.build_with_auto_env(&server).await?;
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "codex_app".to_string(),
         description: "Audio tools.".to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(

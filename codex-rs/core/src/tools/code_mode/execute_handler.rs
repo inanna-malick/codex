@@ -108,7 +108,13 @@ impl CodeModeExecuteHandler {
         exec.session
             .services
             .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id, originating_item_id);
+            .mark_cell_ready_for_dispatch(
+                &cell_id,
+                super::CellOrigin {
+                    call_id,
+                    item_id: originating_item_id,
+                },
+            );
         let response = started_cell
             .initial_response()
             .await

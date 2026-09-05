@@ -282,6 +282,10 @@ pub enum DynamicToolCallStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct DynamicToolCallItem {
+    /// Recorded model invocation owning this execution; absent for legacy events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub context_call_id: Option<String>,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

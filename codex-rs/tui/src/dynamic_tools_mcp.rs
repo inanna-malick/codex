@@ -274,6 +274,7 @@ impl ServerHandler for DynamicToolMcpHandler {
             .and_then(Value::as_str)
             .map_or_else(|| format!("mcp-call-{}", Uuid::new_v4()), str::to_string);
         let params = DynamicToolCallParams {
+            context_call_id: None,
             thread_id: thread_id.to_string(),
             turn_id,
             call_id,

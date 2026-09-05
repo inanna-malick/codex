@@ -4939,6 +4939,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
         CreateThreadParams {
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8206,6 +8207,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8317,6 +8319,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -10983,6 +10986,7 @@ async fn attach_in_memory_thread_store(
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
