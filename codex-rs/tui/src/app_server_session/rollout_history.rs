@@ -70,6 +70,7 @@ impl AppServerSession {
             self.remote_cwd_override.as_deref(),
             model_settings,
         );
+        params.experimental_raw_events = self.host_dynamic_tools.is_some();
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;

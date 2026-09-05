@@ -111,6 +111,21 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
+        if let Some(host) = app_server_client.host_dynamic_tools() {
+            let completion = match &notification {
+                ServerNotification::RawResponseItemCompleted(item) => {
+                    host.observe_completion(item).await
+                }
+                ServerNotification::TurnCompleted(turn) => host.settle_turn(&turn.thread_id).await,
+                _ => Ok(()),
+            };
+            if let Err(error) = completion {
+                self.app_event_tx.send(AppEvent::FatalExitRequest(format!(
+                    "Cannot settle hosted tool completion: {error}. Deferred child startup was not confirmed."
+                )));
+                return;
+            }
+        }
         if let ServerNotification::ThreadStatusChanged(status) = &notification {
             let _ = self.dynamic_tool_status_updates.send(status.clone());
         }

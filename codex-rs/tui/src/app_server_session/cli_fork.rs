@@ -7,6 +7,7 @@ use crate::cli::Cli;
 pub(super) struct CliFork {
     pub(super) destination_local: bool,
     through_call_id: Option<String>,
+    after_call_id: Option<String>,
     override_model: bool,
     override_provider: bool,
     override_effort: bool,
@@ -23,6 +24,7 @@ impl AppServerSession {
         self.cli_fork = CliFork {
             destination_local: cli.fork_destination_local,
             through_call_id: cli.fork_through_call.clone(),
+            after_call_id: cli.fork_after_call.clone(),
             override_model: cli.model.is_some() || keys.contains(&"model"),
             override_provider: cli.oss || keys.contains(&"model_provider"),
             override_effort: keys.contains(&"model_reasoning_effort"),
@@ -34,6 +36,7 @@ impl AppServerSession {
 impl CliFork {
     pub(super) fn configure(&self, params: &mut ThreadForkParams) {
         params.through_call_id = self.through_call_id.clone();
+        params.after_call_id = self.after_call_id.clone();
         if !self.destination_local {
             return;
         }

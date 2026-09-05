@@ -578,14 +578,14 @@ the corresponding turn's completion/error for the inference outcome.
 
 Fork requests are not idempotent: retrying a fork may create another child. This
 does not add a live effort-control endpoint or an applied-inference event.
-Unless `throughCallId` is supplied as described below, existing active-turn
+Unless `throughCallId` or `afterCallId` is supplied as described below, existing active-turn
 snapshot/interrupt-boundary and tool-result repair semantics still apply.
 Use a completed parent turn and unchanged model, tools, and base
 instructions for exact-prefix comparisons. Compaction can replace the active
 context under its existing rules. Structural request-prefix preservation is not
 proof of provider cache reuse; cached/uncached token measurements and lineage
-must be recorded separately. Cache routing keys remain session-scoped and may
-differ between parent and child. Real-provider cache reuse is unverified.
+must be recorded separately. Cache routing affinity is retained across the fork lineage. This is a routing
+hint; it does not guarantee provider cache reuse.
 
 ### Destination-owned invocation forks (experimental)
 
@@ -625,7 +625,7 @@ or source-owner unload is required.
 
 Destination-local forks require readiness and defer inherited goal continuation.
 The hosted endpoint receives `POST /v1/dynamic-tools/session` with
-`{"protocolVersion":2,"threadId":"CHILD_UUID"}`. Bind that UUID to the prepared
+`{"protocolVersion":3,"threadId":"CHILD_UUID"}`. Bind that UUID to the prepared
 environment and respond HTTP `204` within the current five-second control timeout.
 Readiness must not depend on inference. Queueing assignment for that UUID before
 the acknowledgment is supported: the durable queue retains it behind the gate.
@@ -3211,3 +3211,21 @@ For server-initiated request payloads, annotate the field the same way so schema
    ```bash
    just test -p codex-app-server-protocol
    ```
+
+### Completed-tool forks
+
+Use experimental `thread/fork.afterCallId` (CLI `fork --after-call CALL_ID`)
+to inherit the source through the real tool result and all other results in its
+open tool batch. An incomplete or ambiguous call is rejected. The stored boundary
+excludes later parent messages; sibling forks share that exact prefix without
+synthetic tool outputs. `afterCallId` conflicts with `throughCallId` and turn-based
+boundaries. The older `throughCallId` still means capture through the invocation.
+
+Hosted protocol version 3 requests `experimentalRawEvents` on start, fork, and
+resume. After a durable, protocol-closed result batch, the client posts
+`{ "protocolVersion": 3, "threadId": "UUID", "contextCallId": "CALL_ID" }`
+to `/v1/dynamic-tools/completed`. Hosts must acknowledge idempotently. The client
+retries a failed callback three times and exits on failure. Hosts settle any
+unacknowledged forks when the client reattaches; they must not guess that an
+unrecorded result completed. Registration and session binding otherwise retain
+the existing contract.

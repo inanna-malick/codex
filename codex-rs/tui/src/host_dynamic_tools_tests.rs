@@ -93,7 +93,7 @@ pub(crate) fn spawn_host(
                 REGISTRATION_PATH => Some((
                     "200 OK",
                     serde_json::to_vec(&json!({
-                        "protocolVersion": 2,
+                        "protocolVersion": 3,
                         "dynamicTools": [{
                             "type": "custom",
                             "name": "evaluate",
@@ -103,7 +103,9 @@ pub(crate) fn spawn_host(
                         "scope": "primaryThread"
                     }))?,
                 )),
-                SESSION_PATH => Some(("204 No Content", Vec::new())),
+                SESSION_PATH | "/v1/dynamic-tools/completed" => {
+                    Some(("204 No Content", Vec::new()))
+                }
                 CALL_PATH => Some((
                     "200 OK",
                     serde_json::to_vec(&json!({
@@ -181,7 +183,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(session.path, SESSION_PATH);
     assert_eq!(
         session.body,
-        json!({"protocolVersion": 2, "threadId": thread_id})
+        json!({"protocolVersion": 3, "threadId": thread_id})
     );
     let call = requests.recv()?;
     assert_eq!(call.method, "POST");
@@ -189,7 +191,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(
         call.body,
         json!({
-            "protocolVersion": 2,
+            "protocolVersion": 3,
             "threadId": thread_id,
             "turnId": "turn-α",
             "callId": "call-1",
@@ -234,4 +236,80 @@ fn registration_rejects_duplicates_and_tui_namespace() {
         scope: HostDynamicToolScope::PrimaryThread,
     };
     assert!(validate_registration(&registration).is_err());
+}
+
+#[tokio::test]
+async fn completion_waits_for_sibling_result_and_acknowledges_once() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    host.completions.lock().unwrap().register("outer".into())?;
+    let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
+        thread_id: thread.to_string(),
+        turn_id: "turn".into(),
+        item: serde_json::from_value(item).unwrap(),
+    };
+    for id in ["outer", "sibling"] {
+        host.observe_completion(&notify(json!({"type":"function_call", "call_id":id,
+            "name":"exec", "arguments":"{}"})))
+            .await?;
+    }
+    host.observe_completion(&notify(
+        json!({"type":"function_call_output", "call_id":"outer", "output":"actual result"}),
+    ))
+    .await?;
+    assert!(requests.try_recv().is_err());
+    let last = notify(json!({"type":"function_call_output", "call_id":"sibling", "output":"done"}));
+    host.observe_completion(&last).await?;
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: "/v1/dynamic-tools/completed".into(),
+            body: json!({"protocolVersion":3, "threadId":thread, "contextCallId":"outer"}),
+        }
+    );
+    host.observe_completion(&last).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
+-> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    host.completions
+        .lock()
+        .unwrap()
+        .register("interrupted".into())?;
+    host.settle_turn(&thread.to_string()).await?;
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: SESSION_PATH.into(),
+            body: json!({"protocolVersion":3,"threadId":thread}),
+        }
+    );
+    host.settle_turn(&thread.to_string()).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
 }

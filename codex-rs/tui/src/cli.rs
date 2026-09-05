@@ -73,6 +73,9 @@ pub struct Cli {
     #[clap(skip)]
     pub fork_through_call: Option<String>,
 
+    #[clap(skip)]
+    pub fork_after_call: Option<String>,
+
     #[clap(flatten)]
     pub shared: TuiSharedCliOptions,
 

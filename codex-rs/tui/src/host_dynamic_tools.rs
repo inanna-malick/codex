@@ -1,3 +1,5 @@
+mod completions;
+
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 const SESSION_PATH: &str = "/v1/dynamic-tools/session";
 const CALL_PATH: &str = "/v1/dynamic-tools/call";
@@ -57,6 +59,7 @@ pub(crate) struct HostDynamicTools {
     registration: HostDynamicToolRegistration,
     identities: HashMap<(Option<String>, String), DynamicToolKind>,
     primary_thread_id: Mutex<Option<ThreadId>>,
+    completions: Mutex<completions::HostToolCompletions>,
     #[cfg(unix)]
     client: reqwest::Client,
 }
@@ -85,6 +88,7 @@ struct CallRequest<'a> {
 
 impl HostDynamicTools {
     pub(crate) fn configure_fork(&self, params: &mut codex_app_server_protocol::ThreadForkParams) {
+        params.experimental_raw_events = true;
         params.expected_dynamic_tools = Some(self.registration.dynamic_tools.clone());
     }
 
@@ -125,6 +129,7 @@ impl HostDynamicTools {
                 registration,
                 identities,
                 primary_thread_id: Mutex::new(None),
+                completions: Mutex::new(completions::HostToolCompletions::default()),
                 client,
             })))
         }
@@ -140,6 +145,7 @@ impl HostDynamicTools {
             .extend(self.registration.dynamic_tools.clone());
         params.ephemeral = Some(false);
         params.persistence = Some(ThreadStartPersistence::Immediate);
+        params.experimental_raw_events = true;
         true
     }
 
@@ -202,6 +208,12 @@ impl HostDynamicTools {
         &self,
         params: &DynamicToolCallParams,
     ) -> color_eyre::Result<DynamicToolCallResponse> {
+        if let Some(call_id) = &params.context_call_id {
+            self.completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .register(call_id.clone())?;
+        }
         #[cfg(unix)]
         return send_call(&self.client, params).await;
         #[cfg(not(unix))]

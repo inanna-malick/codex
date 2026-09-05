@@ -422,12 +422,27 @@ struct DeleteCommand {
 #[derive(Debug, Parser)]
 struct ForkCommand {
     /// Run the child in this process's execution environment, without daemon reuse.
-    #[arg(long, requires_all = ["through_call", "host_dynamic_tools_socket"])]
+    #[arg(long, requires_all = ["call_boundary", "host_dynamic_tools_socket"])]
     destination_local: bool,
 
     /// Inherit through this recorded hosted invocation, excluding its subsequent result.
-    #[arg(long, value_name = "CALL_ID", requires = "session_id")]
+    #[arg(
+        long,
+        value_name = "CALL_ID",
+        requires = "session_id",
+        group = "call_boundary"
+    )]
     through_call: Option<String>,
+
+    /// Inherit through the actual recorded result and its complete tool-call batch.
+    #[arg(
+        long,
+        value_name = "CALL_ID",
+        requires = "session_id",
+        conflicts_with = "through_call",
+        group = "call_boundary"
+    )]
+    after_call: Option<String>,
 
     /// Conversation/session id (UUID). When provided, forks this session.
     /// If omitted, use --last to pick the most recent recorded session.
@@ -1591,6 +1606,7 @@ async fn cli_main(
         Some(Subcommand::Fork(ForkCommand {
             destination_local,
             through_call,
+            after_call,
             session_id,
             last,
             all,
@@ -1608,6 +1624,7 @@ async fn cli_main(
             );
             interactive.fork_destination_local = destination_local;
             interactive.fork_through_call = through_call;
+            interactive.fork_after_call = after_call;
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
@@ -3232,6 +3249,7 @@ mod tests {
         let Subcommand::Fork(ForkCommand {
             destination_local,
             through_call,
+            after_call,
             session_id,
             last,
             all,
@@ -3247,6 +3265,7 @@ mod tests {
             finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli);
         interactive.fork_destination_local = destination_local;
         interactive.fork_through_call = through_call;
+        interactive.fork_after_call = after_call;
         interactive
     }
 

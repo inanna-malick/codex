@@ -11,7 +11,7 @@ fn destination_fork_is_explicit_with_or_without_effort() {
             "fork".to_string(),
             "source-uuid".to_string(),
             "--destination-local".to_string(),
-            "--through-call".to_string(),
+            "--after-call".to_string(),
             "call_1".to_string(),
             "--host-dynamic-tools-socket".to_string(),
             socket.to_string_lossy().into_owned(),
@@ -27,7 +27,7 @@ fn destination_fork_is_explicit_with_or_without_effort() {
             panic!("expected fork")
         };
         assert_eq!(
-            (fork.destination_local, fork.through_call.as_deref()),
+            (fork.destination_local, fork.after_call.as_deref()),
             (true, Some("call_1"))
         );
     }

@@ -1,5 +1,6 @@
 ---
 source: cli/src/destination_fork_tests.rs
+assertion_line: 63
 expression: "help.to_string().lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
 ---
 Fork a previous interactive session (picker by default; use --last to fork the
@@ -36,6 +37,10 @@ Options:
       --through-call <CALL_ID>
           Inherit through this recorded hosted invocation, excluding its
           subsequent result
+
+      --after-call <CALL_ID>
+          Inherit through the actual recorded result and its complete tool-call
+          batch
 
       --disable <FEATURE>
           Disable a feature (repeatable). Equivalent to `-c
