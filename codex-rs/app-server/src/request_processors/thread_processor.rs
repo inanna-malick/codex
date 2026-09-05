@@ -3713,6 +3713,7 @@ impl ThreadRequestProcessor {
         };
 
         let ThreadResumeParams {
+            experimental_raw_events,
             thread_id,
             history,
             path,
@@ -4005,7 +4006,7 @@ impl ThreadRequestProcessor {
                     self.ensure_conversation_listener(
                         thread_id,
                         request_id.connection_id,
-                        /*raw_events_enabled*/ false,
+                        experimental_raw_events,
                     )
                     .await,
                     thread_id,
@@ -4377,6 +4378,9 @@ impl ThreadRequestProcessor {
                 .thread_state_manager
                 .thread_state(existing_thread_id)
                 .await;
+            if params.experimental_raw_events {
+                thread_state.lock().await.experimental_raw_events = true;
+            }
             self.ensure_listener_task_running(
                 existing_thread_id,
                 existing_thread.clone(),
@@ -4817,8 +4821,10 @@ impl ThreadRequestProcessor {
         super::thread_fork_settings::inherit(&mut params, &source_thread, &self.thread_manager)
             .await;
         let ThreadForkParams {
+            experimental_raw_events,
             thread_id,
             through_call_id,
+            after_call_id,
             require_client_readiness,
             expected_dynamic_tools,
             last_turn_id,
@@ -4859,6 +4865,17 @@ impl ThreadRequestProcessor {
                 "`throughCallId` requires a 1–256 byte call id and cannot be combined with turn boundaries",
             ));
         }
+        if let Some(call_id) = after_call_id.as_deref()
+            && (call_id.is_empty()
+                || call_id.len() > 256
+                || through_call_id.is_some()
+                || last_turn_id.is_some()
+                || before_turn_id.is_some())
+        {
+            return Err(invalid_request(
+                "`afterCallId` requires a 1–256 byte call id and cannot be combined with other boundaries",
+            ));
+        }
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
                 "`beforeTurnId` cannot be combined with `lastTurnId`",
@@ -4887,7 +4904,9 @@ impl ThreadRequestProcessor {
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
         let prepared_fork = if paginated_source {
-            let boundary = if let Some(call_id) = through_call_id.as_ref() {
+            let boundary = if let Some(call_id) = after_call_id.as_ref() {
+                codex_thread_store::ForkBoundary::AfterCall(call_id.clone())
+            } else if let Some(call_id) = through_call_id.as_ref() {
                 codex_thread_store::ForkBoundary::ThroughCall(call_id.clone())
             } else {
                 match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
@@ -5093,7 +5112,9 @@ impl ThreadRequestProcessor {
                         .map_err(|err| core_thread_write_error("truncate thread for fork", err))?
                 }
                 (None, None) => {
-                    if let Some(call_id) = through_call_id.as_deref() {
+                    if let Some(call_id) = after_call_id.as_deref() {
+                        super::thread_fork_boundary::after_call(source_history_items, call_id)?
+                    } else if let Some(call_id) = through_call_id.as_deref() {
                         super::thread_fork_boundary::through_call(source_history_items, call_id)?
                     } else {
                         source_history_items
@@ -5138,7 +5159,9 @@ impl ThreadRequestProcessor {
             .await?
         };
 
-        let snapshot = if through_call_id.is_some() {
+        let snapshot = if after_call_id.is_some() {
+            ForkSnapshot::CompletedCallBoundary
+        } else if through_call_id.is_some() {
             ForkSnapshot::InvocationBoundary
         } else {
             ForkSnapshot::Interrupted
@@ -5248,7 +5271,7 @@ impl ThreadRequestProcessor {
             self.ensure_conversation_listener(
                 thread_id,
                 request_id.connection_id,
-                /*raw_events_enabled*/ false,
+                experimental_raw_events,
             )
             .await,
             thread_id,

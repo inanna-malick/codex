@@ -325,6 +325,7 @@ fn write_rollout_with_user_message(
             ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
+                    cache_affinity: None,
                     require_client_readiness: false,
                     session_id: thread_id.into(),
                     id: thread_id,

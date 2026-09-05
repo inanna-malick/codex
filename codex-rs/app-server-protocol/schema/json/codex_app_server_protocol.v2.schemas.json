@@ -15093,7 +15093,9 @@
             "null"
           ]
         },
-        "metadata": true
+        "metadata": true,
+        "promptCacheDiagnostics": true,
+        "promptCacheOptions": true
       },
       "type": "object"
     },

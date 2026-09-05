@@ -111,7 +111,22 @@ pub(super) async fn history_base_at_boundary(
     let position = match boundary {
         ForkBoundary::Latest => latest_position,
         ForkBoundary::ThroughCall(call_id) => {
-            super::call_boundary::resolve(lineage.clone(), latest_position, call_id).await?
+            super::call_boundary::resolve(
+                lineage.clone(),
+                latest_position,
+                call_id,
+                super::call_boundary::CallBoundaryEnd::Invocation,
+            )
+            .await?
+        }
+        ForkBoundary::AfterCall(call_id) => {
+            super::call_boundary::resolve(
+                lineage.clone(),
+                latest_position,
+                call_id,
+                super::call_boundary::CallBoundaryEnd::Completed,
+            )
+            .await?
         }
         ForkBoundary::ThroughTurn(turn_id) => {
             let row = find_visible_turn(pool, lineage, turn_id.as_str()).await?;

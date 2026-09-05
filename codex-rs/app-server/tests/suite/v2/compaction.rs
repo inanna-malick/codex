@@ -341,6 +341,8 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
             usage_metadata: Some(ResponseUsageMetadata {
                 amount: Some("0.125".to_string()),
                 metadata: Some(expected_metadata),
+                prompt_cache_diagnostics: None,
+                prompt_cache_options: None,
             }),
             usage: Some(TokenUsageBreakdown {
                 total_tokens: 200,

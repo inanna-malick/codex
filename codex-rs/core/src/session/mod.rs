@@ -3882,6 +3882,29 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+        // Hosted clients release deferred effects on these result notifications.
+        // A notification must never advertise a boundary that is only buffered.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+            )
+        }) && let Err(error) = self.flush_rollout().await
+        {
+            tracing::error!(%error, "cannot publish durable tool completion");
+            if let Some((_, cancellation)) = self.active_turn_context_and_cancellation_token().await
+            {
+                cancellation.cancel();
+            }
+            self.send_event(turn_context, EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message: format!("Could not persist tool completion; deferred forks were not released: {error}"),
+                codex_error_info: Some(codex_protocol::protocol::CodexErrorInfo::Other),
+                misalignment: None,
+            })).await;
+            return;
+        }
         for item in items {
             self.send_event(
                 turn_context,

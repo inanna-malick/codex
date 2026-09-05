@@ -123,6 +123,10 @@ struct ResponseCompleted {
     usage: Option<ResponseCompletedUsage>,
     usage_metadata: Option<ResponseUsageMetadata>,
     #[serde(default)]
+    prompt_cache_diagnostics: Option<Value>,
+    #[serde(default)]
+    prompt_cache_options: Option<Value>,
+    #[serde(default)]
     end_turn: Option<bool>,
 }
 
@@ -498,6 +502,16 @@ pub fn process_responses_event(
                     Ok(mut resp) => {
                         if let Some(metadata) = metadata {
                             resp.usage_metadata.get_or_insert_default().metadata = Some(metadata);
+                        }
+                        if let Some(prompt_cache_diagnostics) = resp.prompt_cache_diagnostics {
+                            resp.usage_metadata
+                                .get_or_insert_default()
+                                .prompt_cache_diagnostics = Some(prompt_cache_diagnostics);
+                        }
+                        if let Some(prompt_cache_options) = resp.prompt_cache_options {
+                            resp.usage_metadata
+                                .get_or_insert_default()
+                                .prompt_cache_options = Some(prompt_cache_options);
                         }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
@@ -924,6 +938,38 @@ mod tests {
                 total_tokens: 110,
                 codex_rollout_budget_units: serde_json::Number::from_f64(2.5),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_prompt_cache_diagnostics() {
+        let diagnostics = json!({
+            "type": "cache_miss",
+            "reason": "overflow_routing",
+            "cache_missed_tokens": 14720,
+            "comparison_reusable_tokens": 14720
+        });
+        let options = json!({"mode": "implicit", "ttl": "30m"});
+        let events = run_sse(vec![json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp1",
+                "prompt_cache_diagnostics": diagnostics,
+                "prompt_cache_options": options
+            }
+        })])
+        .await;
+
+        let [ResponseEvent::Completed { usage_metadata, .. }] = events.as_slice() else {
+            panic!("expected one completed response");
+        };
+        assert_eq!(
+            usage_metadata,
+            &Some(ResponseUsageMetadata {
+                prompt_cache_diagnostics: Some(diagnostics),
+                prompt_cache_options: Some(options),
+                ..Default::default()
+            })
         );
     }
 

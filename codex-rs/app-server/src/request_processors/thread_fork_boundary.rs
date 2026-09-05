@@ -29,3 +29,28 @@ pub(super) fn through_call(
     items.truncate(index + 1);
     Ok(items)
 }
+
+/// Preserve the first closed prefix after the real result, without synthetic items.
+pub(super) fn after_call(
+    mut items: Vec<RolloutItem>,
+    call_id: &str,
+) -> Result<Vec<RolloutItem>, JSONRPCErrorError> {
+    let mut boundary = codex_rollout::CompletedCallBoundary::new(call_id);
+    let mut end = None;
+    for (index, item) in items.iter().enumerate() {
+        if let RolloutItem::ResponseItem(item) = item
+            && boundary
+                .observe(&item.item)
+                .map_err(super::invalid_request)?
+        {
+            end.get_or_insert(index + 1);
+        }
+    }
+    let end = end.ok_or_else(|| {
+        super::invalid_request(format!(
+            "no completed tool boundary for call id '{call_id}'"
+        ))
+    })?;
+    items.truncate(end);
+    Ok(items)
+}

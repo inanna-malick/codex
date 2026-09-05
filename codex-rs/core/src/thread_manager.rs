@@ -214,6 +214,8 @@ pub enum ForkSnapshot {
     /// Preserve a frozen invocation prefix and append child-only protocol closures.
     /// Unlike `Interrupted`, this never describes the source turn as aborted.
     InvocationBoundary,
+    /// Preserve a prefix ending after a recorded, protocol-complete tool result.
+    CompletedCallBoundary,
 }
 
 struct ForkHistory {
@@ -2576,6 +2578,9 @@ fn fork_history_from_snapshot(
     let snapshot_state = snapshot_turn_state(&history);
     match snapshot {
         ForkSnapshot::InvocationBoundary => crate::forked_invocations::close(history),
+        ForkSnapshot::CompletedCallBoundary => {
+            InitialHistory::Forked(history.get_rollout_items().to_vec())
+        }
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }

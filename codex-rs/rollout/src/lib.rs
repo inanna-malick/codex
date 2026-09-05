@@ -6,7 +6,9 @@ use codex_protocol::protocol::SessionSource;
 use serde::de::Error as _;
 use serde_json::Value;
 
+mod completed_call;
 pub(crate) mod compression;
+pub use completed_call::CompletedCallBoundary;
 pub(crate) mod config;
 pub(crate) mod list;
 mod maintenance;

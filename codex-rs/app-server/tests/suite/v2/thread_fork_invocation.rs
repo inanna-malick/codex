@@ -332,3 +332,127 @@ async fn destination_forks_pending_invocation(mode: ThreadHistoryMode) -> Result
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn destination_forks_completed_invocation_legacy() -> Result<()> {
+    destination_forks_completed_invocation(ThreadHistoryMode::Legacy).await
+}
+
+#[tokio::test]
+async fn destination_forks_completed_invocation_paginated() -> Result<()> {
+    destination_forks_completed_invocation(ThreadHistoryMode::Paginated).await
+}
+
+async fn destination_forks_completed_invocation(mode: ThreadHistoryMode) -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-6-astra")
+        .write(home.path())?;
+    let mut source = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    let id = source
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            history_mode: Some(mode),
+            dynamic_tools: Some(vec![DynamicToolSpec::Custom(DynamicToolCustomSpec {
+                name: "hosted_eval".into(),
+                description: "Evaluate code".into(),
+                defer_loading: false,
+                format: None,
+            })]),
+            ..Default::default()
+        })
+        .await?;
+    let parent: ThreadStartResponse = source.read_response(id).await?;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("call"),
+            responses::ev_custom_tool_call("unfold_done", "hosted_eval", "unfold then bind"),
+            responses::ev_completed("call"),
+        ]),
+    )
+    .await;
+    let id = source
+        .send_turn_start_request(TurnStartParams {
+            thread_id: parent.thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "fork".into(),
+                text_elements: vec![],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = source.read_response(id).await?;
+    let ServerRequest::DynamicToolCall { request_id, .. } =
+        source.read_stream_until_request_message().await?
+    else {
+        panic!("expected invocation");
+    };
+    let mut destination = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    let params = ThreadForkParams {
+        thread_id: parent.thread.id.clone(),
+        after_call_id: Some("unfold_done".into()),
+        exclude_turns: true,
+        ..Default::default()
+    };
+    let id = destination.send_thread_fork_request(params.clone()).await?;
+    let error = destination
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert_eq!(error.error.code, -32600);
+    let continuation = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("continued"),
+            responses::ev_assistant_message("later", "parent advanced beyond the boundary"),
+            responses::ev_completed("continued"),
+        ]),
+    )
+    .await;
+    source
+        .send_response(
+            request_id,
+            serde_json::to_value(DynamicToolCallResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "real result with final bindings".into(),
+                }],
+                success: true,
+            })?,
+        )
+        .await?;
+    source
+        .read_stream_until_notification_message("turn/completed")
+        .await?;
+    let expected = continuation.single_request().input();
+    for _ in 0..2 {
+        let id = destination.send_thread_fork_request(params.clone()).await?;
+        let child: ThreadForkResponse = destination.read_response(id).await?;
+        let request = infer(
+            &mut destination,
+            &server,
+            &child.thread.id,
+            "child assignment",
+        )
+        .await?;
+        let input = request.input();
+        assert_eq!(&input[..expected.len()], expected.as_slice());
+        assert!(
+            input
+                .iter()
+                .any(|item| item.to_string().contains("real result with final bindings"))
+        );
+        assert!(!input.iter().any(|item| {
+            item.to_string()
+                .contains("parent advanced beyond the boundary")
+                || item.to_string().contains("child-local protocol closure")
+                || item.to_string().contains("<turn_aborted>")
+        }));
+    }
+    Ok(())
+}

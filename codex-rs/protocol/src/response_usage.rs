@@ -11,4 +11,12 @@ use ts_rs::TS;
 pub struct ResponseUsageMetadata {
     pub amount: Option<String>,
     pub metadata: Option<Value>,
+    /// Provider explanation of the prompt-cache outcome for this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prompt_cache_diagnostics: Option<Value>,
+    /// Provider-selected prompt-cache mode, lifetime, and comparison response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prompt_cache_options: Option<Value>,
 }

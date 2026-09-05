@@ -11,15 +11,23 @@ use super::rollout_lineage::RolloutLineage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+#[derive(Clone, Copy)]
+pub(super) enum CallBoundaryEnd {
+    Invocation,
+    Completed,
+}
+
 /// Search the durable lineage, not its latest compacted model context. Reference preparation
 /// has materialized plain JSONL segments, and the supplied latest position freezes the tail.
 pub(super) async fn resolve(
     lineage: RolloutLineage,
     latest: HistoryPosition,
     call_id: String,
+    boundary_end: CallBoundaryEnd,
 ) -> ThreadStoreResult<HistoryPosition> {
     tokio::task::spawn_blocking(move || {
         let mut found = None;
+        let mut completed = codex_rollout::CompletedCallBoundary::new(&call_id);
         for segment in lineage.segments() {
             let end = segment.end.unwrap_or(latest);
             let file =
@@ -51,26 +59,44 @@ pub(super) async fn resolve(
                 if ordinal < segment.start_ordinal() || ordinal >= end.end_ordinal_exclusive {
                     continue;
                 }
-                if let RolloutItem::ResponseItem(item) = line.item
-                    && matches!(&item.item,
-                        ResponseItem::FunctionCall { call_id: id, .. }
-                        | ResponseItem::CustomToolCall { call_id: id, .. } if id == &call_id)
-                {
-                    if found.is_some() {
-                        return Err(ThreadStoreError::InvalidRequest {
-                            message: format!("call id '{call_id}' is ambiguous in source history"),
+                if let RolloutItem::ResponseItem(item) = line.item {
+                    let matches = match boundary_end {
+                        CallBoundaryEnd::Invocation => matches!(&item.item,
+                            ResponseItem::FunctionCall { call_id: id, .. }
+                            | ResponseItem::CustomToolCall { call_id: id, .. } if id == &call_id),
+                        CallBoundaryEnd::Completed => {
+                            completed.observe(&item.item).map_err(|message| {
+                                ThreadStoreError::InvalidRequest {
+                                    message: message.to_string(),
+                                }
+                            })?
+                        }
+                    };
+                    if matches {
+                        if found.is_some() && matches!(boundary_end, CallBoundaryEnd::Invocation) {
+                            return Err(ThreadStoreError::InvalidRequest {
+                                message: format!(
+                                    "call id '{call_id}' is ambiguous in source history"
+                                ),
+                            });
+                        }
+                        found.get_or_insert(HistoryPosition {
+                            thread_id: segment.rollout_id(),
+                            end_ordinal_exclusive: ordinal + 1,
+                            end_byte_offset: offset,
                         });
                     }
-                    found = Some(HistoryPosition {
-                        thread_id: segment.rollout_id(),
-                        end_ordinal_exclusive: ordinal + 1,
-                        end_byte_offset: offset,
-                    });
                 }
             }
         }
-        found.ok_or_else(|| ThreadStoreError::InvalidRequest {
-            message: format!("no durable invocation found for call id '{call_id}'"),
+        found.ok_or_else(|| {
+            let description = match boundary_end {
+                CallBoundaryEnd::Invocation => "invocation",
+                CallBoundaryEnd::Completed => "completed tool result",
+            };
+            ThreadStoreError::InvalidRequest {
+                message: format!("no durable {description} found for call id '{call_id}'"),
+            }
         })
     })
     .await

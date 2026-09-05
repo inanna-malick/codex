@@ -348,6 +348,11 @@ pub struct ThreadSettingsUpdatedNotification {
 ///
 /// Prefer using thread_id whenever possible.
 pub struct ThreadResumeParams {
+    /// Emit raw response items, including durably recorded tool results.
+    #[experimental("thread/resume.experimentalRawEvents")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_raw_events: bool,
+
     pub thread_id: String,
 
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
@@ -531,6 +536,11 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 ///
 /// Prefer using thread_id whenever possible.
 pub struct ThreadForkParams {
+    /// Emit raw response items, including durably recorded tool results.
+    #[experimental("thread/fork.experimentalRawEvents")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_raw_events: bool,
+
     pub thread_id: String,
 
     /// Freeze history through this complete invocation, excluding its future result.
@@ -539,6 +549,12 @@ pub struct ThreadForkParams {
     #[experimental("thread/fork.throughCallId")]
     #[ts(optional = nullable)]
     pub through_call_id: Option<String>,
+
+    /// Freeze history after this call's actual result and all outstanding tool results.
+    /// Rejects an incomplete call; never includes subsequent parent progress.
+    #[experimental("thread/fork.afterCallId")]
+    #[ts(optional = nullable)]
+    pub after_call_id: Option<String>,
 
     /// Require thread/ready before inference, including on subsequent runtime attachments.
     /// Implies deferred goal continuation. Queued assignments remain queued until readiness.
@@ -1902,6 +1918,8 @@ pub struct RawResponseCompletedNotification {
 pub struct ResponseUsageMetadata {
     pub amount: Option<String>,
     pub metadata: Option<JsonValue>,
+    pub prompt_cache_diagnostics: Option<JsonValue>,
+    pub prompt_cache_options: Option<JsonValue>,
 }
 
 impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
@@ -1909,6 +1927,8 @@ impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
         Self {
             amount: value.amount,
             metadata: value.metadata,
+            prompt_cache_diagnostics: value.prompt_cache_diagnostics,
+            prompt_cache_options: value.prompt_cache_options,
         }
     }
 }

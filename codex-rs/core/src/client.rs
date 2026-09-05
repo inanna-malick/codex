@@ -2094,6 +2094,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
+        let prewarm_started = Instant::now();
         let disabled_trace = InferenceTraceContext::disabled();
         match self
             .stream_responses_websocket(
@@ -2114,7 +2115,34 @@ impl ModelClientSession {
                 // Wait for the v2 warmup request to complete before sending the first turn request.
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Ok(ResponseEvent::Completed {
+                            response_id,
+                            token_usage,
+                            usage_metadata,
+                            ..
+                        }) => {
+                            tracing::info!(
+                                target: "codex_core::cache_routing",
+                                %response_id,
+                                thread_id = %responses_metadata.thread_id,
+                                elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+                                input_tokens = token_usage.as_ref().map(|usage| usage.input_tokens),
+                                cached_input_tokens = token_usage
+                                    .as_ref()
+                                    .map(|usage| usage.cached_input_tokens),
+                                cache_write_input_tokens = token_usage
+                                    .as_ref()
+                                    .map(|usage| usage.cache_write_input_tokens),
+                                prompt_cache_diagnostics = ?usage_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.prompt_cache_diagnostics.as_ref()),
+                                prompt_cache_options = ?usage_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.prompt_cache_options.as_ref()),
+                                "startup websocket prewarm completed"
+                            );
+                            break;
+                        }
                         Err(err) => return Err(err),
                         _ => {}
                     }
@@ -2352,6 +2380,25 @@ where
                     usage_metadata,
                     end_turn,
                 }) => {
+                    tracing::debug!(
+                        target: "codex_core::cache_routing",
+                        %response_id,
+                        upstream_request_id,
+                        input_tokens = token_usage.as_ref().map(|usage| usage.input_tokens),
+                        cached_input_tokens = token_usage
+                            .as_ref()
+                            .map(|usage| usage.cached_input_tokens),
+                        cache_write_input_tokens = token_usage
+                            .as_ref()
+                            .map(|usage| usage.cache_write_input_tokens),
+                        prompt_cache_diagnostics = ?usage_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.prompt_cache_diagnostics.as_ref()),
+                        prompt_cache_options = ?usage_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.prompt_cache_options.as_ref()),
+                        "provider response cache outcome"
+                    );
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);

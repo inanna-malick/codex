@@ -199,6 +199,8 @@ pub enum ForkBoundary {
     /// Inherit through the fully persisted invocation, excluding its subsequent result.
     /// The source thread and call id identify a reusable boundary as history advances.
     ThroughCall(String),
+    /// Inherit the first closed tool-call batch containing this call's real result.
+    AfterCall(String),
 }
 
 /// Parameters for freezing the source history used to initialize a fork.

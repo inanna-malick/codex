@@ -207,6 +207,18 @@ impl Session {
             return;
         }
 
+        // A fork's first request already has an inherited conversation to send.
+        // Let that request establish the connection instead of waiting for a
+        // separate base-instructions-only response before sending the history.
+        if self
+            .thread_config_snapshot()
+            .await
+            .forked_from_thread_id
+            .is_some()
+        {
+            return;
+        }
+
         let session_telemetry = self.services.session_telemetry.clone();
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let started_at = Instant::now();
