@@ -211,6 +211,9 @@ pub enum ForkSnapshot {
     /// already at a turn boundary, this returns the current persisted history
     /// unchanged.
     Interrupted,
+    /// Preserve a frozen invocation prefix and append child-only protocol closures.
+    /// Unlike `Interrupted`, this never describes the source turn as aborted.
+    InvocationBoundary,
 }
 
 struct ForkHistory {
@@ -1395,6 +1398,7 @@ impl ThreadManager {
     /// Fork prepared reference-backed history using the same snapshot semantics as copied forks.
     pub async fn fork_prepared_thread(
         &self,
+        snapshot: ForkSnapshot,
         config: Config,
         prepared: PreparedFork,
         thread_source: Option<ThreadSource>,
@@ -1415,7 +1419,7 @@ impl ThreadManager {
             .fork_thread_with_initial_history(
                 config,
                 ForkHistory {
-                    snapshot: ForkSnapshot::Interrupted,
+                    snapshot,
                     initial_history: history,
                     persistence: fork_persistence,
                 },
@@ -2571,6 +2575,7 @@ fn fork_history_from_snapshot(
 ) -> InitialHistory {
     let snapshot_state = snapshot_turn_state(&history);
     match snapshot {
+        ForkSnapshot::InvocationBoundary => crate::forked_invocations::close(history),
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }

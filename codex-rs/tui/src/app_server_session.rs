@@ -3,6 +3,7 @@
 //! This module owns the typed JSON-RPC calls needed by the TUI and keeps
 //! request/response plumbing out of `App` and `ChatWidget`.
 
+mod cli_fork;
 mod fs;
 mod history;
 mod models;
@@ -331,6 +332,7 @@ pub(crate) struct AppServerSession {
     external_agent_config_import_completion_pending: AtomicBool,
     dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
     host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+    cli_fork: cli_fork::CliFork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,6 +431,7 @@ impl AppServerSession {
             external_agent_config_import_completion_pending: AtomicBool::new(false),
             dynamic_tool_mcp: None,
             host_dynamic_tools: None,
+            cli_fork: cli_fork::CliFork::default(),
         }
     }
 
@@ -898,7 +901,11 @@ impl AppServerSession {
             thread_id,
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
-            ForkGoalContinuation::StartIfIdle,
+            if self.cli_fork.destination_local {
+                ForkGoalContinuation::DeferUntilNextTurn
+            } else {
+                ForkGoalContinuation::StartIfIdle
+            },
         )
         .await
     }
@@ -982,6 +989,16 @@ impl AppServerSession {
                 self.remote_cwd_override.as_deref(),
             )
         };
+        let cli_fork = std::mem::take(&mut self.cli_fork);
+        cli_fork.configure(&mut params);
+        if cli_fork.destination_local {
+            let host = self.host_dynamic_tools.as_ref().ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "destination-local fork requires a registered hosted tool endpoint"
+                )
+            })?;
+            host.configure_fork(&mut params);
+        }
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let response: ThreadForkResponse = match self
@@ -1047,6 +1064,18 @@ impl AppServerSession {
         }
         self.attach_host_primary_if_applicable(started.session.thread_id)
             .await?;
+        if cli_fork.destination_local {
+            let request_id = self.next_request_id();
+            let _: codex_app_server_protocol::ThreadReadyResponse = self
+                .client
+                .request_typed(ClientRequest::ThreadReady {
+                    request_id,
+                    params: codex_app_server_protocol::ThreadReadyParams {
+                        thread_id: started.session.thread_id.to_string(),
+                    },
+                })
+                .await?;
+        }
         Ok(started)
     }
 

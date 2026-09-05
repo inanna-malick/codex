@@ -123,6 +123,7 @@ async fn guardian_history_survives_restart_and_user_fork(
         initial
             .thread_manager
             .fork_prepared_thread(
+                codex_core::ForkSnapshot::Interrupted,
                 initial.config.clone(),
                 prepared,
                 /*thread_source*/ None,

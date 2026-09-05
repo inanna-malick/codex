@@ -25,7 +25,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
-async fn infer(
+pub(super) async fn infer(
     app: &mut TestAppServer,
     server: &MockServer,
     thread_id: &str,

@@ -1,4 +1,5 @@
 use super::persisted_resume_settings::PersistedResumeSettings;
+mod readiness;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
@@ -4817,6 +4818,9 @@ impl ThreadRequestProcessor {
             .await;
         let ThreadForkParams {
             thread_id,
+            through_call_id,
+            require_client_readiness,
+            expected_dynamic_tools,
             last_turn_id,
             before_turn_id,
             path,
@@ -4838,12 +4842,23 @@ impl ThreadRequestProcessor {
             defer_goal_continuation,
         } = params;
         let include_turns = !exclude_turns;
+        let defer_goal_continuation = defer_goal_continuation || require_client_readiness;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
         let paginated_source = matches!(source_thread.history_mode, ThreadHistoryMode::Paginated);
+        if let Some(call_id) = through_call_id.as_deref()
+            && (call_id.is_empty()
+                || call_id.len() > 256
+                || last_turn_id.is_some()
+                || before_turn_id.is_some())
+        {
+            return Err(invalid_request(
+                "`throughCallId` requires a 1–256 byte call id and cannot be combined with turn boundaries",
+            ));
+        }
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
                 "`beforeTurnId` cannot be combined with `lastTurnId`",
@@ -4872,15 +4887,19 @@ impl ThreadRequestProcessor {
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
         let prepared_fork = if paginated_source {
-            let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
-                (Some(turn_id), None) => {
-                    codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
+            let boundary = if let Some(call_id) = through_call_id.as_ref() {
+                codex_thread_store::ForkBoundary::ThroughCall(call_id.clone())
+            } else {
+                match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
+                    (Some(turn_id), None) => {
+                        codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
+                    }
+                    (None, Some(turn_id)) => {
+                        codex_thread_store::ForkBoundary::BeforeTurn(turn_id.to_string())
+                    }
+                    (None, None) => codex_thread_store::ForkBoundary::Latest,
+                    (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
                 }
-                (None, Some(turn_id)) => {
-                    codex_thread_store::ForkBoundary::BeforeTurn(turn_id.to_string())
-                }
-                (None, None) => codex_thread_store::ForkBoundary::Latest,
-                (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
             Some(
                 self.thread_store
@@ -4926,6 +4945,23 @@ impl ThreadRequestProcessor {
             )
         };
         let history_cwd = Some(source_thread.cwd.clone());
+
+        if let Some(expected) = expected_dynamic_tools {
+            let inherited = source_history_items
+                .iter()
+                .find_map(|item| match item {
+                    RolloutItem::SessionMeta(meta) => {
+                        Some(meta.meta.dynamic_tools.as_deref().unwrap_or_default())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if inherited != expected.as_slice() {
+                return Err(invalid_request(
+                    "destination hosted tool declarations do not match the inherited declarations",
+                ));
+            }
+        }
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -5027,11 +5063,16 @@ impl ThreadRequestProcessor {
             }
         }
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let config = self
+        let mut config = self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
             .map_err(|err| config_load_error(&err))?;
+        if require_client_readiness {
+            config.extra_config = Some(codex_thread_store::ExtraConfig {
+                require_client_readiness: true,
+            });
+        }
         let goals_enabled = config.features.enabled(Feature::Goals);
 
         let fallback_model_provider = config.model_provider_id.clone();
@@ -5051,7 +5092,13 @@ impl ThreadRequestProcessor {
                     truncate_rollout_before_turn_id(source_history_items, before_turn_id)
                         .map_err(|err| core_thread_write_error("truncate thread for fork", err))?
                 }
-                (None, None) => source_history_items,
+                (None, None) => {
+                    if let Some(call_id) = through_call_id.as_deref() {
+                        super::thread_fork_boundary::through_call(source_history_items, call_id)?
+                    } else {
+                        source_history_items
+                    }
+                }
                 (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
             Arc::new(history_items)
@@ -5091,9 +5138,15 @@ impl ThreadRequestProcessor {
             .await?
         };
 
+        let snapshot = if through_call_id.is_some() {
+            ForkSnapshot::InvocationBoundary
+        } else {
+            ForkSnapshot::Interrupted
+        };
         let new_thread = if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
                 .fork_prepared_thread(
+                    snapshot,
                     config,
                     prepared_fork,
                     thread_source,
@@ -5105,7 +5158,7 @@ impl ThreadRequestProcessor {
         } else {
             self.thread_manager
                 .fork_thread_from_history(
-                    ForkSnapshot::Interrupted,
+                    snapshot,
                     config,
                     InitialHistory::Resumed(ResumedHistory {
                         conversation_id: source_thread_id,

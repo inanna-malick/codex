@@ -1084,6 +1084,7 @@ async fn run_ratatui_app(
             AppServerSession::new(app_server, app_server_target.thread_params_mode())
                 .with_startup_config(&initial_config)
                 .with_host_dynamic_tools(host_dynamic_tools.clone())
+                .with_cli_fork(&cli)
         }
         Ok(Err(err)) => {
             terminal_restore_guard.restore_silently();
@@ -1648,6 +1649,7 @@ async fn run_ratatui_app(
     #[cfg(not(target_os = "windows"))]
     let should_prompt_windows_sandbox_nux_at_startup = false;
 
+    let cli_for_fork = cli.clone();
     let Cli {
         prompt,
         shared,
@@ -1695,6 +1697,7 @@ async fn run_ratatui_app(
                     .with_startup_config(&config)
                     .with_remote_cwd_override(remote_cwd_override.clone())
                     .with_host_dynamic_tools(host_dynamic_tools.clone())
+                    .with_cli_fork(&cli_for_fork)
             }
             Ok(Err(err)) => {
                 terminal_restore_guard.restore_silently();

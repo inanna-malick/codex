@@ -1,4 +1,5 @@
 mod archive_thread;
+mod call_boundary;
 mod create_thread;
 mod delete_thread;
 mod helpers;

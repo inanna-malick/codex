@@ -533,6 +533,25 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 pub struct ThreadForkParams {
     pub thread_id: String,
 
+    /// Freeze history through this complete invocation, excluding its future result.
+    /// Reuse the source thread id and call id for siblings, even after the source advances.
+    /// Mutually exclusive with turn boundaries. Does not interrupt the source operation.
+    #[experimental("thread/fork.throughCallId")]
+    #[ts(optional = nullable)]
+    pub through_call_id: Option<String>,
+
+    /// Require thread/ready before inference, including on subsequent runtime attachments.
+    /// Implies deferred goal continuation. Queued assignments remain queued until readiness.
+    #[experimental("thread/fork.requireClientReadiness")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_client_readiness: bool,
+
+    /// Validate destination-hosted declarations against the inherited declarations without
+    /// replacing them. A mismatch rejects the fork before any child is created.
+    #[experimental("thread/fork.expectedDynamicTools")]
+    #[ts(optional = nullable)]
+    pub expected_dynamic_tools: Option<Vec<DynamicToolSpec>>,
+
     /// Optional last turn id to fork through, inclusive.
     ///
     /// When specified, turns after `last_turn_id` are omitted from the fork.

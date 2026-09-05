@@ -564,6 +564,25 @@ where
             }
         })
     }
+
+    fn on_thread_input_ready<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadInputReadyInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(thread_id) = ThreadId::from_string(input.thread_store.level_id()) else {
+                tracing::warn!(
+                    level_id = input.thread_store.level_id(),
+                    "queue extension received an invalid thread id"
+                );
+                return;
+            };
+            self.resumed_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(thread_id);
+        })
+    }
 }
 
 fn queued_item_from_record(

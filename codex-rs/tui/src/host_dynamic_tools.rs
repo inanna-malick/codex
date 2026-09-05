@@ -84,6 +84,10 @@ struct CallRequest<'a> {
 }
 
 impl HostDynamicTools {
+    pub(crate) fn configure_fork(&self, params: &mut codex_app_server_protocol::ThreadForkParams) {
+        params.expected_dynamic_tools = Some(self.registration.dynamic_tools.clone());
+    }
+
     pub(crate) async fn connect(
         socket_path: Option<AbsolutePathBuf>,
     ) -> color_eyre::Result<Option<Arc<Self>>> {

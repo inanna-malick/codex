@@ -103,6 +103,8 @@ mod thread_delete;
 mod thread_environments;
 mod thread_fork;
 mod thread_fork_effort;
+mod thread_fork_invocation;
+mod thread_fork_readiness;
 mod thread_inject_items;
 mod thread_list;
 mod thread_loaded_list;

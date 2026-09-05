@@ -558,6 +558,7 @@ mod projects;
 mod remote_control_processor;
 mod search;
 mod thread_enrichment;
+mod thread_fork_boundary;
 mod thread_fork_goal;
 mod thread_fork_settings;
 mod thread_input;

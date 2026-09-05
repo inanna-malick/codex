@@ -12,6 +12,12 @@ pub(super) async fn run_main_inner(
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
     let strict_config = cli.strict_config;
+    if cli.fork_destination_local && explicit_remote_endpoint.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--destination-local cannot use a remote app server",
+        ));
+    }
     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
         (
             Some(SandboxMode::DangerFullAccess),
@@ -75,13 +81,14 @@ pub(super) async fn run_main_inner(
             workload_identity_selected,
             std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
         )?;
-        let validation_environment_manager =
-            if should_load_configured_environments(&loader_overrides, &validation_target) {
-                EnvironmentManager::prepare_from_codex_home(&codex_home).await
-            } else {
-                EnvironmentManager::prepare_from_env().await
-            }
-            .map_err(std::io::Error::other)?;
+        let validation_environment_manager = if cli.fork_destination_local {
+            EnvironmentManager::prepare_local().await
+        } else if should_load_configured_environments(&loader_overrides, &validation_target) {
+            EnvironmentManager::prepare_from_codex_home(&codex_home).await
+        } else {
+            EnvironmentManager::prepare_from_env().await
+        }
+        .map_err(std::io::Error::other)?;
         let validation_cwd = config_cwd_for_app_server_target(
             cli.cwd.as_deref(),
             &validation_target,
@@ -136,7 +143,8 @@ pub(super) async fn run_main_inner(
         .await;
     }
 
-    let reuse_implicit_local_daemon = !workload_identity_selected
+    let reuse_implicit_local_daemon = !cli.fork_destination_local
+        && !workload_identity_selected
         && (cli.agents_overview
             || can_reuse_implicit_local_daemon(
                 &cli_kv_overrides,
@@ -144,7 +152,8 @@ pub(super) async fn run_main_inner(
                 strict_config,
                 cli.bypass_hook_trust,
             ));
-    let search_only_config_override = !workload_identity_selected
+    let search_only_config_override = !cli.fork_destination_local
+        && !workload_identity_selected
         && cli.web_search
         && startup_preflight::has_only_search_config_override(&cli_kv_overrides)
         && loader_overrides_are_default(&launch_loader_overrides)
@@ -199,17 +208,20 @@ pub(super) async fn run_main_inner(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
-    let prepared_environment_manager =
-        if should_load_configured_environments(&loader_overrides, &app_server_target) {
-            startup_draft
-                .run_until(EnvironmentManager::prepare_from_codex_home(&codex_home))
-                .await?
-        } else {
-            startup_draft
-                .run_until(EnvironmentManager::prepare_from_env())
-                .await?
-        }
-        .map_err(std::io::Error::other)?;
+    let prepared_environment_manager = if cli.fork_destination_local {
+        startup_draft
+            .run_until(EnvironmentManager::prepare_local())
+            .await?
+    } else if should_load_configured_environments(&loader_overrides, &app_server_target) {
+        startup_draft
+            .run_until(EnvironmentManager::prepare_from_codex_home(&codex_home))
+            .await?
+    } else {
+        startup_draft
+            .run_until(EnvironmentManager::prepare_from_env())
+            .await?
+    }
+    .map_err(std::io::Error::other)?;
     let cwd = cli.cwd.clone();
     let config_cwd = config_cwd_for_app_server_target(
         cwd.as_deref(),

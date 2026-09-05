@@ -202,6 +202,7 @@ pub(super) async fn handle(
     mode: TurnInputMode,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    session.ensure_client_ready()?;
     match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {
@@ -332,6 +333,7 @@ async fn start_if_idle(
     submission_id: String,
     kind: TurnStartKind,
 ) -> CodexResult<TurnInputSubmission> {
+    session.ensure_client_ready()?;
     let TurnInputRequest {
         input,
         thread_settings,

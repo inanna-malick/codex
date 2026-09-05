@@ -203,6 +203,14 @@ impl DynamicToolHandler {
             }
         };
 
+        // The invocation was recorded before this handler was scheduled. Hosts may fork from
+        // another process while servicing it, so publish the call only after that prefix is durable.
+        session.flush_rollout().await.map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "could not persist dynamic tool invocation before dispatch: {err}"
+            ))
+        })?;
+
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),

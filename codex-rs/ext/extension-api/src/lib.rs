@@ -68,6 +68,7 @@ pub use contributors::SkillInvocationKind;
 pub use contributors::SynchronousApprovalReviewer;
 pub use contributors::ThreadIdleCause;
 pub use contributors::ThreadIdleInput;
+pub use contributors::ThreadInputReadyInput;
 pub use contributors::ThreadLifecycleContributor;
 pub use contributors::ThreadOriginator;
 pub use contributors::ThreadReadyInput;

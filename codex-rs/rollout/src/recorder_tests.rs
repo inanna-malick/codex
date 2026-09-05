@@ -189,6 +189,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
 
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            require_client_readiness: false,
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,

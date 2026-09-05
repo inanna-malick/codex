@@ -66,7 +66,11 @@ pub struct ThreadPersistenceMetadata {
 
 /// Extra configuration fields for a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExtraConfig {}
+pub struct ExtraConfig {
+    /// Require a trusted client readiness acknowledgment on every runtime attachment.
+    #[serde(default)]
+    pub require_client_readiness: bool,
+}
 
 /// Parameters required to create a persisted thread.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,6 +193,9 @@ pub enum ForkBoundary {
     ThroughTurn(String),
     /// Inherit history preceding the original visible occurrence of this turn.
     BeforeTurn(String),
+    /// Inherit through the fully persisted invocation, excluding its subsequent result.
+    /// The source thread and call id identify a reusable boundary as history advances.
+    ThroughCall(String),
 }
 
 /// Parameters for freezing the source history used to initialize a fork.

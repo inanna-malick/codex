@@ -59,6 +59,9 @@ mod app_cmd;
 mod cloud_config;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
+#[cfg(test)]
+#[path = "destination_fork_tests.rs"]
+mod destination_fork_tests;
 mod doctor;
 #[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
@@ -418,6 +421,14 @@ struct DeleteCommand {
 
 #[derive(Debug, Parser)]
 struct ForkCommand {
+    /// Run the child in this process's execution environment, without daemon reuse.
+    #[arg(long, requires_all = ["through_call", "host_dynamic_tools_socket"])]
+    destination_local: bool,
+
+    /// Inherit through this recorded hosted invocation, excluding its subsequent result.
+    #[arg(long, value_name = "CALL_ID", requires = "session_id")]
+    through_call: Option<String>,
+
     /// Conversation/session id (UUID). When provided, forks this session.
     /// If omitted, use --last to pick the most recent recorded session.
     #[arg(value_name = "SESSION_ID")]
@@ -1578,6 +1589,8 @@ async fn cli_main(
             println!("{output}");
         }
         Some(Subcommand::Fork(ForkCommand {
+            destination_local,
+            through_call,
             session_id,
             last,
             all,
@@ -1593,6 +1606,8 @@ async fn cli_main(
                 all,
                 config_overrides,
             );
+            interactive.fork_destination_local = destination_local;
+            interactive.fork_through_call = through_call;
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
@@ -3215,6 +3230,8 @@ mod tests {
             .take_auto_review_config_overrides(&mut root_overrides);
 
         let Subcommand::Fork(ForkCommand {
+            destination_local,
+            through_call,
             session_id,
             last,
             all,
@@ -3226,7 +3243,11 @@ mod tests {
         };
         let SessionTuiCli(fork_cli) = fork_cli;
 
-        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+        let mut interactive =
+            finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli);
+        interactive.fork_destination_local = destination_local;
+        interactive.fork_through_call = through_call;
+        interactive
     }
 
     fn finalize_exec_from_args(args: &[&str]) -> ExecCli {

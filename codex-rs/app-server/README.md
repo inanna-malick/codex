@@ -527,8 +527,9 @@ Like `thread/resume`, full-history hydration is deprecated for paginated `thread
 
 ### Effort-only context forks
 
-Use the existing `thread/fork` configuration override on the app server that owns
-the parent (including the local daemon used by interactive sessions):
+Use the existing `thread/fork` configuration override. The receiving server owns
+the new child; it can read a persisted parent from shared Codex storage without
+owning the live parent. Only the live owner can supply unpersisted settings:
 
 For new interactive actors, an explicit `codex --remote unix://` connection to
 `codex app-server --listen unix://` avoids implicit embedded-server fallback.
@@ -577,13 +578,94 @@ the corresponding turn's completion/error for the inference outcome.
 
 Fork requests are not idempotent: retrying a fork may create another child. This
 does not add a live effort-control endpoint or an applied-inference event.
-Existing active-turn snapshot/interrupt-boundary and tool-result repair semantics
-still apply. Use a completed parent turn and unchanged model, tools, and base
+Unless `throughCallId` is supplied as described below, existing active-turn
+snapshot/interrupt-boundary and tool-result repair semantics still apply.
+Use a completed parent turn and unchanged model, tools, and base
 instructions for exact-prefix comparisons. Compaction can replace the active
 context under its existing rules. Structural request-prefix preservation is not
 proof of provider cache reuse; cached/uncached token measurements and lineage
 must be recorded separately. Cache routing keys remain session-scoped and may
 differ between parent and child. Real-provider cache reuse is unverified.
+
+### Destination-owned invocation forks (experimental)
+
+Launch the interactive CLI inside an already-prepared destination execution
+environment, sharing the source's underlying Codex storage:
+
+```sh
+codex fork PARENT_UUID --destination-local --through-call CALL_ID \
+  --host-dynamic-tools-socket /absolute/child.sock -C /child/worktree \
+  -c 'model_reasoning_effort="low"'
+```
+
+Omit `-c` to inherit effort. `--destination-local` explicitly bypasses daemon
+reuse, configured remote execution environments, and exec-server environment
+selection, regardless of effort. It rejects a remote app-server connection.
+It does not create a namespace: the launcher must prepare the namespace,
+workspace, native-tool policy, and hosted socket before starting Codex.
+
+The reusable boundary is `(PARENT_UUID, CALL_ID)`, where `CALL_ID` is the recorded
+function/custom invocation's call ID, not a JSON-RPC request ID. Hosted invocation
+recording is flushed before dispatch to the host. Siblings and recursive forks
+can capture through that invocation while the source awaits its result, without
+interrupting or completing the source turn. Later source appends do not move the
+boundary. The full invocation and arguments belong to the inherited prefix;
+future results do not. Any necessary child-only protocol closures are appended
+after the prefix and explicitly do not report source failure or returned values.
+The child must receive its own assignment; it must not replay the inherited call.
+
+The underlying experimental `thread/fork` fields are `throughCallId`,
+`requireClientReadiness`, and `expectedDynamicTools`. Call IDs must contain
+1–256 UTF-8 bytes; missing/ambiguous IDs and combinations with turn boundaries
+are rejected. Source deletion or a revert removing the boundary prevents capture.
+`expectedDynamicTools` must exactly equal the inherited declarations, including
+order, descriptions, schemas, and grammars. The CLI supplies the destination
+registration for this check; only the endpoint may differ. No live-child migration
+or source-owner unload is required.
+
+Destination-local forks require readiness and defer inherited goal continuation.
+The hosted endpoint receives `POST /v1/dynamic-tools/session` with
+`{"protocolVersion":2,"threadId":"CHILD_UUID"}`. Bind that UUID to the prepared
+environment and respond HTTP `204` within the current five-second control timeout.
+Readiness must not depend on inference. Queueing assignment for that UUID before
+the acknowledgment is supported: the durable queue retains it behind the gate.
+After successful host attachment, the CLI calls the experimental RPC internally:
+
+```json
+{"method":"thread/ready","id":43,"params":{"threadId":"CHILD_UUID"}}
+{"id":43,"result":{"threadId":"CHILD_UUID","ready":true}}
+```
+
+The RPC targets the child's current owner. Unknown or unavailable threads fail
+explicitly. Repeated acknowledgments are idempotent. `ready: true` means input
+admission is open, not that a provider request was sent or accepted. Acknowledging
+an idle thread creates no input or inference. Existing queued work is reconsidered
+on the queue watcher (currently up to ten seconds). Direct inference requests
+before readiness fail explicitly. The persisted readiness requirement rearms on
+ID-based resume; RPC controllers must acknowledge the new runtime after setup.
+Ordinary CLI resume does not yet automatically perform this readiness handshake.
+
+Fork creation itself is not idempotent: retries create distinct children. Record
+the UUID from session attachment; an attachment timeout can leave a persisted,
+gated child. Queue RPC clients should retain `clientUserMessageId` for assignment
+retry deduplication. Pin the implementing revision: older binaries may ignore
+the persisted readiness policy. Experimental RPC clients must enable
+`experimentalApi` during initialization; inspect the matching schema and CLI
+`fork --help` for interface discovery, not as proof of provider cache support.
+
+Verification includes legacy and paginated RPC tests for pending-invocation
+siblings, recursive capture, parent independence, effort, injection authority,
+and readiness/resume. On Linux, run the real CLI namespace smoke test with a
+local mock provider:
+
+```sh
+python3 scripts/test-destination-fork.py /absolute/path/to/codex
+```
+
+It uses separate mount namespaces and checks first native-tool output against
+each child's worktree sentinel, while ancestor hosted calls remain unresolved.
+It reports lineage and a structural prefix digest; auxiliary title-generation
+requests are counted separately. These are not real-provider cache measurements.
 
 ### Listing projects
 

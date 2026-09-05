@@ -3038,6 +3038,9 @@ pub struct HistoryPosition {
 /// and should be used when there is no config override.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
+    /// Runtime attachment must be acknowledged before this thread can infer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_client_readiness: bool,
     /// session_id is equal to the root thread's ID.
     pub session_id: SessionId,
     pub id: ThreadId,
@@ -3109,6 +3112,7 @@ impl Default for SessionMeta {
             id,
             forked_from_id: None,
             forked_from_ordinal_exclusive: None,
+            require_client_readiness: false,
             parent_thread_id: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),

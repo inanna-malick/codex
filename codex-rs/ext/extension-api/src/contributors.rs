@@ -41,6 +41,7 @@ pub use skill_invocation::SkillInvocationInput;
 pub use skill_invocation::SkillInvocationKind;
 pub use thread_lifecycle::ThreadIdleCause;
 pub use thread_lifecycle::ThreadIdleInput;
+pub use thread_lifecycle::ThreadInputReadyInput;
 pub use thread_lifecycle::ThreadOriginator;
 pub use thread_lifecycle::ThreadReadyInput;
 pub use thread_lifecycle::ThreadResumeInput;
@@ -154,6 +155,18 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
 
     /// Called after the host constructs a runtime from persisted history.
     fn on_thread_resume<'a>(&'a self, input: ThreadResumeInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let _self = self;
+            let _input = input;
+        })
+    }
+
+    /// Called when client setup finishes. Reconsider existing queued work only; this is not a
+    /// resume or an idle transition and must not manufacture automatic continuation.
+    fn on_thread_input_ready<'a>(
+        &'a self,
+        input: ThreadInputReadyInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let _self = self;
             let _input = input;

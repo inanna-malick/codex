@@ -544,6 +544,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadArchiveResponse,
     },
+    #[experimental("thread/ready")]
+    ThreadReady => "thread/ready" {
+        params: v2::ThreadReadyParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadReadyResponse,
+    },
     ThreadDelete => "thread/delete" {
         params: v2::ThreadDeleteParams,
         serialization: thread_id(params.thread_id),

@@ -743,8 +743,13 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::explicit_deferral(false)]
+#[case::readiness_gate(true)]
 #[tokio::test]
-async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()> {
+async fn thread_fork_defers_inherited_active_goal_until_next_turn(
+    #[case] require_client_readiness: bool,
+) -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("first-source-turn"),
@@ -854,7 +859,8 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
                 thread_id: source_thread.id.clone(),
                 last_turn_id,
                 before_turn_id,
-                defer_goal_continuation: true,
+                defer_goal_continuation: !require_client_readiness,
+                require_client_readiness,
                 ..Default::default()
             })
             .await?;
@@ -862,6 +868,12 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
             thread: forked_thread,
             ..
         } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+        if require_client_readiness {
+            let id = mcp
+                .send_request("thread/ready", Some(json!({"threadId": forked_thread.id})))
+                .await?;
+            let _: codex_app_server_protocol::ThreadReadyResponse = mcp.read_response(id).await?;
+        }
         let forked_thread_id = ThreadId::from_string(&forked_thread.id)?;
         assert_eq!(forked_thread.turns.len(), expected_turn_count);
         let mut expected_goal = source_goal.clone();
@@ -932,6 +944,18 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
             .any(|method| method == "turn/started"),
         "deferred goal should remain deferred after app-server restart"
     );
+    if require_client_readiness {
+        let id = mcp
+            .send_request("thread/ready", Some(json!({"threadId": forked_thread.id})))
+            .await?;
+        let _: codex_app_server_protocol::ThreadReadyResponse = mcp.read_response(id).await?;
+        assert!(
+            state_db
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(forked_thread_id)
+                .await?
+        );
+    }
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.start_turn_and_wait_for_completion(TurnStartParams {

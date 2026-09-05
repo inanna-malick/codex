@@ -40,6 +40,7 @@ use tokio::sync::Semaphore;
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
+    pub(crate) client_ready: std::sync::atomic::AtomicBool,
     pub(crate) thread_id: ThreadId,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
@@ -673,6 +674,12 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     ) -> anyhow::Result<Arc<Self>> {
+        let require_client_readiness = config
+            .extra_config
+            .as_ref()
+            .is_some_and(|config| config.require_client_readiness)
+            || matches!(&initial_history, InitialHistory::Resumed(history)
+                if matches!(history.history.first(), Some(RolloutItem::SessionMeta(meta)) if meta.meta.require_client_readiness));
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -1498,6 +1505,7 @@ impl Session {
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
+                client_ready: std::sync::atomic::AtomicBool::new(!require_client_readiness),
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),

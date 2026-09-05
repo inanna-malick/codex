@@ -253,6 +253,7 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        require_client_readiness: false,
         session_id,
         id: conversation_id,
         forked_from_id: None,
@@ -346,6 +347,7 @@ pub fn create_fake_rollout_with_text_elements(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        require_client_readiness: false,
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
