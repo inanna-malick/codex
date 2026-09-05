@@ -425,7 +425,13 @@ fn reasoning_effort_for_requests_uses_multi_agent_override_for_ultra() {
 fn responses_lite_configuration_keeps_baseline_and_all_effort_values() -> anyhow::Result<()> {
     let client = test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli);
     let mut model = test_model_info();
-    for use_responses_lite in [true, false] {
+    for (slug, use_responses_lite, supports_configuration) in [
+        ("gpt-6-astra", true, true),
+        ("gpt-6-astra", false, false),
+        ("gpt-5.6-sol", true, false),
+        ("gpt-5.6-sol", false, false),
+    ] {
+        model.slug = slug.to_string();
         model.use_responses_lite = use_responses_lite;
         for selected in [
             ReasoningEffort::None,
@@ -468,7 +474,7 @@ fn responses_lite_configuration_keeps_baseline_and_all_effort_values() -> anyhow
                     TestCodexResponsesRequestKind::Turn,
                 ),
             )?;
-            if use_responses_lite {
+            if supports_configuration {
                 assert_eq!(
                     request.reasoning.unwrap().effort,
                     Some(ReasoningEffort::High)
@@ -482,7 +488,12 @@ fn responses_lite_configuration_keeps_baseline_and_all_effort_values() -> anyhow
                     request.reasoning.unwrap().effort,
                     Some(super::reasoning_effort_for_request(&model, selected))
                 );
-                assert_eq!(request.input, vec![]);
+                assert!(
+                    !request
+                        .input
+                        .iter()
+                        .any(|item| matches!(item, ResponseItem::ConfigurationUpdate { .. }))
+                );
             }
         }
     }

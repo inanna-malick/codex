@@ -12,7 +12,9 @@ use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::ResponseItem;
 
 pub(super) async fn record_for_step(session: &Session, step: &StepContext) -> Result<()> {
-    if !step.settings.model_info.use_responses_lite {
+    if !codex_models_manager::model_info::supports_reasoning_configuration(
+        &step.settings.model_info,
+    ) {
         return Ok(());
     }
     let Some(effort) = step.settings.effective_reasoning_effort() else {

@@ -991,9 +991,11 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
-        if !model_info.use_responses_lite {
-            // A model switch may leave Lite controls in durable history. Do not
-            // send them to a protocol that uses request-level reasoning instead.
+        let supports_configuration =
+            codex_models_manager::model_info::supports_reasoning_configuration(model_info);
+        if !supports_configuration {
+            // Keep durable history intact across model switches, but project
+            // unsupported controls out of this model's outgoing request.
             input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
         }
         let is_openai = self.state.provider.info().is_openai();
@@ -1047,7 +1049,7 @@ impl ModelClient {
         // Trusted history has already been filtered by the session owner. Keep
         // its original request-level baseline stable across effort-only forks;
         // the backend applies subsequent configuration updates in order.
-        let effort = if model_info.use_responses_lite {
+        let effort = if supports_configuration {
             prompt
                 .input
                 .iter()
