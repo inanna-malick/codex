@@ -183,7 +183,7 @@ pub(crate) struct CompactConversationRequestSettings {
     pub(crate) service_tier: Option<String>,
 }
 
-fn reasoning_effort_for_request(
+pub(crate) fn reasoning_effort_for_request(
     model_info: &ModelInfo,
     effort: ReasoningEffortConfig,
 ) -> ReasoningEffortConfig {
@@ -934,14 +934,16 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+        if !model_info.use_responses_lite {
+            // A model switch may leave Lite controls in durable history. Do not
+            // send them to a protocol that uses request-level reasoning instead.
+            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
+        }
         let is_openai = self.state.provider.info().is_openai();
         let (instructions, tools) = if model_info.use_responses_lite {
-            // These prompt-only items are rebuilt on every request. Hash their visible payloads
-            // within the thread so retries and resumed sessions preserve their identity.
-            let prefix_namespace = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                self.state.thread_id.to_string().as_bytes(),
-            );
+            // Content-address prompt-only items so exact-context forks, retries,
+            // and resumes preserve the same provider-visible prefix identities.
+            let prefix_namespace = Uuid::NAMESPACE_OID;
             let tools = if self.state.provider.capabilities().namespace_tools {
                 create_tools_json_for_responses_lite(&prompt.tools)?
             } else {
@@ -985,6 +987,23 @@ impl ModelClient {
                 }
             }
         }
+        // Trusted history has already been filtered by the session owner. Keep
+        // its original request-level baseline stable across effort-only forks;
+        // the backend applies subsequent configuration updates in order.
+        let effort = if model_info.use_responses_lite {
+            prompt
+                .input
+                .iter()
+                .find_map(|item| match item {
+                    ResponseItem::ConfigurationUpdate { reasoning } => {
+                        Some(reasoning.effort.clone())
+                    }
+                    _ => None,
+                })
+                .or(effort)
+        } else {
+            effort
+        };
         let reasoning = self.build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai

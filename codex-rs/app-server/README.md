@@ -525,6 +525,66 @@ To branch from a stored session, call `thread/fork` with the `thread.id`. This c
 
 Like `thread/resume`, full-history hydration is deprecated for paginated `thread/fork` and emits `deprecationNotice`. Clients should pass `excludeTurns: true` to return only thread metadata in `thread.turns` and page history with `thread/turns/list` and `thread/items/list`. Metadata-only forks do not replay restored `thread/tokenUsage/updated`. Ephemeral forks of paginated threads require `excludeTurns: true`.
 
+### Effort-only context forks
+
+Use the existing `thread/fork` configuration override on the app server that owns
+the parent (including the local daemon used by interactive sessions):
+
+For new interactive actors, an explicit `codex --remote unix://` connection to
+`codex app-server --listen unix://` avoids implicit embedded-server fallback.
+Connect the controller to that same socket using the initialization handshake
+above. An embedded interactive server without an exposed control transport cannot
+be targeted externally by this RPC; neither another app-server process nor
+launch-time options on `codex queue` change that live owner.
+
+```json
+{"method":"thread/fork","id":42,"params":{"threadId":"PARENT_UUID","excludeTurns":true,"config":{"model_reasoning_effort":"low"}}}
+```
+
+Omitting the effort override inherits the parent's selected effort, including a
+committed thread-settings update before its next turn. Loaded parents supply
+their owner snapshot; unloaded parents supply persisted metadata. Model and
+provider also default to the parent. Explicit model/provider changes retain their
+ordinary configuration semantics and are not an effort-only prefix guarantee.
+All existing effort values and non-empty model-defined strings are accepted by
+the configuration parser; consult `model/list.supportedReasoningEfforts` for the
+selected model's advertised values. Empty values and wrong JSON types produce
+configuration errors; backend rejection is reported as a turn error.
+Custom values longer than 128 UTF-8 bytes fail before Lite inference so trusted
+history controls stay bounded; this does not restrict ordinary non-Lite settings.
+
+For Responses Lite models, ordinary inference records trusted
+`configuration_update` items. The original request-level reasoning baseline and
+inherited items remain unchanged; a different effort appends an update before
+the child's first sampling request. Repeated settings append nothing. Legacy and
+paginated storage preserve these trusted updates through ID-based resume.
+The stable request baseline requires a parent that has already inferred with
+this implementation. Older histories without an authored configuration update
+cannot establish the old request baseline from the item stream alone.
+Non-Lite models retain the ordinary request-level effort behavior; they do not
+have this effort-change cache-prefix guarantee. There is no runtime cache-support
+probe in this API. Pin the implementing revision; schema presence alone does not
+establish these semantics on older servers.
+
+The response's `thread.id` is the exact child target and `reasoningEffort` is its
+selected setting, **not** an acknowledgement of inference. Forking does not run
+a turn unless existing goal-continuation behavior requests one; use
+`deferGoalContinuation: true` (experimental clients) when applicable. Start ordinary
+work with `turn/start` or queue it for the returned child ID. With raw events
+enabled, `rawResponseItem/completed` includes `threadId`, `turnId`, and the staged
+configuration item. It reports history recording, not provider acceptance; use
+the corresponding turn's completion/error for the inference outcome.
+
+Fork requests are not idempotent: retrying a fork may create another child. This
+does not add a live effort-control endpoint or an applied-inference event.
+Existing active-turn snapshot/interrupt-boundary and tool-result repair semantics
+still apply. Use a completed parent turn and unchanged model, tools, and base
+instructions for exact-prefix comparisons. Compaction can replace the active
+context under its existing rules. Structural request-prefix preservation is not
+proof of provider cache reuse; cached/uncached token measurements and lineage
+must be recorded separately. Cache routing keys remain session-scoped and may
+differ between parent and child. Real-provider cache reuse is unverified.
+
 ### Listing projects
 
 `project/list` accepts optional `sortKey` (`position` or `recencyAt`) and

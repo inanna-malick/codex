@@ -287,7 +287,7 @@ fn test_model_info() -> ModelInfo {
 }
 
 #[test]
-fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
+fn responses_lite_prefix_ids_track_payload_across_threads() -> anyhow::Result<()> {
     let thread_id = ThreadId::new();
     let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
     let mut model = test_model_info();
@@ -346,8 +346,7 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
         &test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli),
         &prompt,
     )?;
-    assert_ne!(independent.input[0].id(), changed_tools.input[0].id());
-    assert_ne!(independent.input[1].id(), changed_tools.input[1].id());
+    assert_eq!(independent.input, changed_tools.input);
     Ok(())
 }
 
@@ -420,6 +419,74 @@ fn reasoning_effort_for_requests_uses_multi_agent_override_for_ultra() {
     });
 
     assert_eq!(actual, [ReasoningEffort::High, ReasoningEffort::High]);
+}
+
+#[test]
+fn responses_lite_configuration_keeps_baseline_and_all_effort_values() -> anyhow::Result<()> {
+    let client = test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli);
+    let mut model = test_model_info();
+    for use_responses_lite in [true, false] {
+        model.use_responses_lite = use_responses_lite;
+        for selected in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Persistent,
+            ReasoningEffort::Custom("future-effort".to_string()),
+        ] {
+            let input = vec![
+                ResponseItem::ConfigurationUpdate {
+                    reasoning: codex_protocol::models::ConfigurationReasoning {
+                        effort: ReasoningEffort::High,
+                    },
+                },
+                ResponseItem::ConfigurationUpdate {
+                    reasoning: codex_protocol::models::ConfigurationReasoning {
+                        effort: super::reasoning_effort_for_request(&model, selected.clone()),
+                    },
+                },
+            ];
+            let request = client.build_responses_request(
+                &Prompt {
+                    input: input.clone(),
+                    ..Default::default()
+                },
+                &model,
+                Some(selected.clone()),
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &test_responses_metadata_for_client(
+                    &client,
+                    /*turn_id*/ None,
+                    "step".to_string(),
+                    /*parent_thread_id*/ None,
+                    TestCodexResponsesRequestKind::Turn,
+                ),
+            )?;
+            if use_responses_lite {
+                assert_eq!(
+                    request.reasoning.unwrap().effort,
+                    Some(ReasoningEffort::High)
+                );
+                assert_eq!(
+                    &request.input[request.input.len() - input.len()..],
+                    input.as_slice()
+                );
+            } else {
+                assert_eq!(
+                    request.reasoning.unwrap().effort,
+                    Some(super::reasoning_effort_for_request(&model, selected))
+                );
+                assert_eq!(request.input, vec![]);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

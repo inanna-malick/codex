@@ -4801,11 +4801,20 @@ impl ThreadRequestProcessor {
     async fn thread_fork_inner(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadForkParams,
+        mut params: ThreadForkParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<(), JSONRPCErrorError> {
+        let source_thread = self
+            .read_stored_thread_for_resume(
+                &params.thread_id,
+                params.path.as_ref(),
+                /*include_history*/ false,
+            )
+            .await?;
+        super::thread_fork_settings::inherit(&mut params, &source_thread, &self.thread_manager)
+            .await;
         let ThreadForkParams {
             thread_id,
             last_turn_id,
@@ -4834,13 +4843,6 @@ impl ThreadRequestProcessor {
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
-        let source_thread = self
-            .read_stored_thread_for_resume(
-                &thread_id,
-                path.as_ref(),
-                /*include_history*/ false,
-            )
-            .await?;
         let paginated_source = matches!(source_thread.history_mode, ThreadHistoryMode::Paginated);
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
