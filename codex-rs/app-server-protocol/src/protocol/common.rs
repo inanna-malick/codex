@@ -544,6 +544,30 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadArchiveResponse,
     },
+    #[experimental("thread/observe")]
+    ThreadObserve => "thread/observe" {
+        params: v2::ThreadObserveParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadObserveResponse,
+    },
+    #[experimental("control/acquire")]
+    ControlAcquire => "control/acquire" {
+        params: v2::ControlAcquireParams,
+        serialization: None,
+        response: v2::ControlAcquireResponse,
+    },
+    #[experimental("control/status/read")]
+    ControlStatusRead => "control/status/read" {
+        params: v2::ControlStatusParams,
+        serialization: None,
+        response: v2::ControlStatusReadResponse,
+    },
+    #[experimental("control/pending/list")]
+    ControlPendingList => "control/pending/list" {
+        params: v2::ControlPendingListParams,
+        serialization: None,
+        response: v2::ControlPendingListResponse,
+    },
     #[experimental("thread/ready")]
     ThreadReady => "thread/ready" {
         params: v2::ThreadReadyParams,
@@ -1855,6 +1879,8 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
 }
 
 server_notification_definitions! {
+    #[experimental("control/status/changed")]
+    ControlStatusChanged => "control/status/changed" (v2::ControlStatusChangedNotification),
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),

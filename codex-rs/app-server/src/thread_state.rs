@@ -56,6 +56,10 @@ pub(crate) struct PendingThreadResumeRequest {
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
 pub(crate) enum ThreadListenerCommand {
+    Observe {
+        request_id: ConnectionRequestId,
+        thread: Box<codex_app_server_protocol::Thread>,
+    },
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
     SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
     // EmitThreadGoalUpdated is used to order goal updates with running-thread resume responses and goal clears.

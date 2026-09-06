@@ -1,3 +1,4 @@
+mod control;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -102,6 +103,8 @@ pub(crate) enum OutgoingEnvelope {
 
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
+    pub(crate) control: Arc<crate::control::Control>,
+    fenced_pending: Mutex<(Vec<codex_app_server_protocol::ControlPendingEntry>, bool)>,
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
@@ -221,6 +224,8 @@ impl OutgoingMessageSender {
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
+            control: Arc::new(crate::control::Control::default()),
+            fenced_pending: Mutex::new((Vec::new(), true)),
             next_server_request_id: AtomicI64::new(0),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
@@ -298,6 +303,21 @@ impl OutgoingMessageSender {
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
+        let controlled_connections;
+        let connection_ids = if self.control.enabled() {
+            controlled_connections = self.control.request_connections(&[]);
+            if controlled_connections.is_empty() {
+                let id = self.next_request_id();
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(Err(crate::control::control_error(
+                    "controller is unavailable",
+                )));
+                return (id, receiver);
+            }
+            Some(controlled_connections.as_slice())
+        } else {
+            connection_ids
+        };
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
@@ -305,6 +325,12 @@ impl OutgoingMessageSender {
         let (tx_approve, rx_approve) = oneshot::channel();
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            if self.control.enabled() && self.control.request_connections(&[]).is_empty() {
+                let _ = tx_approve.send(Err(crate::control::control_error(
+                    "controller disconnected before dispatch",
+                )));
+                return (outgoing_message_id, rx_approve);
+            }
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
@@ -364,6 +390,9 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         thread_id: ThreadId,
     ) {
+        if self.control.enabled() {
+            return;
+        }
         let requests = self.pending_requests_for_thread(thread_id).await;
         for request in requests {
             if let Err(err) = self
@@ -380,8 +409,18 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn notify_client_response(&self, id: RequestId, result: Result) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_response(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        result: Result,
+    ) {
+        let entry = {
+            let mut callbacks = self.request_id_to_callback.lock().await;
+            self.control
+                .with_authority(connection_id, || callbacks.remove_entry(&id))
+                .flatten()
+        };
 
         match entry {
             Some((id, entry)) => {
@@ -403,8 +442,18 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn notify_client_error(&self, id: RequestId, error: JSONRPCErrorError) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_error(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        error: JSONRPCErrorError,
+    ) {
+        let entry = {
+            let mut callbacks = self.request_id_to_callback.lock().await;
+            self.control
+                .with_authority(connection_id, || callbacks.remove_entry(&id))
+                .flatten()
+        };
 
         match entry {
             Some((id, entry)) => {
@@ -1316,7 +1365,7 @@ mod tests {
         let error = internal_error("refresh failed");
 
         outgoing
-            .notify_client_error(request_id, error.clone())
+            .notify_client_error(ConnectionId(42), request_id, error.clone())
             .await;
 
         let result = timeout(Duration::from_secs(1), wait_for_result)

@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Protocol](#protocol)
+- [Controlled execution and observer attachment](#controlled-execution-and-observer-attachment-experimental)
 - [Message Schema](#message-schema)
 - [Core Primitives](#core-primitives)
 - [Lifecycle Overview](#lifecycle-overview)
@@ -62,6 +63,153 @@ Backpressure behavior:
 - The server uses bounded queues between transport ingress, request processing, and outbound writes.
 - When request ingress is saturated, new requests are rejected with a JSON-RPC error code `-32001` and message `"Server overloaded; retry later."`.
 - Clients should treat this as retryable and use exponential backoff with jitter.
+
+## Controlled execution and observer attachment (experimental)
+
+Launch one service per managed execution environment, with a launcher-generated
+fresh credential file for each process lifetime, containing 32–4096 bytes of random
+secret text (surrounding whitespace
+is trimmed). Keep that file available only to the launcher and controller:
+
+```sh
+codex app-server --listen unix:///absolute/path/actor.sock \
+  --controller-token-file /absolute/path/controller-token
+codex observe THREAD_UUID --remote unix:///absolute/path/actor.sock
+```
+
+The standalone `codex-app-server` binary accepts the same service flags. Explicit
+`ws://IP:PORT` is also supported. Unix sockets carry a WebSocket handshake and
+frames, not JSONL; the controller must use the native transport. The credential
+establishes execution custody, not OS-user isolation or transport authentication.
+Configure those separately in the launcher. Claiming an ordinary running service
+is unsupported. Omitting the flag preserves ordinary service/client behavior.
+
+Every connection initializes with `capabilities.experimentalApi: true`. The
+controller then acquires custody on that same connection before other operations:
+
+```json
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"shoal","version":"1"},"capabilities":{"experimentalApi":true}}}
+{"id":2,"method":"control/acquire","params":{"token":"LAUNCHER_CREDENTIAL"}}
+{"id":2,"result":{"instanceId":"INSTANCE_UUID","state":"controlled","shutdown":"notStarted","reconciliationRequired":false}}
+{"id":3,"method":"thread/start","params":{"dynamicTools":[{"type":"function","name":"effect","description":"Execute an actor effect","inputSchema":{"type":"object","properties":{}}}]}}
+{"id":4,"method":"thread/ready","params":{"threadId":"THREAD_UUID"}}
+{"id":5,"method":"turn/start","params":{"threadId":"THREAD_UUID","input":[{"type":"text","text":"Perform the assignment"}]}}
+```
+
+All roots created or resumed in controlled mode require readiness, including roots
+without hosted tools. Register the destination host before acknowledging readiness.
+The controller uses the existing input/steering, queue, interrupt and full-prefix
+fork APIs. For an invocation-boundary fork, supply `throughCallId`,
+`requireClientReadiness: true` and `expectedDynamicTools` matching the inherited
+registration. Child-only protocol closures complete the inherited boundary without
+executing its call or pretending to settle its source effect. The child needs its
+own assignment and readiness acknowledgment; viewing it releases neither barrier.
+See the invocation-boundary examples below.
+
+Hosted calls, approvals, time and attestation requests are routed exclusively to the
+controller. Reply on its original connection using the JSON-RPC request ID, for example:
+
+```json
+{"id":73,"method":"item/tool/call","params":{"contextCallId":null,"threadId":"THREAD_UUID","turnId":"TURN_UUID","callId":"CALL_ID","namespace":null,"tool":"effect","arguments":{}}}
+{"id":73,"result":{"contentItems":[{"type":"inputText","text":"Recorded external result"}],"success":true}}
+```
+
+A second connection cannot claim custody, mutate execution or consume a callback
+using a forged result/error. The server rejects observer mutations with error
+`-32010` and `data.reason: "controlUnavailable"`. Custody is enforced by the server;
+clients must not rely on the observer UI's disabled input as an authority boundary.
+
+An observer calls `thread/observe` with an ID already loaded by the controller.
+The response contains thread metadata and a listener-ordered active-turn snapshot;
+subsequent notifications follow it. The connection may then read that thread's
+history with `thread/read`, `thread/turns/list` and, for paginated history,
+`thread/items/list`. It may unsubscribe. Observation never loads or resumes an
+execution, acknowledges readiness, replays callbacks, or changes tools/configuration.
+Reading inactive persisted history through observer attachment is deferred.
+Controlled runtimes stay loaded independently of subscriber counts, including when
+the controller unsubscribes; observer detachment never owns idle unloading.
+
+The native `observe` command opens only this observation path. It shows a read-only
+transcript; arrows scroll, PageUp browses persisted history from newest to oldest,
+End returns to live output,
+and q exits. Its display retains up to 1,000 recent live items and a separate older
+page. It never answers server requests or reconnects automatically. A notification
+gap is displayed explicitly; exit and reattach to refresh. Detachment closes only
+the observer connection, leaving the service and executor children owned by the
+controller. Standard interactive `codex --remote` is not the observer command.
+
+### Controller disconnect and reconciliation
+
+Controller disconnection irreversibly changes this service instance to `fenced`,
+requests cancellation of inference/tool execution and blocks further execution
+admission. No observer
+becomes controller, and even the credential cannot acquire replacement custody in
+the fenced instance. Already dispatched external effects may still finish.
+`control/status/read` and `control/status/changed` expose:
+
+- `state`: `awaitingController`, `controlled`, or `fenced`.
+- `shutdown`: `notStarted`, `draining`, `sessionsStopped`, or `incomplete`.
+- `reconciliationRequired`: true after fencing, even when native shutdown completed.
+- `instanceId`: identifies this process lifetime, not an effect-deduplication key.
+
+`sessionsStopped` means session-loop shutdown and controller request/startup draining
+completed. Existing process managers request termination without confirming every
+local/remote process exit; Windows restricted direct commands may not be cancellable.
+This status does **not** establish process exit or external-effect outcomes. The
+launcher must stop the service and its executor process tree before replacement,
+including after `sessionsStopped`. `incomplete` additionally means session/request
+cleanup timed out or failed; never assume safe draining.
+The service remains available for status inspection and never automatically restarts,
+replays callbacks, or resubmits input.
+
+Call `control/pending/list` with optional `cursor` and `limit` (1–100). Each entry
+contains a request ID, method and available thread/turn/call IDs, without arguments.
+After fencing this is a frozen, process-local snapshot of at most 1,024 outstanding
+requests; `truncated: true` means it is incomplete (also while capture is pending).
+Live pagination can change as callbacks settle. This inventory is diagnostic, not a
+persistent effect ledger: an accepted response may have left the callback map before
+its result reached durable history. Absence from the inventory proves no outcome.
+
+Preserve recorded results and reconcile unrecorded external-effect outcomes as
+**uncertain**, never as failed or undone. A request response establishes only that
+operation's documented acceptance; a successful socket write, callback ID or
+`thread/ready` response does not prove presentation, effect completion or deduplication.
+Use item/turn completion notifications and persisted history alongside the host's
+own durable effect records. Stop the fenced service and its executor tree, confirm quiescence, and reconcile
+outcomes before launching a replacement with a fresh credential. Then acquire custody,
+resume the chosen thread, inspect
+its durable queue/history, reconnect its host, then explicitly acknowledge readiness.
+Readiness can release existing queued input: remove or reconcile uncertain input
+before that acknowledgment. Do not blindly resubmit a request whose acknowledgment
+was lost. No exactly-once guarantee is added by this protocol.
+
+### Building and validating the controlled service
+
+Build both native entry points from the pinned checkout:
+
+```sh
+cd codex-rs
+cargo build --locked -p codex-cli --bin codex -p codex-app-server --bin codex-app-server
+just test -p codex-app-server -p codex-app-server-protocol -p codex-core -p codex-tui -p codex-cli -E 'binary(observer) | test(observer::tests) | test(controlled_service) | test(execution_fence) | test(fenced_shutdown) | test(control::tests::disconnected_connections) | test(control::tests::only_lost)'
+```
+
+The focused acceptance selection passed all 13 tests on Linux with mock providers.
+It exercises native WebSocket custody/callback routing, fork/readiness, fenced
+recovery with a fresh credential, and actual native TUI attachment through a PTY.
+Two observer rendering snapshots cover connected and fenced displays. Both stable
+and experimental schema generation passed.
+
+The broader five-crate run was not clean: 10,173 passed, 485 failed, one timed out,
+and 18 were skipped. Failures included unavailable hardcoded system executables,
+sandbox helper failures and unrelated existing terminal snapshots; the full failure
+set has not been established as baseline-only. The complete workspace suite was
+not run. Windows/macOS behavior and complete executor-process termination were not
+verified by these Linux acceptance tests.
+
+The consumer still owns mount setup, destination tool-host registration, durable
+effect reconciliation, assignment/notification semantics and the mounted
+controller/observer canary. Native tests and source review do not establish that
+mounted integration's acceptance.
 
 ## Message Schema
 

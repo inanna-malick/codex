@@ -104,6 +104,7 @@ mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
 mod connection_rpc_gate;
+mod control;
 mod current_time;
 mod dynamic_tools;
 mod effective_plugin_change;
@@ -456,6 +457,7 @@ pub enum PluginStartupTasks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    pub controller_token_file: Option<std::path::PathBuf>,
     pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
@@ -465,6 +467,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            controller_token_file: None,
             code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
@@ -485,6 +488,26 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    let control = if let Some(path) = &runtime_options.controller_token_file {
+        if !matches!(
+            transport,
+            AppServerTransport::UnixSocket { .. } | AppServerTransport::WebSocket { .. }
+        ) {
+            return Err(std::io::Error::other(
+                "controlled mode requires an explicit socket transport",
+            ));
+        }
+        let token = std::fs::read_to_string(path)?;
+        let token = token.trim().to_string();
+        if token.len() < 32 || token.len() > 4096 {
+            return Err(std::io::Error::other(
+                "controller credential must contain 32 to 4096 bytes",
+            ));
+        }
+        Arc::new(control::Control::controlled(token))
+    } else {
+        Arc::new(control::Control::default())
+    };
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -569,6 +592,11 @@ pub async fn run_main_with_transport_options(
         }
     };
     config.auth_config().validate()?;
+    if control.enabled() {
+        codex_login::default_client::set_default_client_residency_requirement(
+            config.enforce_residency.value(),
+        );
+    }
     #[cfg(target_os = "macos")]
     let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
@@ -921,10 +949,10 @@ pub async fn run_main_with_transport_options(
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
+        let outgoing_message_sender = Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, analytics_events_client.clone())
+                .with_control(Arc::clone(&control)),
+        );
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
@@ -1004,6 +1032,7 @@ pub async fn run_main_with_transport_options(
                                 writer,
                                 disconnect_sender,
                             } => {
+                                control.connection_opened(connection_id);
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
                                 let outbound_experimental_api_enabled =
                                     Arc::new(AtomicBool::new(false));
@@ -1042,6 +1071,7 @@ pub async fn run_main_with_transport_options(
                                     continue;
                                 };
                                 let stdio_closed = connection_state.origin == ConnectionOrigin::Stdio;
+                                processor.fence_disconnected_controller(connection_id);
                                 connection_state.session.rpc_gate.close().await;
                                 let outbound_closed = outbound_control_tx
                                     .send(OutboundControlEvent::Closed { connection_id })
@@ -1134,7 +1164,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping response from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_response(response).await;
+                                        processor.process_response(connection_id, response).await;
                                     }
                                     JSONRPCMessage::Notification(notification) => {
                                         if !connections.contains_key(&connection_id) {
@@ -1148,7 +1178,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping error from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_error(err).await;
+                                        processor.process_error(connection_id, err).await;
                                     }
                                 }
                             }

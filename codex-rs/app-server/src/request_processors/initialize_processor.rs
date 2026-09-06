@@ -92,7 +92,8 @@ impl InitializeRequestProcessor {
         }
         let originator = name.clone();
         let user_agent_suffix = format!("{name}; {version}");
-        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
+        let mutates_global_identity = !self.outgoing.control.enabled()
+            && !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
         let codex_home = self.config.codex_home.clone();
         if session
             .initialize(InitializedConnectionSessionState {
@@ -133,7 +134,9 @@ impl InitializeRequestProcessor {
             originator,
             self.rpc_transport,
         );
-        set_default_client_residency_requirement(self.config.enforce_residency.value());
+        if !self.outgoing.control.enabled() {
+            set_default_client_residency_requirement(self.config.enforce_residency.value());
+        }
         if mutates_global_identity && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
             *suffix = Some(user_agent_suffix);
         }
@@ -186,6 +189,9 @@ impl InitializeRequestProcessor {
         request_id: RequestId,
         request: &ClientRequest,
     ) {
+        if matches!(request, ClientRequest::ControlAcquire { .. }) {
+            return;
+        }
         self.analytics_events_client
             .track_request(connection_id.0, request_id, request);
     }

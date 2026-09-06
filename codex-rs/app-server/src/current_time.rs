@@ -88,20 +88,23 @@ async fn request_current_time(
     thread_id: ThreadId,
 ) -> Result<DateTime<Utc>> {
     let deadline = Instant::now() + CURRENT_TIME_REQUEST_TIMEOUT;
-    timeout_at(
-        deadline,
-        thread_state_manager.wait_for_thread_subscriber(thread_id),
-    )
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "timed out waiting for a client to subscribe to the thread after {}s",
-            CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
+    if !outgoing.control.enabled() {
+        timeout_at(
+            deadline,
+            thread_state_manager.wait_for_thread_subscriber(thread_id),
         )
-    })?;
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out waiting for a client to subscribe to the thread after {}s",
+                CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
+            )
+        })?;
+    }
     let connection_ids = thread_state_manager
         .subscribed_connection_ids(thread_id)
         .await;
+    let connection_ids = outgoing.control.request_connections(&connection_ids);
     let connection_id = require_single_current_time_connection(&connection_ids)?;
     let connection_ids = [connection_id];
     let (request_id, rx) = outgoing

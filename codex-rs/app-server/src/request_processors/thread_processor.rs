@@ -1,4 +1,5 @@
 use super::persisted_resume_settings::PersistedResumeSettings;
+mod observe;
 mod readiness;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
@@ -1299,14 +1300,9 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
-    pub(crate) async fn drain_background_tasks(&self) {
+    pub(crate) async fn drain_background_tasks(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.background_tasks.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
-            .await
-            .is_err()
-        {
-            warn!("timed out waiting for background tasks to shut down; proceeding");
-        }
+        tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait()).await
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {

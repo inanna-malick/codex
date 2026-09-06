@@ -21,6 +21,7 @@ mod config_rpc;
 mod connection_handling_websocket;
 #[cfg(any(unix, windows))]
 mod connection_handling_websocket_unix;
+mod controlled_service;
 #[cfg(unix)]
 mod curated_mcp_sync;
 mod current_time;

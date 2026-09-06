@@ -2811,6 +2811,30 @@
       "title": "CommandExecutionRequestApprovalResponse",
       "type": "object"
     },
+    "ControlStatus": {
+      "properties": {
+        "instanceId": {
+          "type": "string"
+        },
+        "reconciliationRequired": {
+          "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+          "type": "boolean"
+        },
+        "shutdown": {
+          "$ref": "#/definitions/v2/ControlShutdownState"
+        },
+        "state": {
+          "$ref": "#/definitions/v2/ControlState"
+        }
+      },
+      "required": [
+        "instanceId",
+        "reconciliationRequired",
+        "shutdown",
+        "state"
+      ],
+      "type": "object"
+    },
     "DynamicToolCallParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -4484,6 +4508,26 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Notification sent from the server to the client.",
       "oneOf": [
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "control/status/changed"
+              ],
+              "title": "Control/status/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ControlStatus"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Control/status/changedNotification",
+          "type": "object"
+        },
         {
           "description": "NEW NOTIFICATIONS",
           "properties": {
@@ -10464,6 +10508,98 @@
           "turnId"
         ],
         "title": "ContextCompactedNotification",
+        "type": "object"
+      },
+      "ControlPendingEntry": {
+        "properties": {
+          "callId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": "string"
+          },
+          "requestId": {
+            "$ref": "#/definitions/v2/RequestId"
+          },
+          "threadId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turnId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "method",
+          "requestId"
+        ],
+        "type": "object"
+      },
+      "ControlShutdownState": {
+        "oneOf": [
+          {
+            "enum": [
+              "notStarted",
+              "draining"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Session loops and accepted request/startup tasks stopped; process exit is unconfirmed.",
+            "enum": [
+              "sessionsStopped"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Session/request cleanup failed or timed out; launcher teardown remains required.",
+            "enum": [
+              "incomplete"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "ControlState": {
+        "enum": [
+          "awaitingController",
+          "controlled",
+          "fenced"
+        ],
+        "type": "string"
+      },
+      "ControlStatusChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "reconciliationRequired": {
+            "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+            "type": "boolean"
+          },
+          "shutdown": {
+            "$ref": "#/definitions/v2/ControlShutdownState"
+          },
+          "state": {
+            "$ref": "#/definitions/v2/ControlState"
+          }
+        },
+        "required": [
+          "instanceId",
+          "reconciliationRequired",
+          "shutdown",
+          "state"
+        ],
+        "title": "ControlStatus",
         "type": "object"
       },
       "ConversationTextRole": {

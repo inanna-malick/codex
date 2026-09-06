@@ -366,7 +366,7 @@ pub(super) async fn ensure_listener_task_running(
                         let _ = completion_tx.send(());
                     }
                 }
-                unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
+                unloading_watchers_open = unloading_state.wait_for_unloading_trigger(), if !outgoing_for_task.control.enabled() => {
                     if !unloading_watchers_open {
                         break;
                     }
@@ -487,6 +487,46 @@ pub(super) async fn handle_thread_listener_command(
     listener_command: ThreadListenerCommand,
 ) {
     match listener_command {
+        ThreadListenerCommand::Observe { request_id, thread } => {
+            // This command shares the listener's event order, but never runs resume hooks.
+            if pending_thread_unloads
+                .lock()
+                .await
+                .contains(&conversation_id)
+            {
+                outgoing
+                    .send_error(
+                        request_id,
+                        crate::control::control_error("observer target is unloading"),
+                    )
+                    .await;
+                return;
+            }
+            let active_turn = thread_state.lock().await.active_turn_snapshot();
+            let connection_id = request_id.connection_id;
+            if !thread_state_manager
+                .try_add_connection_to_thread(conversation_id, connection_id)
+                .await
+            {
+                return;
+            }
+            if !outgoing
+                .control
+                .observe(connection_id, conversation_id.to_string())
+            {
+                return;
+            }
+            outgoing
+                .send_response(
+                    request_id,
+                    codex_app_server_protocol::ThreadObserveResponse {
+                        thread: *thread,
+                        active_turn,
+                    },
+                )
+                .await;
+        }
+
         ThreadListenerCommand::SendThreadResumeResponse(resume_request) => {
             handle_pending_thread_resume_request(
                 conversation_id,

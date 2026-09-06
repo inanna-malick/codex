@@ -1116,6 +1116,63 @@
       ],
       "type": "object"
     },
+    "ControlShutdownState": {
+      "oneOf": [
+        {
+          "enum": [
+            "notStarted",
+            "draining"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Session loops and accepted request/startup tasks stopped; process exit is unconfirmed.",
+          "enum": [
+            "sessionsStopped"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Session/request cleanup failed or timed out; launcher teardown remains required.",
+          "enum": [
+            "incomplete"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ControlState": {
+      "enum": [
+        "awaitingController",
+        "controlled",
+        "fenced"
+      ],
+      "type": "string"
+    },
+    "ControlStatus": {
+      "properties": {
+        "instanceId": {
+          "type": "string"
+        },
+        "reconciliationRequired": {
+          "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+          "type": "boolean"
+        },
+        "shutdown": {
+          "$ref": "#/definitions/ControlShutdownState"
+        },
+        "state": {
+          "$ref": "#/definitions/ControlState"
+        }
+      },
+      "required": [
+        "instanceId",
+        "reconciliationRequired",
+        "shutdown",
+        "state"
+      ],
+      "type": "object"
+    },
     "CreditsSnapshot": {
       "properties": {
         "balance": {
@@ -6741,6 +6798,26 @@
   },
   "description": "Notification sent from the server to the client.",
   "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "control/status/changed"
+          ],
+          "title": "Control/status/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ControlStatus"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Control/status/changedNotification",
+      "type": "object"
+    },
     {
       "description": "NEW NOTIFICATIONS",
       "properties": {
