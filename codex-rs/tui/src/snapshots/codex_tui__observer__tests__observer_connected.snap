@@ -1,0 +1,12 @@
+---
+source: tui/src/observer_tests.rs
+expression: terminal.backend().to_string()
+---
+Observer — read only
+• Work completed.
+
+
+
+
+
+Connected  ↑↓ scroll · PageUp history · End live · q exit

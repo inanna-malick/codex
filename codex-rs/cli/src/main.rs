@@ -212,6 +212,9 @@ enum Subcommand {
     /// Queue a message for an existing session.
     Queue(QueueCommand),
 
+    /// Observe a loaded execution on an explicit controlled service.
+    Observe(ObserveCommand),
+
     /// Archive a saved session by id or session name.
     Archive(SessionArchiveCommand),
 
@@ -244,6 +247,13 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+}
+
+#[derive(Debug, Parser)]
+struct ObserveCommand {
+    thread_id: String,
+    #[arg(long)]
+    remote: String,
 }
 
 #[derive(Debug, Parser)]
@@ -585,6 +595,10 @@ struct LogoutCommand {
 
 #[derive(Debug, Parser)]
 struct AppServerCommand {
+    /// Enable exclusive controller custody using a launcher-provided credential file.
+    #[arg(long, value_name = "PATH")]
+    controller_token_file: Option<std::path::PathBuf>,
+
     /// Omit to run the app server; specify a subcommand for tooling.
     #[command(subcommand)]
     subcommand: Option<AppServerSubcommand>,
@@ -1362,6 +1376,7 @@ async fn cli_main(
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
+                controller_token_file,
                 subcommand,
                 code_mode_host,
                 strict_config: app_server_strict_config,
@@ -1387,6 +1402,7 @@ async fn cli_main(
                     };
                     let auth = auth.try_into_settings()?;
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
+                        controller_token_file,
                         code_mode_host_transport: code_mode_host.into(),
                         remote_control_startup_mode: match (remote_control, remote_control_disabled)
                         {
@@ -1555,6 +1571,32 @@ async fn cli_main(
             )
             .await?;
             println!("{output}");
+        }
+        Some(Subcommand::Observe(cmd)) => {
+            if interactive.prompt.is_some()
+                || !root_config_overrides.raw_overrides.is_empty()
+                || interactive.model.is_some()
+                || interactive.cwd.is_some()
+                || interactive.sandbox_mode.is_some()
+                || interactive.approval_policy.is_some()
+                || interactive.dangerously_bypass_approvals_and_sandbox
+                || interactive.bypass_hook_trust
+                || interactive.oss
+                || interactive.oss_provider.is_some()
+                || interactive.web_search
+                || !interactive.images.is_empty()
+                || !interactive.add_dir.is_empty()
+                || interactive.host_dynamic_tools_socket.is_some()
+                || root_remote.is_some()
+                || root_remote_auth_token_env.is_some()
+            {
+                anyhow::bail!(
+                    "observe accepts only an execution ID and its explicit --remote endpoint"
+                );
+            }
+            codex_tui::run_observer(cmd.thread_id, cmd.remote)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
         }
         Some(Subcommand::Queue(cmd)) => {
             let output = queue_cmd::run_queue_command(
@@ -2611,6 +2653,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Observe(_)) => Some("observe"),
         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
