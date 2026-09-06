@@ -99,3 +99,20 @@ fn is_execution_limited(
 #[cfg(test)]
 #[path = "execution_tests.rs"]
 mod tests;
+
+impl AgentControl {
+    pub(crate) fn ensure_execution_active(&self) -> CodexResult<()> {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.ensure_execution_active()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execution_cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.manager
+            .upgrade()
+            .map_or_else(tokio_util::sync::CancellationToken::new, |manager| {
+                manager.execution_fence.child_token()
+            })
+    }
+}

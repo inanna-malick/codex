@@ -355,6 +355,11 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        session
+            .services
+            .agent_control
+            .ensure_execution_active()
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
         let ToolCall {
             tool_name,
             call_id,

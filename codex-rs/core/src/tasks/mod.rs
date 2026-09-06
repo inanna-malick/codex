@@ -75,6 +75,7 @@ pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
+    ControllerDisconnected,
     Disabled,
     ContextualUser,
     Developer,
@@ -102,6 +103,11 @@ pub(crate) fn interrupted_turn_history_marker(
     marker: InterruptedTurnHistoryMarker,
 ) -> Option<ResponseItem> {
     match marker {
+        InterruptedTurnHistoryMarker::ControllerDisconnected => Some(ContextualUserFragment::into(
+            crate::context::TurnAborted::new(
+                crate::context::TurnAborted::CONTROLLER_DISCONNECTED_GUIDANCE,
+            ),
+        )),
         InterruptedTurnHistoryMarker::Disabled => None,
         InterruptedTurnHistoryMarker::ContextualUser => Some(ContextualUserFragment::into(
             crate::context::TurnAborted::new(crate::context::TurnAborted::INTERRUPTED_GUIDANCE),
@@ -298,7 +304,7 @@ impl Session {
             .set_turn_started_at_unix_ms(turn_started_at_unix_ms);
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
 
-        let cancellation_token = CancellationToken::new();
+        let cancellation_token = self.services.agent_control.execution_cancellation_token();
         let done = Arc::new(Notify::new());
 
         self.services
@@ -806,7 +812,13 @@ impl Session {
             ThreadIdleCause::Completed
         };
         let event = if let Some(reason) = abort_reason {
-            if reason == TurnAbortReason::Interrupted {
+            if reason == TurnAbortReason::Interrupted
+                && self
+                    .services
+                    .agent_control
+                    .ensure_execution_active()
+                    .is_ok()
+            {
                 run_turn_interrupt_hooks(self, &turn_context, &turn_state).await;
             }
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
@@ -907,7 +919,13 @@ impl Session {
         turn_state: &Mutex<TurnState>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
+        if task.cancellation_token.is_cancelled()
+            && self
+                .services
+                .agent_control
+                .ensure_execution_active()
+                .is_ok()
+        {
             return;
         }
 
@@ -946,10 +964,19 @@ impl Session {
 
         if reason == TurnAbortReason::Interrupted
             && let Some(marker) = interrupted_turn_history_marker(
-                InterruptedTurnHistoryMarker::from_config_and_version(
-                    task.turn_context.config.as_ref(),
-                    task.turn_context.multi_agent_version,
-                ),
+                if self
+                    .services
+                    .agent_control
+                    .ensure_execution_active()
+                    .is_err()
+                {
+                    InterruptedTurnHistoryMarker::ControllerDisconnected
+                } else {
+                    InterruptedTurnHistoryMarker::from_config_and_version(
+                        task.turn_context.config.as_ref(),
+                        task.turn_context.multi_agent_version,
+                    )
+                },
             )
         {
             self.record_conversation_items(
@@ -964,7 +991,13 @@ impl Session {
             }
         }
 
-        if reason == TurnAbortReason::Interrupted {
+        if reason == TurnAbortReason::Interrupted
+            && self
+                .services
+                .agent_control
+                .ensure_execution_active()
+                .is_ok()
+        {
             run_turn_interrupt_hooks(self, &task.turn_context, turn_state).await;
         }
 

@@ -8,6 +8,7 @@ use crate::session::Session;
 
 impl Session {
     pub(crate) fn ensure_client_ready(&self) -> Result<()> {
+        self.services.agent_control.ensure_execution_active()?;
         if !self.client_ready.load(Ordering::Acquire) {
             return Err(CodexErr::InvalidRequest(
                 "thread awaits trusted client readiness; acknowledge with thread/ready before inference".to_string(),

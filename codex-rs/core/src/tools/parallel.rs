@@ -193,7 +193,12 @@ impl ToolCallRuntime {
                             Err(err) if err.is_cancelled() => {}
                             Err(err) => return Err(Self::tool_task_join_error(err)),
                         }
-                        let response = Self::aborted_response(&call, secs);
+                        let message = if abort_session.services.agent_control.ensure_execution_active().is_err() {
+                            "Controller disconnected before the tool result was recorded. External-effect outcome is uncertain, not failed or undone. Reconcile before continuing; do not replay automatically.".to_string()
+                        } else {
+                            Self::abort_message(&call, secs)
+                        };
+                        let response = Self::aborted_response(&call, message);
                         notify_tool_aborted(
                             abort_session.as_ref(),
                             abort_turn.as_ref(),
@@ -243,13 +248,11 @@ impl ToolCallRuntime {
         }
     }
 
-    fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
+    fn aborted_response(call: &ToolCall, message: String) -> AnyToolResult {
         AnyToolResult {
             call_id: call.call_id.clone(),
             payload: call.payload.clone(),
-            result: Box::new(AbortedToolOutput {
-                message: Self::abort_message(call, secs),
-            }),
+            result: Box::new(AbortedToolOutput { message }),
             post_tool_use_payload: None,
         }
     }

@@ -1,3 +1,6 @@
+mod execution;
+
+use execution::execute_hook;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,13 +209,16 @@ pub(crate) async fn run_pre_tool_use_hooks(
     let preview_runs = hooks.preview_pre_tool_use(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let PreToolUseOutcome {
+    let Some(PreToolUseOutcome {
         hook_events,
         should_block,
         block_reason,
         additional_contexts,
         updated_input,
-    } = hooks.run_pre_tool_use(request).await;
+    }) = execute_hook(sess, hooks.run_pre_tool_use(request)).await
+    else {
+        return PreToolUseHookResult::Blocked("execution owner disconnected".to_string());
+    };
     emit_hook_completed_events(sess, turn_context, hook_events).await;
     record_additional_contexts(sess, turn_context, additional_contexts).await;
 
@@ -270,7 +276,7 @@ pub(crate) async fn run_permission_request_hooks(
     let PermissionRequestOutcome {
         hook_events,
         decision,
-    } = hooks.run_permission_request(request).await;
+    } = execute_hook(sess, hooks.run_permission_request(request)).await?;
     emit_hook_completed_events(sess, turn_context, hook_events).await;
 
     decision
@@ -310,7 +316,14 @@ pub(crate) async fn run_post_tool_use_hooks(
     let preview_runs = hooks.preview_post_tool_use(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_post_tool_use(request).await;
+    let Some(outcome) = execute_hook(sess, hooks.run_post_tool_use(request)).await else {
+        return PostToolUseOutcome {
+            hook_events: Vec::new(),
+            should_block: false,
+            additional_contexts: Vec::new(),
+            feedback_message: None,
+        };
+    };
     emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
     outcome
 }
@@ -446,13 +459,23 @@ pub(crate) async fn run_turn_stop_hooks(
     let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
 
-    let mut outcome = hooks.run_stop(request).await;
+    let Some(mut outcome) = execute_hook(sess, hooks.run_stop(request)).await else {
+        return StopOutcome::default();
+    };
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
 }
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    if sess
+        .services
+        .agent_control
+        .ensure_execution_active()
+        .is_err()
+    {
+        return;
+    }
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_session_end();
     if preview_runs.is_empty() {
@@ -479,7 +502,9 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
     }
     emit_hook_started_events(sess, &turn_context, preview_runs).await;
 
-    let outcome = hooks.run_session_end(request).await;
+    let Some(outcome) = execute_hook(sess, hooks.run_session_end(request)).await else {
+        return;
+    };
     emit_hook_completed_events(sess, &turn_context, outcome.hook_events).await;
 }
 
@@ -521,7 +546,9 @@ pub(crate) async fn run_turn_interrupt_hooks(
     }
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_interrupt(request).await;
+    let Some(outcome) = execute_hook(sess, hooks.run_interrupt(request)).await else {
+        return;
+    };
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
 }
 
@@ -543,7 +570,9 @@ pub(crate) async fn run_pre_compact_hooks(
     let preview_runs = sess.hooks().preview_pre_compact(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = sess.hooks().run_pre_compact(request).await;
+    let Some(outcome) = execute_hook(sess, sess.hooks().run_pre_compact(request)).await else {
+        return PreCompactHookOutcome::Stopped;
+    };
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
         PreCompactHookOutcome::Stopped
@@ -580,7 +609,9 @@ pub(crate) async fn run_post_compact_hooks(
     let preview_runs = sess.hooks().preview_post_compact(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = sess.hooks().run_post_compact(request).await;
+    let Some(outcome) = execute_hook(sess, sess.hooks().run_post_compact(request)).await else {
+        return PostCompactHookOutcome::Stopped;
+    };
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
         PostCompactHookOutcome::Stopped
@@ -605,8 +636,9 @@ pub(crate) async fn run_legacy_after_agent_hook(
         })
         .collect();
     let hooks = sess.hooks();
-    for hook_outcome in hooks
-        .dispatch(codex_hooks::HookPayload {
+    for hook_outcome in execute_hook(
+        sess,
+        hooks.dispatch(codex_hooks::HookPayload {
             session_id: sess.session_id().into(),
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
@@ -620,8 +652,10 @@ pub(crate) async fn run_legacy_after_agent_hook(
                     last_assistant_message,
                 },
             },
-        })
-        .await
+        }),
+    )
+    .await
+    .unwrap_or_default()
     {
         let hook_name = hook_outcome.hook_name;
         let (error, should_abort) = match hook_outcome.result {
@@ -810,7 +844,14 @@ where
 {
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = outcome_future.await.into();
+    let Some(outcome) = execute_hook(sess, outcome_future).await else {
+        // Preserve accepted input without launching its hooks during shutdown.
+        return HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        };
+    };
+    let outcome = outcome.into();
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     outcome.outcome
 }
@@ -858,6 +899,14 @@ async fn emit_hook_started_events(
     turn_context: &Arc<TurnContext>,
     preview_runs: Vec<HookRunSummary>,
 ) {
+    if sess
+        .services
+        .agent_control
+        .ensure_execution_active()
+        .is_err()
+    {
+        return;
+    }
     for run in preview_runs
         .into_iter()
         .filter(should_emit_hook_notification)

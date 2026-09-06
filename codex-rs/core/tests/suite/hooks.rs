@@ -5663,3 +5663,23 @@ async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fenced_shutdown_does_not_execute_session_end_hooks() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_session_end_hook(home).expect("write session end hook fixture");
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build_with_auto_env(&server).await?;
+    test.thread_manager.fence_execution();
+    test.codex.shutdown_and_wait().await?;
+    assert!(
+        !test
+            .codex_home_path()
+            .join("session_end_hook_log.jsonl")
+            .exists()
+    );
+    Ok(())
+}

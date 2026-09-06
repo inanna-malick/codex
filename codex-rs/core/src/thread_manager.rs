@@ -1,3 +1,5 @@
+#[path = "execution_fence.rs"]
+mod execution_fence;
 use crate::CodexAppsToolsCache;
 use crate::agent::AgentControl;
 use crate::attestation::AttestationProvider;
@@ -407,6 +409,8 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
+    pub(crate) execution_fence: tokio_util::sync::CancellationToken,
+    pub(crate) require_client_readiness: AtomicBool,
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     start_transaction_gates:
         Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
@@ -545,6 +549,8 @@ impl ThreadManager {
             };
         Self {
             state: Arc::new(ThreadManagerState {
+                execution_fence: tokio_util::sync::CancellationToken::new(),
+                require_client_readiness: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 start_transaction_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 thread_created_tx,
@@ -694,6 +700,8 @@ impl ThreadManager {
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         Self {
             state: Arc::new(ThreadManagerState {
+                execution_fence: tokio_util::sync::CancellationToken::new(),
+                require_client_readiness: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 start_transaction_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 thread_created_tx,
@@ -1978,6 +1986,7 @@ impl ThreadManagerState {
     }
 
     async fn spawn_thread_inner(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        self.ensure_execution_active()?;
         let ThreadSpawnRequest {
             options,
             auth_manager,
@@ -1990,7 +1999,7 @@ impl ThreadManagerState {
             user_shell_override,
         } = request;
         let StartThreadOptions {
-            config,
+            mut config,
             allow_provider_model_fallback,
             initial_history,
             history_mode,
@@ -2005,6 +2014,11 @@ impl ThreadManagerState {
             persistence,
             reserved_thread_id,
         } = options;
+        if parent_thread_id.is_none() && self.require_client_readiness.load(Ordering::Acquire) {
+            config.extra_config = Some(codex_thread_store::ExtraConfig {
+                require_client_readiness: true,
+            });
+        }
         if persistence == ThreadStartPersistence::Immediate && config.ephemeral {
             return Err(CodexErr::InvalidRequest(
                 "immediate persistence cannot be used for an ephemeral thread".to_string(),
@@ -2349,6 +2363,9 @@ impl ThreadManagerState {
         io: SessionIo,
         session_source: SessionSource,
     ) -> Result<NewThread, Box<ThreadSpawnFailure>> {
+        if let Err(error) = self.ensure_execution_active() {
+            return Err(Box::new(ThreadSpawnFailure { error, session, io }));
+        }
         let thread_id = session.thread_id();
         let event = match io.next_event().await {
             Ok(event) => event,
@@ -2370,6 +2387,9 @@ impl ThreadManagerState {
 
         {
             let mut threads = self.threads.write().await;
+            if let Err(error) = self.ensure_execution_active() {
+                return Err(Box::new(ThreadSpawnFailure { error, session, io }));
+            }
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 let thread = Arc::new(CodexThread::new(
                     session,
