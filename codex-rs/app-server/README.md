@@ -3373,7 +3373,14 @@ Hosted protocol version 3 requests `experimentalRawEvents` on start, fork, and
 resume. After a durable, protocol-closed result batch, the client posts
 `{ "protocolVersion": 3, "threadId": "UUID", "contextCallId": "CALL_ID" }`
 to `/v1/dynamic-tools/completed`. Hosts must acknowledge idempotently. The client
-retries a failed callback three times and exits on failure. Hosts settle any
+makes up to three callback attempts with a 60-second timeout per attempt. If
+settlement fails, the TUI keeps the session alive and disables hosted tool access
+for the rest of that client session. Subsequent hosted calls return an explicit
+unavailable error; other Codex tools remain usable. Pending completion identities
+are retained, and reconnect does not automatically re-enable hosted tools.
+A timeout does not prove that the host operation or child startup failed.
+Session attachment also allows 60 seconds because it settles pending effects;
+registration retains its five-second timeout. Hosts settle any
 unacknowledged forks when the client reattaches; they must not guess that an
 unrecorded result completed. Registration and session binding otherwise retain
 the existing contract.

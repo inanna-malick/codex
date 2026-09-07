@@ -1750,10 +1750,11 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
     assert_eq!(
         call.body,
         serde_json::json!({
-            "protocolVersion": 2,
+            "protocolVersion": 3,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",
+            "contextCallId": null,
             "namespace": null,
             "tool": "evaluate",
             "arguments": source,
@@ -3696,3 +3697,131 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
 
 #[path = "new_session_tests.rs"]
 mod new_session_tests;
+
+#[cfg(unix)]
+enum HostSettlementCase {
+    Completed,
+    Interrupted,
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_host_completion_keeps_session_alive_and_disables_host_calls() -> Result<()> {
+    use crate::host_dynamic_tools::HostDynamicToolRouting;
+    use crate::host_dynamic_tools::HostDynamicTools;
+    use std::os::unix::fs::PermissionsExt;
+
+    for settlement in [
+        HostSettlementCase::Completed,
+        HostSettlementCase::Interrupted,
+    ] {
+        let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+        let directory = tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket = directory.path().join("host.sock");
+        let (_requests, host_task) = crate::host_dynamic_tools::spawn_host(&socket, 3)?;
+        let host = HostDynamicTools::connect(Some(
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&socket)?,
+        ))
+        .await?
+        .expect("configured host");
+        let thread = ThreadId::new();
+        host.attach_primary(thread).await?;
+        let params = codex_app_server_protocol::DynamicToolCallParams {
+            thread_id: thread.to_string(),
+            turn_id: "turn".into(),
+            call_id: "outer".into(),
+            context_call_id: Some("outer".into()),
+            namespace: None,
+            tool: "evaluate".into(),
+            arguments: serde_json::json!("unfold work"),
+        };
+        assert!(host.call(&params).await?.success);
+        // The operation returned successfully, but its host disappears before settlement.
+        host_task.join().expect("host thread panicked")?;
+        let (app_server, _requests, proxy) = start_recording_app_server(
+            &app.config,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+        )
+        .await?;
+        let app_server = app_server.with_host_dynamic_tools(Some(host.clone()));
+        let notifications = match settlement {
+            HostSettlementCase::Completed => [
+                serde_json::json!({
+                    "type": "function_call", "call_id": "outer", "name": "exec", "arguments": "{}",
+                }),
+                serde_json::json!({
+                    "type": "function_call_output", "call_id": "outer", "output": "done",
+                }),
+            ]
+            .into_iter()
+            .map(|item| {
+                ServerNotification::RawResponseItemCompleted(
+                    codex_app_server_protocol::RawResponseItemCompletedNotification {
+                        thread_id: thread.to_string(),
+                        turn_id: "turn".into(),
+                        item: serde_json::from_value(item).expect("response item"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+            HostSettlementCase::Interrupted => vec![ServerNotification::TurnCompleted(
+                codex_app_server_protocol::TurnCompletedNotification {
+                    thread_id: thread.to_string(),
+                    turn: serde_json::from_value(serde_json::json!({
+                        "id": "turn", "items": [], "status": "interrupted",
+                    }))?,
+                },
+            )],
+        };
+        for notification in notifications {
+            app.handle_app_server_event(
+                &app_server,
+                AppServerEvent::ServerNotification(Box::new(notification)),
+            )
+            .await;
+        }
+        assert_eq!(host.routing(&params), HostDynamicToolRouting::Disabled);
+        // Reconnect and turn settlement must not contact or silently re-enable the host.
+        host.settle_turn(&thread.to_string()).await?;
+        host.revalidate_registration().await?;
+        host.attach_primary(thread).await?;
+        let mut other_tool = params.clone();
+        other_tool.tool = "unrelated_tool".into();
+        assert_eq!(
+            host.routing(&other_tool),
+            HostDynamicToolRouting::Unregistered
+        );
+        let expected =
+            crate::dynamic_tools::failure_response(crate::host_dynamic_tools::DISABLED_MESSAGE);
+        assert_eq!(host.call(&params).await?, expected);
+        app.handle_app_server_event(
+            &app_server,
+            AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
+                request_id: AppServerRequestId::Integer(702),
+                params,
+            })),
+        )
+        .await;
+        let mut saw_unavailable_response = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AppEvent::FatalExitRequest(message) => panic!("session exited: {message}"),
+                AppEvent::DynamicToolCallCompleted {
+                    request_id,
+                    response,
+                } => {
+                    assert_eq!(request_id, AppServerRequestId::Integer(702));
+                    assert_eq!(response, expected);
+                    saw_unavailable_response = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_unavailable_response);
+        app_server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}

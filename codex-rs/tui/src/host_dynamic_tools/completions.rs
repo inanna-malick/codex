@@ -33,6 +33,9 @@ struct CompletionRequest<'a> {
 
 impl HostDynamicTools {
     pub(crate) async fn settle_turn(&self, thread_id: &str) -> color_eyre::Result<()> {
+        if self.is_disabled() {
+            return Ok(());
+        }
         let Some(primary) = self
             .primary_thread_id()
             .filter(|id| id.to_string() == thread_id)
@@ -64,9 +67,10 @@ impl HostDynamicTools {
         &self,
         notification: &RawResponseItemCompletedNotification,
     ) -> color_eyre::Result<()> {
-        if self
-            .primary_thread_id()
-            .is_none_or(|id| id.to_string() != notification.thread_id)
+        if self.is_disabled()
+            || self
+                .primary_thread_id()
+                .is_none_or(|id| id.to_string() != notification.thread_id)
         {
             return Ok(());
         }
@@ -100,7 +104,7 @@ impl HostDynamicTools {
                 let result = self
                     .client
                     .post("http://localhost/v1/dynamic-tools/completed")
-                    .timeout(super::CONTROL_REQUEST_TIMEOUT)
+                    .timeout(super::SETTLEMENT_REQUEST_TIMEOUT)
                     .json(&CompletionRequest {
                         protocol_version: super::PROTOCOL_VERSION,
                         thread_id: &notification.thread_id,
@@ -113,7 +117,7 @@ impl HostDynamicTools {
                     Ok(_) => break,
                     Err(error) if attempt == 2 => return Err(error.into()),
                     Err(error) => {
-                        tracing::warn!(%error, attempt, "retrying hosted tool completion acknowledgement");
+                        tracing::warn!(error = ?error, attempt, "retrying hosted tool completion acknowledgement");
                         tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
                     }
                 }

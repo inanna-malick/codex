@@ -120,10 +120,12 @@ impl App {
                 _ => Ok(()),
             };
             if let Err(error) = completion {
-                self.app_event_tx.send(AppEvent::FatalExitRequest(format!(
-                    "Cannot settle hosted tool completion: {error}. Deferred child startup was not confirmed."
-                )));
-                return;
+                host.disable();
+                tracing::warn!(error = ?error, "host dynamic tools disabled after settlement failure");
+                self.chat_widget.add_error_message(format!(
+                    "{} Completion error: {error:#}",
+                    crate::host_dynamic_tools::DISABLED_MESSAGE,
+                ));
             }
         }
         if let ServerNotification::ThreadStatusChanged(status) = &notification {
@@ -416,6 +418,15 @@ impl App {
                         self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
                             request_id: request_id.clone(),
                             response: crate::host_dynamic_tools::infrastructure_failure(),
+                        });
+                        return;
+                    }
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Disabled => {
+                        self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                            request_id: request_id.clone(),
+                            response: crate::dynamic_tools::failure_response(
+                                crate::host_dynamic_tools::DISABLED_MESSAGE,
+                            ),
                         });
                         return;
                     }

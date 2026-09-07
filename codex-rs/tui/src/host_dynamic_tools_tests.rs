@@ -83,12 +83,26 @@ pub(crate) fn spawn_host(
     mpsc::Receiver<RecordedRequest>,
     std::thread::JoinHandle<std::io::Result<()>>,
 )> {
+    spawn_host_with_completion_delay(socket_path, request_count, Duration::ZERO)
+}
+
+fn spawn_host_with_completion_delay(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    completion_delay: Duration,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
     let listener = UnixListener::bind(socket_path)?;
     let (request_tx, request_rx) = mpsc::channel();
     let task = std::thread::spawn(move || {
         for _ in 0..request_count {
             let (stream, _) = listener.accept()?;
             let request = read_request(&stream)?;
+            if request.path == "/v1/dynamic-tools/completed" {
+                std::thread::sleep(completion_delay);
+            }
             let response = match request.path.as_str() {
                 REGISTRATION_PATH => Some((
                     "200 OK",
@@ -309,6 +323,42 @@ async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
             body: json!({"protocolVersion":3,"threadId":thread}),
         }
     );
+    host.settle_turn(&thread.to_string()).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_accepts_acknowledgement_after_five_seconds() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (_requests, task) = spawn_host_with_completion_delay(
+        &socket,
+        /*request_count*/ 3,
+        Duration::from_secs(6),
+    )?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    host.completions.lock().unwrap().register("outer".into())?;
+    for item in [
+        json!({"type":"function_call", "call_id":"outer", "name":"exec", "arguments":"{}"}),
+        json!({"type":"function_call_output", "call_id":"outer", "output":"done"}),
+    ] {
+        host.observe_completion(
+            &codex_app_server_protocol::RawResponseItemCompletedNotification {
+                thread_id: thread.to_string(),
+                turn_id: "turn".into(),
+                item: serde_json::from_value(item)?,
+            },
+        )
+        .await?;
+    }
+    assert!(!host.is_disabled());
+    // No pending acknowledgement remains to trigger another host request.
     host.settle_turn(&thread.to_string()).await?;
     task.join().expect("host thread panicked")?;
     Ok(())

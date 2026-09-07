@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -22,6 +24,9 @@ const SESSION_PATH: &str = "/v1/dynamic-tools/session";
 const CALL_PATH: &str = "/v1/dynamic-tools/call";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+// Settlement can wait for the host actor and its shared machine checkout.
+const SETTLEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DISABLED_MESSAGE: &str = "Host dynamic tools are disabled for this session because completion could not be confirmed. Previous host operations may have taken effect; do not repeat them without checking. Other Codex tools remain available.";
 const MAX_REGISTRATION_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CALL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -60,6 +65,7 @@ pub(crate) struct HostDynamicTools {
     identities: HashMap<(Option<String>, String), DynamicToolKind>,
     primary_thread_id: Mutex<Option<ThreadId>>,
     completions: Mutex<completions::HostToolCompletions>,
+    disabled: AtomicBool,
     #[cfg(unix)]
     client: reqwest::Client,
 }
@@ -69,6 +75,7 @@ pub(crate) enum HostDynamicToolRouting {
     Unregistered,
     Forward,
     Reject,
+    Disabled,
 }
 
 #[derive(Serialize)]
@@ -87,6 +94,14 @@ struct CallRequest<'a> {
 }
 
 impl HostDynamicTools {
+    pub(crate) fn disable(&self) {
+        self.disabled.store(true, Ordering::Release);
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+
     pub(crate) fn configure_fork(&self, params: &mut codex_app_server_protocol::ThreadForkParams) {
         params.experimental_raw_events = true;
         params.expected_dynamic_tools = Some(self.registration.dynamic_tools.clone());
@@ -130,6 +145,7 @@ impl HostDynamicTools {
                 identities,
                 primary_thread_id: Mutex::new(None),
                 completions: Mutex::new(completions::HostToolCompletions::default()),
+                disabled: AtomicBool::new(false),
                 client,
             })))
         }
@@ -154,6 +170,9 @@ impl HostDynamicTools {
         let Some(kind) = self.identities.get(&key).copied() else {
             return HostDynamicToolRouting::Unregistered;
         };
+        if self.is_disabled() {
+            return HostDynamicToolRouting::Disabled;
+        }
         let authorized = ThreadId::from_string(&params.thread_id)
             .ok()
             .is_some_and(|thread_id| self.primary_thread_id() == Some(thread_id));
@@ -170,12 +189,12 @@ impl HostDynamicTools {
     }
 
     pub(crate) async fn attach_primary(&self, thread_id: ThreadId) -> color_eyre::Result<()> {
-        if !self.should_attach(thread_id) {
+        if self.is_disabled() || !self.should_attach(thread_id) {
             return Ok(());
         }
         #[cfg(unix)]
         tokio::time::timeout(
-            CONTROL_REQUEST_TIMEOUT,
+            SETTLEMENT_REQUEST_TIMEOUT,
             send_session(&self.client, thread_id),
         )
         .await
@@ -190,6 +209,9 @@ impl HostDynamicTools {
     }
 
     pub(crate) async fn revalidate_registration(&self) -> color_eyre::Result<()> {
+        if self.is_disabled() {
+            return Ok(());
+        }
         #[cfg(unix)]
         let registration =
             tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, fetch_registration(&self.client))
@@ -208,6 +230,9 @@ impl HostDynamicTools {
         &self,
         params: &DynamicToolCallParams,
     ) -> color_eyre::Result<DynamicToolCallResponse> {
+        if self.is_disabled() {
+            return Ok(crate::dynamic_tools::failure_response(DISABLED_MESSAGE));
+        }
         if let Some(call_id) = &params.context_call_id {
             self.completions
                 .lock()
