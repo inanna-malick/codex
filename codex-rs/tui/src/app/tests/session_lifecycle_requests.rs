@@ -3776,12 +3776,27 @@ async fn failed_host_completion_keeps_session_alive_and_disables_host_calls() ->
             )],
         };
         for notification in notifications {
-            app.handle_app_server_event(
-                &app_server,
-                AppServerEvent::ServerNotification(Box::new(notification)),
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                app.handle_app_server_event(
+                    &app_server,
+                    AppServerEvent::ServerNotification(Box::new(notification)),
+                ),
             )
-            .await;
+            .await
+            .expect("host settlement must not block TUI event processing");
         }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("app event channel") {
+                    AppEvent::InsertHistoryCell(_) => break,
+                    AppEvent::FatalExitRequest(message) => panic!("session exited: {message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("settlement failure must be reported");
         assert_eq!(host.routing(&params), HostDynamicToolRouting::Disabled);
         // Reconnect and turn settlement must not contact or silently re-enable the host.
         host.settle_turn(&thread.to_string()).await?;

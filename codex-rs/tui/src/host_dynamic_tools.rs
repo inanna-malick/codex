@@ -65,6 +65,7 @@ pub(crate) struct HostDynamicTools {
     identities: HashMap<(Option<String>, String), DynamicToolKind>,
     primary_thread_id: Mutex<Option<ThreadId>>,
     completions: Mutex<completions::HostToolCompletions>,
+    settlement_sender: Mutex<Option<tokio::sync::mpsc::Sender<completions::SettlementWork>>>,
     disabled: AtomicBool,
     #[cfg(unix)]
     client: reqwest::Client,
@@ -94,10 +95,6 @@ struct CallRequest<'a> {
 }
 
 impl HostDynamicTools {
-    pub(crate) fn disable(&self) {
-        self.disabled.store(true, Ordering::Release);
-    }
-
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Acquire)
     }
@@ -145,6 +142,7 @@ impl HostDynamicTools {
                 identities,
                 primary_thread_id: Mutex::new(None),
                 completions: Mutex::new(completions::HostToolCompletions::default()),
+                settlement_sender: Mutex::new(None),
                 disabled: AtomicBool::new(false),
                 client,
             })))
