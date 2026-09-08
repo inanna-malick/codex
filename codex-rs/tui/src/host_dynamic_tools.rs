@@ -1,6 +1,8 @@
 mod completions;
 #[cfg(unix)]
 mod input_control;
+#[cfg(target_os = "linux")]
+mod workspace_control;
 
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;

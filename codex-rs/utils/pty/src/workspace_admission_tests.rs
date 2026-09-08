@@ -128,6 +128,46 @@ async fn writer_admission_tracks_detached_descendants() {
     let missing = tokio::process::Command::new(root.join("missing-executable"));
     assert!(owner.spawn_command(missing).await.is_err());
     assert!(matches!(owner.try_snapshot(), SnapshotAdmission::Ready(_)));
+    let first = std::num::NonZeroU64::new(1).expect("positive sequence");
+    let second = std::num::NonZeroU64::new(2).expect("positive sequence");
+    assert!(matches!(
+        owner.begin_publication(first),
+        PublicationAdmission::Ready
+    ));
+    assert!(matches!(
+        owner.begin_publication(first),
+        PublicationAdmission::Ready
+    ));
+    assert!(matches!(owner.try_snapshot(), SnapshotAdmission::Busy));
+    assert!(matches!(
+        owner.begin_publication(second),
+        PublicationAdmission::Conflict
+    ));
+    assert!(matches!(
+        owner.finish_publication(second),
+        PublicationAdmission::Conflict
+    ));
+    assert!(matches!(
+        owner.finish_publication(first),
+        PublicationAdmission::Settled
+    ));
+    assert!(matches!(
+        owner.begin_publication(first),
+        PublicationAdmission::Settled
+    ));
+    assert!(matches!(
+        owner.begin_publication(second),
+        PublicationAdmission::Ready
+    ));
+    assert!(matches!(
+        owner.finish_publication(first),
+        PublicationAdmission::Settled
+    ));
+    assert!(matches!(owner.try_snapshot(), SnapshotAdmission::Busy));
+    assert!(matches!(
+        owner.finish_publication(second),
+        PublicationAdmission::Settled
+    ));
     std::fs::remove_dir_all(root).expect("test cleanup");
     let group = owner.cgroup_path().to_owned();
     drop(owner);

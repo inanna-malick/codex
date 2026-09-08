@@ -43,9 +43,9 @@ impl Drop for InputControl {
 }
 
 #[derive(Clone)]
-struct InputTarget {
-    thread: ThreadId,
-    handle: watch::Receiver<AppServerRequestHandle>,
+pub(super) struct InputTarget {
+    pub(super) thread: ThreadId,
+    pub(super) handle: watch::Receiver<AppServerRequestHandle>,
 }
 
 #[derive(Deserialize)]
@@ -122,8 +122,13 @@ impl InputControl {
         // Bind only a fresh, host-selected path. Never unlink a competing owner.
         let listener = UnixListener::bind(socket.as_path())?;
         let (handle, receiver) = watch::channel(handle);
-        let router = Router::new()
-            .route("/v1/input", post(present))
+        let router = Router::new().route("/v1/input", post(present));
+        #[cfg(target_os = "linux")]
+        let router = router.route(
+            "/v1/workspace/publication",
+            post(super::workspace_control::publication),
+        );
+        let router = router
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(InputTarget {
                 thread,

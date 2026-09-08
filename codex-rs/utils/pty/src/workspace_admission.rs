@@ -20,6 +20,10 @@ use tokio::sync::RwLock;
 
 const ENABLE_ENV: &str = "CODEX_WORKSPACE_SNAPSHOTS";
 
+#[path = "workspace_publication.rs"]
+mod publication;
+pub use publication::PublicationAdmission;
+
 pub enum Availability {
     Disabled,
     Ready(Arc<WorkspaceAdmission>),
@@ -44,6 +48,8 @@ pub fn availability() -> &'static Availability {
 pub struct WorkspaceAdmission {
     gate: Arc<RwLock<()>>,
     scope: Arc<WriterScope>,
+    publication: std::sync::Mutex<publication::Publication>,
+    cwd: PathBuf,
 }
 
 /// Held across an actual filesystem mutation, not an outer hosted tool call.
@@ -109,6 +115,8 @@ impl WorkspaceAdmission {
         Ok(Self {
             gate: Arc::new(RwLock::new(())),
             scope: Arc::new(scope),
+            publication: std::sync::Mutex::new(publication::Publication::default()),
+            cwd: std::env::current_dir()?,
         })
     }
 
