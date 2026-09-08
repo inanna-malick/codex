@@ -141,6 +141,12 @@ pub async fn spawn_process(
     #[cfg(not(unix))]
     let _ = inherited_fds;
 
+    #[cfg(target_os = "linux")]
+    if crate::workspace_admission::current_scope().is_some() {
+        return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
+            .await;
+    }
+
     #[cfg(unix)]
     if !inherited_fds.is_empty() {
         return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
@@ -299,6 +305,8 @@ async fn spawn_process_preserving_fds(
 ) -> Result<SpawnedProcess> {
     let (master, slave) = open_unix_pty(size)?;
     let io = crate::unix_io::PtyIo::new(master.as_raw_fd())?;
+    #[cfg(target_os = "linux")]
+    let writer_scope = crate::workspace_admission::current_scope();
     let mut command = StdCommand::new(program);
     if let Some(arg0) = arg0 {
         command.arg0(arg0);
@@ -352,6 +360,10 @@ async fn spawn_process_preserving_fds(
                     return Err(std::io::Error::last_os_error());
                 }
 
+                #[cfg(target_os = "linux")]
+                if let Some(scope) = &writer_scope {
+                    scope.enter_child()?;
+                }
                 close_inherited_fds_except(&inherited_fds);
                 Ok(())
             });

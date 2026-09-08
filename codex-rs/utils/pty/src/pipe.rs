@@ -147,6 +147,8 @@ async fn spawn_process_with_stdin_mode(
     #[cfg(not(unix))]
     let _ = inherited_fds;
 
+    #[cfg(target_os = "linux")]
+    let writer_scope = crate::workspace_admission::current_scope();
     let mut command = Command::new(program);
     #[cfg(unix)]
     if let Some(arg0) = arg0 {
@@ -162,6 +164,10 @@ async fn spawn_process_with_stdin_mode(
             crate::process_group::detach_from_tty()?;
             #[cfg(target_os = "linux")]
             crate::process_group::set_parent_death_signal(parent_pid)?;
+            #[cfg(target_os = "linux")]
+            if let Some(scope) = &writer_scope {
+                scope.enter_child()?;
+            }
             crate::pty::close_inherited_fds_except(&inherited_fds);
             Ok(())
         });

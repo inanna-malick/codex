@@ -10,6 +10,8 @@ mod unix_io;
 mod win;
 #[cfg(windows)]
 mod windows_input;
+#[cfg(target_os = "linux")]
+pub mod workspace_admission;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 

@@ -43,6 +43,13 @@ pub struct SpawnRequest<'a> {
 
 /// Spawn a process using the backend selected by the prepared sandbox request.
 pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> {
+    #[cfg(target_os = "linux")]
+    return codex_utils_pty::workspace_admission::track_process(spawn_process_inner(request)).await;
+    #[cfg(not(target_os = "linux"))]
+    spawn_process_inner(request).await
+}
+
+async fn spawn_process_inner(request: SpawnRequest<'_>) -> Result<SpawnedProcess> {
     let tty = request.tty;
     let finish_spawn = |spawned| {
         if tty {
