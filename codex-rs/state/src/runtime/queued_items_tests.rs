@@ -26,6 +26,10 @@ fn host_operation(thread_id: ThreadId, producer_id: &str, sequence: u64) -> Host
         thread_id,
         producer_id: producer_id.to_string(),
         sequence,
+        purpose: "assignment".to_string(),
+        mode: "queueOnly".to_string(),
+        target_json: "{\"actor\":\"actor-1\",\"conversation\":\"thread\",\"correlation\":null}"
+            .to_string(),
         content_digest: "digest-v1".to_string(),
         payload: r#"{"host":true}"#.to_string(),
     }
@@ -49,6 +53,12 @@ async fn host_input_admission_is_idempotent_and_rejects_changed_content() {
     assert_eq!(
         HostInputAdmission::Conflict,
         queue.admit_host_input(&changed).await.unwrap()
+    );
+    let mut changed_purpose = operation.clone();
+    changed_purpose.purpose = "notification".to_string();
+    assert_eq!(
+        HostInputAdmission::Conflict,
+        queue.admit_host_input(&changed_purpose).await.unwrap()
     );
     assert_eq!(
         Some(HostInputRecord {

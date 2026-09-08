@@ -143,6 +143,7 @@ pub(super) enum BindingError {
 pub(super) struct ValidatedEnvelope {
     pub producer_id: String,
     pub sequence: u64,
+    pub purpose: Purpose,
     pub mode: Mode,
     pub target: Target,
     pub payload: Vec<u8>,
@@ -172,6 +173,7 @@ impl Envelope {
         Ok(ValidatedEnvelope {
             producer_id: self.producer_id,
             sequence: self.sequence,
+            purpose: self.purpose,
             mode: self.mode,
             target: self.target,
             payload: self.payload,

@@ -264,13 +264,17 @@ impl SqliteQueueStore {
         .await?;
         sqlx::query(
             "INSERT INTO host_input_operations (
-                thread_id, producer_id, sequence, content_digest, payload_json,
+                thread_id, producer_id, sequence, purpose, input_mode, target_json,
+                content_digest, payload_json,
                 state, queue_item_id, created_at_ms, updated_at_ms
-             ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
         )
         .bind(operation.thread_id.to_string())
         .bind(&operation.producer_id)
         .bind(i64::try_from(operation.sequence)?)
+        .bind(&operation.purpose)
+        .bind(&operation.mode)
+        .bind(&operation.target_json)
         .bind(&operation.content_digest)
         .bind(&operation.payload)
         .bind(item_id)
@@ -456,7 +460,8 @@ where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
     let row = sqlx::query(
-        "SELECT thread_id, producer_id, sequence, content_digest, payload_json, state
+        "SELECT thread_id, producer_id, sequence, purpose, input_mode, target_json,
+                content_digest, payload_json, state
          FROM host_input_operations WHERE producer_id = ? AND sequence = ?",
     )
     .bind(producer_id)
@@ -469,6 +474,9 @@ where
                 thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
                 producer_id: row.try_get("producer_id")?,
                 sequence: u64::try_from(row.try_get::<i64, _>("sequence")?)?,
+                purpose: row.try_get("purpose")?,
+                mode: row.try_get("input_mode")?,
+                target_json: row.try_get("target_json")?,
                 content_digest: row.try_get("content_digest")?,
                 payload: row.try_get("payload_json")?,
             },

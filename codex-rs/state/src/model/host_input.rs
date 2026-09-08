@@ -7,6 +7,9 @@ pub struct HostInputOperation {
     pub thread_id: ThreadId,
     pub producer_id: String,
     pub sequence: u64,
+    pub purpose: String,
+    pub mode: String,
+    pub target_json: String,
     pub content_digest: String,
     pub payload: String,
 }
