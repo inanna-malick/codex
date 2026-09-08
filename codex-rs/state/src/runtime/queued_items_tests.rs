@@ -195,6 +195,40 @@ async fn dispatch_claim_survives_queue_consumption_and_restart() {
 }
 
 #[tokio::test]
+async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 4);
+    let queue = runtime.thread_queue();
+    queue.admit_host_input(&operation).await.unwrap();
+    let queued = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+        .await
+        .unwrap();
+    queue
+        .claim_host_queue_item(thread_id, &queued[0].id)
+        .await
+        .unwrap();
+
+    for _retry_after_lost_response in 0..2 {
+        let record = queue
+            .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+            .expect("acknowledged operation");
+        assert_eq!(HostInputState::Presented, record.state);
+    }
+    assert_eq!(
+        HostInputState::Presented,
+        queue
+            .observe_host_input(&operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    );
+}
+
+#[tokio::test]
 async fn competing_runtimes_preserve_fifo_queue_order() {
     let (runtime, thread_id) = runtime_with_thread().await;
     let other = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string())

@@ -349,6 +349,31 @@ impl SqliteQueueStore {
         Ok(())
     }
 
+    /// Record host-observed presentation through a producer sequence. This is
+    /// monotonic and idempotent so the acknowledgement can be retried safely.
+    pub async fn acknowledge_host_input(
+        &self,
+        thread_id: ThreadId,
+        producer_id: &str,
+        through_sequence: u64,
+    ) -> anyhow::Result<Option<HostInputRecord>> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE host_input_operations SET state = 'presented', updated_at_ms = ?
+             WHERE thread_id = ? AND producer_id = ? AND sequence <= ?
+               AND state IN ('dispatching', 'unknown', 'presented')",
+        )
+        .bind(datetime_to_epoch_millis(Utc::now()))
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(i64::try_from(through_sequence)?)
+        .execute(transaction.as_mut())
+        .await?;
+        let record = read_host_input(transaction.as_mut(), producer_id, through_sequence).await?;
+        transaction.commit().await?;
+        Ok(record)
+    }
+
     /// Fence a ready operation against dispatch. Dispatching remains unknown;
     /// absence from `queued_items` is not negative evidence.
     pub async fn withdraw_host_input(

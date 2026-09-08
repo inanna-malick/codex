@@ -77,6 +77,13 @@ pub trait QueueStore: Send + Sync {
         sequence: u64,
     ) -> ThreadStoreFuture<'a, ()>;
 
+    fn acknowledge_host_input<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        producer_id: &'a str,
+        through_sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>>;
+
     fn withdraw_host_input<'a>(
         &'a self,
         producer_id: &'a str,
@@ -224,6 +231,18 @@ impl QueueStore for LocalQueueStore {
         sequence: u64,
     ) -> ThreadStoreFuture<'a, ()> {
         queue_future(self.queue().mark_host_input_unknown(producer_id, sequence))
+    }
+
+    fn acknowledge_host_input<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        producer_id: &'a str,
+        through_sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>> {
+        queue_future(
+            self.queue()
+                .acknowledge_host_input(thread_id, producer_id, through_sequence),
+        )
     }
 
     fn withdraw_host_input<'a>(

@@ -29,11 +29,32 @@ pub(super) enum Purpose {
     OperatorInput,
 }
 
+impl Purpose {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Assignment => "assignment",
+            Self::RequestUpdate => "requestUpdate",
+            Self::Notification => "notification",
+            Self::OperatorInput => "operatorInput",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum Mode {
     QueueOnly,
     StartOrSteer,
+}
+
+impl Mode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueOnly => "queueOnly",
+            Self::StartOrSteer => "startOrSteer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

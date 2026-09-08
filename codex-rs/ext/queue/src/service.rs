@@ -10,6 +10,7 @@ use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
 use codex_core::TurnStartOptions;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
@@ -326,6 +327,19 @@ impl QueuedItemService {
         Ok(outcome)
     }
 
+    pub async fn acknowledge_host_input(
+        &self,
+        thread_id: ThreadId,
+        producer_id: &str,
+        through_sequence: u64,
+    ) -> Result<Option<HostInputRecord>, QueueServiceError> {
+        let _dispatch_guard = self.dispatch_guard(thread_id).await;
+        Ok(self
+            .queue
+            .acknowledge_host_input(thread_id, producer_id, through_sequence)
+            .await?)
+    }
+
     pub async fn seal_host_input_producer(
         &self,
         thread_id: ThreadId,
@@ -512,18 +526,31 @@ impl QueuedItemService {
                 continue;
             }
 
-            match thread
-                .start_turn_if_idle(TurnInputRequest::new(input).on_start(TurnStartOptions {
-                    turn_trigger: Some("queue".to_string()),
-                    ..Default::default()
-                }))
-                .await
-            {
-                Ok(StartIfIdleSubmission::Started { .. }) => {
+            let request = TurnInputRequest::new(input).on_start(TurnStartOptions {
+                turn_trigger: Some("queue".to_string()),
+                ..Default::default()
+            });
+            let start_or_steer = host_claim
+                .as_ref()
+                .is_some_and(|claim| claim.operation.mode == "startOrSteer");
+            let submission = if start_or_steer {
+                thread.start_or_steer_turn(request).await
+            } else {
+                thread.start_turn_if_idle(request).await.map(|submission| match submission {
+                    StartIfIdleSubmission::Started { turn_id } => {
+                        TurnInputSubmission::Started { turn_id }
+                    }
+                    StartIfIdleSubmission::NotSubmitted { reason } => {
+                        TurnInputSubmission::NotSubmitted { reason }
+                    }
+                })
+            };
+            match submission {
+                Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }) => {
                     self.delete_locked(thread_id, queued_item_id).await?;
                     return Ok(());
                 }
-                Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+                Ok(TurnInputSubmission::NotSubmitted { reason }) => {
                     if let Some(claim) = &host_claim {
                         self.queue
                             .mark_host_input_unknown(

@@ -91,8 +91,13 @@ use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
 use codex_protocol::protocol::SessionSource;
+use codex_queue_extension::QueuedItemService;
 pub use codex_rollout::StateDbHandle;
 pub use codex_state::log_db::LogDbLayer;
+use codex_thread_store::HostInputAdmission;
+use codex_thread_store::HostInputOperation;
+use codex_thread_store::HostInputState;
+use codex_thread_store::HostInputWithdrawal;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -272,10 +277,146 @@ impl InProcessClientSender {
 /// This is the low-level runtime handle. Higher-level callers should usually go
 /// through `codex-app-server-client`, which adds worker-task buffering,
 /// request/response helpers, and surface-specific startup policy.
+#[derive(Clone)]
+pub struct InProcessHostInputControl {
+    service: Arc<QueuedItemService>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProcessHostInputOutcome {
+    Admitted,
+    Dispatching,
+    Presented,
+    Withdrawn,
+    Rejected,
+    Unknown,
+    Conflict,
+    ProducerSealed,
+    AtCapacity,
+    EvidenceUnavailable,
+}
+
+pub struct InProcessHostInputSubmission {
+    pub thread_id: codex_protocol::ThreadId,
+    pub producer_id: String,
+    pub sequence: u64,
+    pub purpose: String,
+    pub mode: String,
+    pub target_json: String,
+    pub content_digest: String,
+    pub payload: String,
+}
+
+fn host_input_state(state: HostInputState) -> InProcessHostInputOutcome {
+    match state {
+        HostInputState::Ready => InProcessHostInputOutcome::Admitted,
+        HostInputState::Dispatching => InProcessHostInputOutcome::Dispatching,
+        HostInputState::Presented => InProcessHostInputOutcome::Presented,
+        HostInputState::Withdrawn => InProcessHostInputOutcome::Withdrawn,
+        HostInputState::Rejected => InProcessHostInputOutcome::Rejected,
+        HostInputState::Unknown => InProcessHostInputOutcome::Unknown,
+    }
+}
+
+impl InProcessHostInputControl {
+    pub async fn submit(
+        &self,
+        submission: InProcessHostInputSubmission,
+    ) -> IoResult<InProcessHostInputOutcome> {
+        let operation = HostInputOperation {
+            thread_id: submission.thread_id,
+            producer_id: submission.producer_id,
+            sequence: submission.sequence,
+            purpose: submission.purpose,
+            mode: submission.mode,
+            target_json: submission.target_json,
+            content_digest: submission.content_digest,
+            payload: submission.payload,
+        };
+        self.service
+            .admit_host_input(operation)
+            .await
+            .map(|result| match result {
+                HostInputAdmission::Admitted(record) | HostInputAdmission::Existing(record) => {
+                    host_input_state(record.state)
+                }
+                HostInputAdmission::Conflict => InProcessHostInputOutcome::Conflict,
+                HostInputAdmission::ProducerSealed => InProcessHostInputOutcome::ProducerSealed,
+                HostInputAdmission::AtCapacity => InProcessHostInputOutcome::AtCapacity,
+            })
+            .map_err(IoError::other)
+    }
+
+    pub async fn query(
+        &self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> IoResult<InProcessHostInputOutcome> {
+        self.service
+            .observe_host_input(producer_id, sequence)
+            .await
+            .map(|record| {
+                record.map_or(InProcessHostInputOutcome::EvidenceUnavailable, |record| {
+                    host_input_state(record.state)
+                })
+            })
+            .map_err(IoError::other)
+    }
+
+    pub async fn withdraw(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        producer_id: &str,
+        sequence: u64,
+    ) -> IoResult<InProcessHostInputOutcome> {
+        self.service
+            .withdraw_host_input(thread_id, producer_id, sequence)
+            .await
+            .map(|result| match result {
+                Some(
+                    HostInputWithdrawal::Withdrawn(record)
+                    | HostInputWithdrawal::Existing(record)
+                    | HostInputWithdrawal::Unknown(record),
+                ) => host_input_state(record.state),
+                None => InProcessHostInputOutcome::EvidenceUnavailable,
+            })
+            .map_err(IoError::other)
+    }
+
+    pub async fn seal(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        producer_id: &str,
+    ) -> IoResult<()> {
+        self.service
+            .seal_host_input_producer(thread_id, producer_id)
+            .await
+            .map_err(IoError::other)
+    }
+
+    pub async fn acknowledge(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        producer_id: &str,
+        through_sequence: u64,
+    ) -> IoResult<InProcessHostInputOutcome> {
+        self.service
+            .acknowledge_host_input(thread_id, producer_id, through_sequence)
+            .await
+            .map(|record| {
+                record.map_or(InProcessHostInputOutcome::EvidenceUnavailable, |record| {
+                    host_input_state(record.state)
+                })
+            })
+            .map_err(IoError::other)
+    }
+}
+
 pub struct InProcessClientHandle {
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     runtime_handle: tokio::task::JoinHandle<()>,
+    host_input_control: Option<InProcessHostInputControl>,
     #[cfg(test)]
     _test_codex_home: Option<tempfile::TempDir>,
 }
@@ -354,6 +495,10 @@ impl InProcessClientHandle {
         Ok(())
     }
 
+    pub fn host_input_control(&self) -> Option<InProcessHostInputControl> {
+        self.host_input_control.clone()
+    }
+
     pub fn sender(&self) -> InProcessClientSender {
         self.client.clone()
     }
@@ -424,6 +569,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             .map_err(IoError::other)?;
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+    let (host_input_control_tx, host_input_control_rx) = oneshot::channel();
 
     let runtime_handle = tokio::spawn(async move {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
@@ -489,6 +635,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 remote_control_handle: None,
                 plugin_startup_tasks: Some(PluginStartupConfig::Current),
             }));
+            let _ = host_input_control_tx.send(
+                processor
+                    .host_input_queue()
+                    .map(|service| InProcessHostInputControl { service }),
+            );
             let mut thread_created_rx = processor.thread_created_receiver();
             let session = Arc::new(ConnectionSessionState::new());
             let mut listen_for_threads = true;
@@ -777,10 +928,17 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         }
     });
 
+    let host_input_control = host_input_control_rx.await.map_err(|_| {
+        IoError::new(
+            ErrorKind::BrokenPipe,
+            "in-process host input owner did not initialize",
+        )
+    })?;
     Ok(InProcessClientHandle {
         client: InProcessClientSender { client_tx },
         event_rx,
         runtime_handle,
+        host_input_control,
         #[cfg(test)]
         _test_codex_home: None,
     })
@@ -867,6 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn in_process_start_initializes_and_handles_typed_v2_request() {
         let client = start_test_client(SessionSource::Cli).await;
+        assert!(client.host_input_control().is_some());
         let response = client
             .request(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -983,6 +1142,7 @@ mod tests {
             client: InProcessClientSender { client_tx },
             event_rx,
             runtime_handle,
+            host_input_control: None,
             _test_codex_home: None,
         };
 
