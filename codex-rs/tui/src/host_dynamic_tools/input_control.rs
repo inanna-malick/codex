@@ -1,6 +1,9 @@
 //! Hosted input reaches this TUI's existing app-server connection. The host owns
 //! the private socket directory; this listener never resumes or creates a thread.
 
+#[allow(dead_code)]
+#[path = "input_control_protocol.rs"]
+mod protocol;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;

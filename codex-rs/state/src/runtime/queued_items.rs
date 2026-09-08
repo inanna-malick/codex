@@ -323,7 +323,7 @@ impl SqliteQueueStore {
         .await?;
         let record = read_host_input(transaction.as_mut(), &producer_id, u64::try_from(sequence)?)
             .await?
-            .expect("claimed host input remains retained");
+            .ok_or_else(|| anyhow::anyhow!("claimed host input record disappeared"))?;
         transaction.commit().await?;
         Ok(Some(record))
     }

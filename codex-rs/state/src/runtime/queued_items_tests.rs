@@ -99,7 +99,10 @@ async fn distinct_run_scopes_do_not_alias_and_seal_quarantines_ready_input() {
             .state
     );
     assert_eq!(
-        HostInputAdmission::ProducerSealed,
+        HostInputAdmission::Existing(HostInputRecord {
+            operation: first.clone(),
+            state: HostInputState::Rejected,
+        }),
         queue.admit_host_input(&first).await.unwrap()
     );
 }
