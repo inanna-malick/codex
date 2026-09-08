@@ -1,4 +1,9 @@
 use super::*;
+use crate::HostInputAdmission;
+use crate::HostInputOperation;
+use crate::HostInputRecord;
+use crate::HostInputState;
+use crate::HostInputWithdrawal;
 use crate::MAX_QUEUE_ITEMS;
 use crate::QueuedUserSubmissionRecord;
 use sqlx::Connection;
@@ -200,6 +205,238 @@ impl SqliteQueueStore {
         Ok(())
     }
 
+    /// Atomically retain a host operation and its queue row. Repeating an exact
+    /// operation returns its retained state; changing frozen content conflicts.
+    pub async fn admit_host_input(
+        &self,
+        operation: &HostInputOperation,
+    ) -> anyhow::Result<HostInputAdmission> {
+        let mut transaction = self.pool.begin().await?;
+        if let Some(record) = read_host_input(
+            transaction.as_mut(),
+            &operation.producer_id,
+            operation.sequence,
+        )
+        .await?
+        {
+            transaction.rollback().await?;
+            return Ok(if record.operation == *operation {
+                HostInputAdmission::Existing(record)
+            } else {
+                HostInputAdmission::Conflict
+            });
+        }
+        let sealed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM host_input_producer_seals WHERE producer_id = ?)",
+        )
+        .bind(&operation.producer_id)
+        .fetch_one(transaction.as_mut())
+        .await?;
+        if sealed {
+            transaction.rollback().await?;
+            return Ok(HostInputAdmission::ProducerSealed);
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM queued_items WHERE thread_id = ?")
+                .bind(operation.thread_id.to_string())
+                .fetch_one(transaction.as_mut())
+                .await?;
+        if count >= i64::try_from(MAX_QUEUE_ITEMS)? {
+            transaction.rollback().await?;
+            return Ok(HostInputAdmission::AtCapacity);
+        }
+        let item_id = format!("host:{}:{}", operation.producer_id, operation.sequence);
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        sqlx::query(
+            "INSERT INTO queued_items (
+                id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms
+             ) VALUES (?, ?, ?,
+                COALESCE((SELECT MAX(queue_order) FROM queued_items WHERE thread_id = ?), -1) + 1,
+                ?, ?)",
+        )
+        .bind(&item_id)
+        .bind(operation.thread_id.to_string())
+        .bind(&operation.payload)
+        .bind(operation.thread_id.to_string())
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(transaction.as_mut())
+        .await?;
+        sqlx::query(
+            "INSERT INTO host_input_operations (
+                thread_id, producer_id, sequence, content_digest, payload_json,
+                state, queue_item_id, created_at_ms, updated_at_ms
+             ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
+        )
+        .bind(operation.thread_id.to_string())
+        .bind(&operation.producer_id)
+        .bind(i64::try_from(operation.sequence)?)
+        .bind(&operation.content_digest)
+        .bind(&operation.payload)
+        .bind(item_id)
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(transaction.as_mut())
+        .await?;
+        transaction.commit().await?;
+        Ok(HostInputAdmission::Admitted(HostInputRecord {
+            operation: operation.clone(),
+            state: HostInputState::Ready,
+        }))
+    }
+
+    pub async fn observe_host_input(
+        &self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> anyhow::Result<Option<HostInputRecord>> {
+        let mut connection = self.pool.acquire().await?;
+        read_host_input(connection.as_mut(), producer_id, sequence).await
+    }
+
+    /// Claim a host-owned queue row before entering the native engine. The
+    /// retained `Dispatching` record survives deletion of the queue row.
+    pub async fn claim_host_queue_item(
+        &self,
+        thread_id: ThreadId,
+        queue_item_id: &str,
+    ) -> anyhow::Result<Option<HostInputRecord>> {
+        let mut transaction = self.pool.begin().await?;
+        let key: Option<(String, i64)> = sqlx::query_as(
+            "SELECT producer_id, sequence FROM host_input_operations
+             WHERE thread_id = ? AND queue_item_id = ? AND state = 'ready'",
+        )
+        .bind(thread_id.to_string())
+        .bind(queue_item_id)
+        .fetch_optional(transaction.as_mut())
+        .await?;
+        let Some((producer_id, sequence)) = key else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        set_host_input_state(
+            &mut transaction,
+            &producer_id,
+            u64::try_from(sequence)?,
+            HostInputState::Dispatching,
+        )
+        .await?;
+        let record = read_host_input(transaction.as_mut(), &producer_id, u64::try_from(sequence)?)
+            .await?
+            .expect("claimed host input remains retained");
+        transaction.commit().await?;
+        Ok(Some(record))
+    }
+
+    pub async fn mark_host_input_unknown(
+        &self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        set_host_input_state(
+            &mut transaction,
+            producer_id,
+            sequence,
+            HostInputState::Unknown,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Fence a ready operation against dispatch. Dispatching remains unknown;
+    /// absence from `queued_items` is not negative evidence.
+    pub async fn withdraw_host_input(
+        &self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> anyhow::Result<Option<HostInputWithdrawal>> {
+        let mut transaction = self.pool.begin().await?;
+        let Some(mut record) = read_host_input(transaction.as_mut(), producer_id, sequence).await?
+        else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let outcome = match record.state {
+            HostInputState::Ready => {
+                sqlx::query(
+                    "DELETE FROM queued_items WHERE id = (
+                        SELECT queue_item_id FROM host_input_operations
+                        WHERE producer_id = ? AND sequence = ?)",
+                )
+                .bind(producer_id)
+                .bind(i64::try_from(sequence)?)
+                .execute(transaction.as_mut())
+                .await?;
+                set_host_input_state(
+                    &mut transaction,
+                    producer_id,
+                    sequence,
+                    HostInputState::Withdrawn,
+                )
+                .await?;
+                record.state = HostInputState::Withdrawn;
+                HostInputWithdrawal::Withdrawn(record)
+            }
+            HostInputState::Dispatching | HostInputState::Unknown => {
+                if record.state == HostInputState::Dispatching {
+                    set_host_input_state(
+                        &mut transaction,
+                        producer_id,
+                        sequence,
+                        HostInputState::Unknown,
+                    )
+                    .await?;
+                    record.state = HostInputState::Unknown;
+                }
+                HostInputWithdrawal::Unknown(record)
+            }
+            HostInputState::Presented | HostInputState::Withdrawn | HostInputState::Rejected => {
+                HostInputWithdrawal::Existing(record)
+            }
+        };
+        transaction.commit().await?;
+        Ok(Some(outcome))
+    }
+
+    /// Seal one producer and quarantine all of its undispatched operations.
+    pub async fn seal_host_input_producer(
+        &self,
+        thread_id: ThreadId,
+        producer_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        sqlx::query(
+            "INSERT INTO host_input_producer_seals (thread_id, producer_id, sealed_at_ms)
+             VALUES (?, ?, ?) ON CONFLICT(producer_id) DO NOTHING",
+        )
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(now_ms)
+        .execute(transaction.as_mut())
+        .await?;
+        sqlx::query(
+            "DELETE FROM queued_items WHERE id IN (
+                SELECT queue_item_id FROM host_input_operations
+                WHERE producer_id = ? AND state = 'ready')",
+        )
+        .bind(producer_id)
+        .execute(transaction.as_mut())
+        .await?;
+        sqlx::query(
+            "UPDATE host_input_operations SET state = 'rejected', updated_at_ms = ?
+             WHERE producer_id = ? AND state = 'ready'",
+        )
+        .bind(now_ms)
+        .bind(producer_id)
+        .execute(transaction.as_mut())
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn delete_thread_queue(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
         Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
             .bind(thread_id.to_string())
@@ -208,6 +445,56 @@ impl SqliteQueueStore {
             .rows_affected()
             > 0)
     }
+}
+
+async fn read_host_input<'e, E>(
+    executor: E,
+    producer_id: &str,
+    sequence: u64,
+) -> anyhow::Result<Option<HostInputRecord>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(
+        "SELECT thread_id, producer_id, sequence, content_digest, payload_json, state
+         FROM host_input_operations WHERE producer_id = ? AND sequence = ?",
+    )
+    .bind(producer_id)
+    .bind(i64::try_from(sequence)?)
+    .fetch_optional(executor)
+    .await?;
+    row.map(|row| {
+        Ok(HostInputRecord {
+            operation: HostInputOperation {
+                thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
+                producer_id: row.try_get("producer_id")?,
+                sequence: u64::try_from(row.try_get::<i64, _>("sequence")?)?,
+                content_digest: row.try_get("content_digest")?,
+                payload: row.try_get("payload_json")?,
+            },
+            state: HostInputState::from_str(row.try_get("state")?)?,
+        })
+    })
+    .transpose()
+}
+
+async fn set_host_input_state(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    producer_id: &str,
+    sequence: u64,
+    state: HostInputState,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE host_input_operations SET state = ?, updated_at_ms = ?
+         WHERE producer_id = ? AND sequence = ?",
+    )
+    .bind(state.as_str())
+    .bind(datetime_to_epoch_millis(Utc::now()))
+    .bind(producer_id)
+    .bind(i64::try_from(sequence)?)
+    .execute(transaction.as_mut())
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

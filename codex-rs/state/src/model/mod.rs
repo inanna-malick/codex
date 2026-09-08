@@ -1,5 +1,6 @@
 mod backfill_state;
 mod graph;
+mod host_input;
 mod log;
 mod memories;
 mod project;
@@ -12,6 +13,11 @@ mod thread_metadata;
 pub use backfill_state::BackfillState;
 pub use backfill_state::BackfillStatus;
 pub use graph::DirectionalThreadSpawnEdgeStatus;
+pub use host_input::HostInputAdmission;
+pub use host_input::HostInputOperation;
+pub use host_input::HostInputRecord;
+pub use host_input::HostInputState;
+pub use host_input::HostInputWithdrawal;
 pub use log::LogEntry;
 pub use log::LogQuery;
 pub use log::LogRow;
