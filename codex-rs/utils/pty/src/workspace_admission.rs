@@ -52,6 +52,7 @@ pub struct WorkspaceAdmission {
     publication: std::sync::Mutex<publication::Publication>,
     cwd: PathBuf,
     identity: ProcessIdentity,
+    external_executor: OnceLock<OwnedRwLockReadGuard<()>>,
 }
 
 pub struct ProcessIdentity {
@@ -136,6 +137,7 @@ impl WorkspaceAdmission {
             publication: std::sync::Mutex::new(publication::Publication::default()),
             cwd: std::env::current_dir()?,
             identity,
+            external_executor: OnceLock::new(),
         })
     }
 
@@ -146,6 +148,11 @@ impl WorkspaceAdmission {
     }
 
     pub fn try_snapshot(&self) -> SnapshotAdmission {
+        if self.external_executor.get().is_some() {
+            return SnapshotAdmission::Unavailable(io::Error::other(
+                "workspace publication is unavailable after an external executor connection",
+            ));
+        }
         let Ok(guard) = self.gate.clone().try_write_owned() else {
             return SnapshotAdmission::Busy;
         };
@@ -162,6 +169,16 @@ impl WorkspaceAdmission {
     pub async fn track_process<F: Future>(&self, future: F) -> F::Output {
         let _admission = self.mutation().await;
         COMMAND_SCOPE.scope(self.scope.clone(), future).await
+    }
+
+    async fn disable_for_external_executor(&self) {
+        if self.external_executor.get().is_none() {
+            // Wait for an already-admitted mount transition before exposing the
+            // executor. Remote descendants may outlive its client connection,
+            // so disconnection cannot establish that local publication is safe.
+            let guard = self.gate.clone().read_owned().await;
+            let _ = self.external_executor.set(guard);
+        }
     }
 
     async fn spawn_command(
@@ -182,6 +199,15 @@ impl WorkspaceAdmission {
 
     pub fn cgroup_path(&self) -> &Path {
         &self.scope.path
+    }
+}
+
+/// External execution cannot be accounted for by this process's writer cgroup.
+/// Disable publication for the rest of this native process while keeping local
+/// tools and external execution available. Existing publication settles first.
+pub async fn disable_publication_for_external_executor() {
+    if let Availability::Ready(owner) = availability() {
+        owner.disable_for_external_executor().await;
     }
 }
 

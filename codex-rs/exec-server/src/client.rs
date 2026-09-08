@@ -1177,6 +1177,8 @@ impl ExecServerClient {
         reconnect_strategy: Option<ExecServerReconnectStrategy>,
         noise_context: Option<NoiseInitializeContext>,
     ) -> Result<Self, ExecServerError> {
+        #[cfg(target_os = "linux")]
+        codex_utils_pty::workspace_admission::disable_publication_for_external_executor().await;
         let (rpc_client, events_rx) = RpcClient::new(connection);
         let rpc_client = Arc::new(rpc_client);
         let session_id = OnceLock::new();
@@ -2163,6 +2165,65 @@ mod tests {
         .expect("stdio transport should connect");
 
         assert_eq!(client.session_id().as_deref(), Some("stdio-test"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires CODEX_WORKSPACE_SNAPSHOTS=1 and writable delegated cgroup v2"]
+    async fn external_executor_waits_for_publication_before_starting() {
+        use codex_utils_pty::workspace_admission::Availability;
+        use codex_utils_pty::workspace_admission::PublicationAdmission;
+        use codex_utils_pty::workspace_admission::SnapshotAdmission;
+        use codex_utils_pty::workspace_admission::{self};
+        let Availability::Ready(owner) = workspace_admission::availability() else {
+            panic!("snapshot opt-in and delegated writer scope required");
+        };
+        let sequence = std::num::NonZeroU64::MIN;
+        assert!(matches!(
+            owner.begin_publication(sequence),
+            PublicationAdmission::Ready
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("started");
+        let mut connecting = Box::pin(ExecServerClient::connect_stdio_command(StdioExecServerConnectArgs {
+            command: StdioExecServerCommand {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "touch started; read _line; printf '%s\\n' '{\"id\":1,\"result\":{\"sessionId\":\"publication-test\"}}'; read _line".to_string(),
+                ],
+                env: HashMap::new(),
+                cwd: Some(directory.path().to_path_buf()),
+            },
+            client_name: "publication-test".to_string(),
+            initialize_timeout: Duration::from_secs(5),
+            resume_session_id: None,
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut connecting)
+                .await
+                .is_err()
+        );
+        assert!(
+            !marker.exists(),
+            "executor started during snapshot publication"
+        );
+        assert!(matches!(
+            owner.finish_publication(sequence),
+            PublicationAdmission::Settled
+        ));
+        let client = connecting.await.expect("external executor remains usable");
+        assert_eq!(client.session_id().as_deref(), Some("publication-test"));
+        assert!(marker.exists());
+        assert!(matches!(
+            owner.try_snapshot(),
+            SnapshotAdmission::Unavailable(_)
+        ));
+        drop(client);
+        assert!(matches!(
+            owner.try_snapshot(),
+            SnapshotAdmission::Unavailable(_)
+        ));
     }
 
     #[cfg(windows)]

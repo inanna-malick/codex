@@ -748,6 +748,8 @@ impl ExecServerClient {
     pub(crate) async fn connect_stdio_command(
         args: StdioExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
+        #[cfg(target_os = "linux")]
+        codex_utils_pty::workspace_admission::disable_publication_for_external_executor().await;
         let mut child = stdio_command_process(&args.command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

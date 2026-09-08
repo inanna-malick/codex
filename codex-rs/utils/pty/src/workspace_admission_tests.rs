@@ -169,6 +169,39 @@ async fn writer_admission_tracks_detached_descendants() {
         PublicationAdmission::Settled
     ));
     std::fs::remove_dir_all(root).expect("test cleanup");
+    let third = std::num::NonZeroU64::new(3).expect("positive sequence");
+    assert!(matches!(
+        owner.begin_publication(third),
+        PublicationAdmission::Ready
+    ));
+    {
+        let external = owner.disable_for_external_executor();
+        tokio::pin!(external);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut external)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            owner.finish_publication(third),
+            PublicationAdmission::Settled
+        ));
+        external.await;
+    }
+    assert!(matches!(
+        owner.try_snapshot(),
+        SnapshotAdmission::Unavailable(_)
+    ));
+    let fourth = std::num::NonZeroU64::new(4).expect("positive sequence");
+    assert!(matches!(
+        owner.begin_publication(fourth),
+        PublicationAdmission::Unavailable(_)
+    ));
+    let mutation = tokio::time::timeout(Duration::from_secs(5), owner.mutation())
+        .await
+        .expect("local tools remain available");
+    drop(mutation);
+    owner.disable_for_external_executor().await;
     let group = owner.cgroup_path().to_owned();
     drop(owner);
     assert!(!group.exists());
