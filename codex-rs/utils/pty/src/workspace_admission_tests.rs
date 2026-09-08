@@ -5,7 +5,7 @@ use std::time::Duration;
 
 #[tokio::test]
 #[ignore = "requires writable delegated cgroup v2"]
-async fn writer_admission_tracks_detached_descendants_for_pipe_and_pty() {
+async fn writer_admission_tracks_detached_descendants() {
     let owner = Arc::new(WorkspaceAdmission::create().expect("delegated writer scope"));
     let mutation = owner.mutation().await;
     assert!(matches!(owner.try_snapshot(), SnapshotAdmission::Busy));
@@ -34,42 +34,77 @@ async fn writer_admission_tracks_detached_descendants_for_pipe_and_pty() {
     let root = std::env::temp_dir().join(format!("codex-writer-admission-{}", std::process::id()));
     std::fs::create_dir(&root).expect("exclusive test directory");
     let env: HashMap<String, String> = std::env::vars().collect();
-    for tty in [false, true] {
-        let release = root.join(if tty { "pty-release" } else { "pipe-release" });
+    enum Launch {
+        Pipe,
+        Pty,
+        Direct,
+    }
+    for launch in [Launch::Pipe, Launch::Pty, Launch::Direct] {
+        let release = root.join("release");
         let args = vec![
             "-c".to_owned(),
             include_str!("workspace_admission_worker.py").to_owned(),
             release.to_str().expect("test path").to_owned(),
         ];
-        let spawned = if tty {
-            owner
-                .track_process(crate::spawn_pty_process(
-                    "python3",
-                    &args,
-                    &root,
-                    &env,
-                    &None,
-                    TerminalSize::default(),
-                    &[],
-                ))
-                .await
-        } else {
-            owner
-                .track_process(crate::spawn_pipe_process_no_stdin(
-                    "python3",
-                    &args,
-                    &root,
-                    &env,
-                    &None,
-                    &[],
-                ))
-                .await
-        }
-        .expect("tracked process");
-        let exit = tokio::time::timeout(Duration::from_secs(5), spawned.exit_rx)
-            .await
-            .expect("leader deadline")
-            .expect("leader exit");
+        let (exit, session) = match launch {
+            Launch::Direct => {
+                let mut command = tokio::process::Command::new("python3");
+                command.args(&args).current_dir(&root);
+                let SnapshotAdmission::Ready(snapshot) = owner.try_snapshot() else {
+                    panic!("idle before direct launch");
+                };
+                let spawn = owner.spawn_command(command);
+                tokio::pin!(spawn);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut spawn)
+                        .await
+                        .is_err()
+                );
+                drop(snapshot);
+                let child = spawn.await.expect("direct command");
+                let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+                    .await
+                    .expect("leader deadline")
+                    .expect("leader exit");
+                (output.status.code().expect("normal exit"), None)
+            }
+            Launch::Pipe | Launch::Pty => {
+                let spawned = match launch {
+                    Launch::Pty => {
+                        owner
+                            .track_process(crate::spawn_pty_process(
+                                "python3",
+                                &args,
+                                &root,
+                                &env,
+                                &None,
+                                TerminalSize::default(),
+                                &[],
+                            ))
+                            .await
+                    }
+                    Launch::Pipe => {
+                        owner
+                            .track_process(crate::spawn_pipe_process_no_stdin(
+                                "python3",
+                                &args,
+                                &root,
+                                &env,
+                                &None,
+                                &[],
+                            ))
+                            .await
+                    }
+                    Launch::Direct => unreachable!(),
+                }
+                .expect("tracked process");
+                let exit = tokio::time::timeout(Duration::from_secs(5), spawned.exit_rx)
+                    .await
+                    .expect("leader deadline")
+                    .expect("leader exit");
+                (exit, Some(spawned.session))
+            }
+        };
         assert_eq!(exit, 0);
         assert!(
             matches!(owner.try_snapshot(), SnapshotAdmission::Busy),
@@ -87,8 +122,12 @@ async fn writer_admission_tracks_detached_descendants_for_pipe_and_pty() {
         })
         .await
         .expect("descendants settled");
-        drop(spawned.session);
+        drop(session);
+        std::fs::remove_file(release).expect("remove release marker");
     }
+    let missing = tokio::process::Command::new(root.join("missing-executable"));
+    assert!(owner.spawn_command(missing).await.is_err());
+    assert!(matches!(owner.try_snapshot(), SnapshotAdmission::Ready(_)));
     std::fs::remove_dir_all(root).expect("test cleanup");
     let group = owner.cgroup_path().to_owned();
     drop(owner);

@@ -238,7 +238,9 @@ pub(crate) async fn run_command(
         },
         None => command.spawn(),
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let child = codex_utils_pty::workspace_admission::spawn_command(command).await;
+    #[cfg(not(any(windows, target_os = "linux")))]
     let child = command.spawn();
 
     let mut child = match child {

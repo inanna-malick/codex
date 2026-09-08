@@ -51,7 +51,8 @@ pub struct MutationGuard {
     _guard: OwnedRwLockReadGuard<()>,
 }
 
-/// Held until the mount publisher finishes or its owning control connection ends.
+/// Held until the mount publisher confirms a settled writable view. Losing a
+/// control connection alone is not evidence that publication has stopped.
 pub struct SnapshotGuard {
     _guard: OwnedRwLockWriteGuard<()>,
     _scope: Arc<WriterScope>,
@@ -136,6 +137,18 @@ impl WorkspaceAdmission {
         COMMAND_SCOPE.scope(self.scope.clone(), future).await
     }
 
+    async fn spawn_command(
+        &self,
+        mut command: tokio::process::Command,
+    ) -> io::Result<tokio::process::Child> {
+        let _admission = self.mutation().await;
+        let scope = self.scope.clone();
+        // SAFETY: the callback uses only the retained descriptor and
+        // async-signal-safe syscalls. Admission spans attachment and exec.
+        unsafe { command.pre_exec(move || scope.enter_child()) };
+        command.spawn()
+    }
+
     pub fn cgroup_path(&self) -> &Path {
         &self.scope.path
     }
@@ -147,6 +160,18 @@ pub async fn track_process<F: Future>(future: F) -> F::Output {
     match availability() {
         Availability::Ready(owner) => owner.track_process(future).await,
         Availability::Disabled | Availability::Unavailable(_) => future.await,
+    }
+}
+
+/// Admit a direct authored command, including shell startup scripts and hooks.
+/// Ownership transfers to kernel descendant accounting before this returns;
+/// the caller keeps its existing waiting, output, and cancellation behavior.
+pub async fn spawn_command(
+    mut command: tokio::process::Command,
+) -> io::Result<tokio::process::Child> {
+    match availability() {
+        Availability::Ready(owner) => owner.spawn_command(command).await,
+        Availability::Disabled | Availability::Unavailable(_) => command.spawn(),
     }
 }
 
