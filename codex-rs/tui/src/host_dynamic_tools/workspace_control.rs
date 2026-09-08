@@ -17,6 +17,15 @@ pub(super) struct Request {
     thread_id: String,
     sequence: NonZeroU64,
     operation: Operation,
+    expected_identity: Option<Identity>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Identity {
+    pid: u32,
+    start_ticks: u64,
+    mount_namespace_inode: u64,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +40,10 @@ enum Operation {
 pub(super) enum Response {
     Ready {
         pid: u32,
+        #[serde(rename = "startTicks")]
+        start_ticks: u64,
+        #[serde(rename = "mountNamespaceInode")]
+        mount_namespace_inode: u64,
         #[serde(rename = "cgroupPath")]
         cgroup_path: String,
     },
@@ -70,6 +83,14 @@ pub(super) async fn publication(
             });
         }
     };
+    if request.expected_identity.as_ref().is_some_and(|expected| {
+        expected.pid != std::process::id()
+            || expected.start_ticks != owner.process_identity().start_ticks
+            || expected.mount_namespace_inode != owner.process_identity().mount_namespace_inode
+    }) || (matches!(request.operation, Operation::Finish) && request.expected_identity.is_none())
+    {
+        return Json(Response::Conflict);
+    }
     let outcome = match request.operation {
         Operation::Begin => owner.begin_publication(request.sequence),
         Operation::Finish => owner.finish_publication(request.sequence),
@@ -77,6 +98,8 @@ pub(super) async fn publication(
     Json(match outcome {
         PublicationAdmission::Ready => Response::Ready {
             pid: std::process::id(),
+            start_ticks: owner.process_identity().start_ticks,
+            mount_namespace_inode: owner.process_identity().mount_namespace_inode,
             cgroup_path: owner.cgroup_path().to_string_lossy().into_owned(),
         },
         PublicationAdmission::Settled => Response::Settled,

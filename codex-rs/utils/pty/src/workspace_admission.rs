@@ -9,6 +9,7 @@ use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +51,12 @@ pub struct WorkspaceAdmission {
     scope: Arc<WriterScope>,
     publication: std::sync::Mutex<publication::Publication>,
     cwd: PathBuf,
+    identity: ProcessIdentity,
+}
+
+pub struct ProcessIdentity {
+    pub start_ticks: u64,
+    pub mount_namespace_inode: u64,
 }
 
 /// Held across an actual filesystem mutation, not an outer hosted tool call.
@@ -72,6 +79,17 @@ pub enum SnapshotAdmission {
 
 impl WorkspaceAdmission {
     fn create() -> io::Result<Self> {
+        let stat = std::fs::read_to_string("/proc/self/stat")?;
+        let start_ticks = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .ok_or_else(|| io::Error::other("process start time unavailable"))?
+            .parse()
+            .map_err(io::Error::other)?;
+        let identity = ProcessIdentity {
+            start_ticks,
+            mount_namespace_inode: std::fs::metadata("/proc/self/ns/mnt")?.ino(),
+        };
         let membership = std::fs::read_to_string("/proc/self/cgroup")?;
         let relative = membership
             .lines()
@@ -117,6 +135,7 @@ impl WorkspaceAdmission {
             scope: Arc::new(scope),
             publication: std::sync::Mutex::new(publication::Publication::default()),
             cwd: std::env::current_dir()?,
+            identity,
         })
     }
 
@@ -155,6 +174,10 @@ impl WorkspaceAdmission {
         // async-signal-safe syscalls. Admission spans attachment and exec.
         unsafe { command.pre_exec(move || scope.enter_child()) };
         command.spawn()
+    }
+
+    pub fn process_identity(&self) -> &ProcessIdentity {
+        &self.identity
     }
 
     pub fn cgroup_path(&self) -> &Path {
