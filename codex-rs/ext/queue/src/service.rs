@@ -27,6 +27,10 @@ use codex_protocol::protocol::ThreadQueueChangedEvent;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::HostInputAdmission;
+use codex_thread_store::HostInputOperation;
+use codex_thread_store::HostInputRecord;
+use codex_thread_store::HostInputWithdrawal;
 use codex_thread_store::MAX_QUEUE_ITEMS;
 use codex_thread_store::QueueStore;
 use codex_thread_store::QueuedUserSubmissionRecord;
@@ -279,6 +283,62 @@ impl QueuedItemService {
         Ok(item)
     }
 
+    /// Admit one immutable host-owned operation through the queue's durable
+    /// deduplication owner. The producer identity is negotiated by the owning
+    /// native session; ordinary human queue input cannot select this path.
+    pub async fn admit_host_input(
+        &self,
+        operation: HostInputOperation,
+    ) -> Result<HostInputAdmission, QueueServiceError> {
+        let thread_id = operation.thread_id;
+        let _dispatch_guard = self.dispatch_guard(thread_id).await;
+        let outcome = self.queue.admit_host_input(operation).await?;
+        if matches!(outcome, HostInputAdmission::Admitted(_)) {
+            self.emit_changed(thread_id);
+        }
+        drop(_dispatch_guard);
+        self.wake_if_loaded(thread_id).await;
+        Ok(outcome)
+    }
+
+    pub async fn observe_host_input(
+        &self,
+        producer_id: &str,
+        sequence: u64,
+    ) -> Result<Option<HostInputRecord>, QueueServiceError> {
+        Ok(self.queue.observe_host_input(producer_id, sequence).await?)
+    }
+
+    pub async fn withdraw_host_input(
+        &self,
+        thread_id: ThreadId,
+        producer_id: &str,
+        sequence: u64,
+    ) -> Result<Option<HostInputWithdrawal>, QueueServiceError> {
+        let _dispatch_guard = self.dispatch_guard(thread_id).await;
+        let outcome = self
+            .queue
+            .withdraw_host_input(producer_id, sequence)
+            .await?;
+        if outcome.is_some() {
+            self.emit_changed(thread_id);
+        }
+        Ok(outcome)
+    }
+
+    pub async fn seal_host_input_producer(
+        &self,
+        thread_id: ThreadId,
+        producer_id: &str,
+    ) -> Result<(), QueueServiceError> {
+        let _dispatch_guard = self.dispatch_guard(thread_id).await;
+        self.queue
+            .seal_host_input_producer(thread_id, producer_id)
+            .await?;
+        self.emit_changed(thread_id);
+        Ok(())
+    }
+
     pub async fn list(&self, thread_id: ThreadId) -> Result<Vec<QueuedItem>, QueueServiceError> {
         self.list_page(thread_id, /*offset*/ 0, MAX_QUEUE_ITEMS)
             .await
@@ -385,6 +445,10 @@ impl QueuedItemService {
                 ),
             })?;
         let queued_item_id = item.id.clone();
+        let host_claim = self
+            .queue
+            .claim_host_queue_item(thread_id, &queued_item_id)
+            .await?;
         let input @ TurnInput::UserInput { .. } = item.input else {
             return Err(QueueServiceError::InvalidInput);
         };
@@ -395,7 +459,15 @@ impl QueuedItemService {
                     ..Default::default()
                 },
             ))
-            .await?;
+            .await;
+        if !matches!(submission, Ok(StartIfIdleSubmission::Started { .. }))
+            && let Some(claim) = &host_claim
+        {
+            self.queue
+                .mark_host_input_unknown(&claim.operation.producer_id, claim.operation.sequence)
+                .await?;
+        }
+        let submission = submission?;
         if matches!(submission, StartIfIdleSubmission::Started { .. }) {
             self.delete_locked(thread_id, queued_item_id).await?;
         }
@@ -421,6 +493,10 @@ impl QueuedItemService {
                 return Ok(());
             };
             let queued_item_id = record.id.clone();
+            let host_claim = self
+                .queue
+                .claim_host_queue_item(thread_id, &queued_item_id)
+                .await?;
 
             let input = match serde_json::from_str::<TurnInput>(&record.payload) {
                 Ok(input) => input,
@@ -448,6 +524,14 @@ impl QueuedItemService {
                     return Ok(());
                 }
                 Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+                    if let Some(claim) = &host_claim {
+                        self.queue
+                            .mark_host_input_unknown(
+                                &claim.operation.producer_id,
+                                claim.operation.sequence,
+                            )
+                            .await?;
+                    }
                     tracing::warn!(
                         %thread_id,
                         %queued_item_id,
@@ -457,6 +541,14 @@ impl QueuedItemService {
                     return Ok(());
                 }
                 Err(error) => {
+                    if let Some(claim) = &host_claim {
+                        self.queue
+                            .mark_host_input_unknown(
+                                &claim.operation.producer_id,
+                                claim.operation.sequence,
+                            )
+                            .await?;
+                    }
                     tracing::warn!(
                         %thread_id,
                         %queued_item_id,

@@ -3,6 +3,10 @@ use std::future::Future;
 
 use codex_protocol::ThreadId;
 use codex_rollout::StateDbHandle;
+use codex_state::HostInputAdmission;
+use codex_state::HostInputOperation;
+use codex_state::HostInputRecord;
+use codex_state::HostInputWithdrawal;
 use codex_state::QueuedUserSubmissionRecord;
 use codex_state::SqliteQueueStore;
 
@@ -49,6 +53,41 @@ pub trait QueueStore: Send + Sync {
     /// Returns [`ThreadStoreError::InvalidRequest`] when `item_ids` is not a
     /// permutation of the complete queue.
     fn reorder(&self, thread_id: ThreadId, item_ids: Vec<String>) -> ThreadStoreFuture<'_, ()>;
+
+    fn admit_host_input(
+        &self,
+        operation: HostInputOperation,
+    ) -> ThreadStoreFuture<'_, HostInputAdmission>;
+
+    fn observe_host_input<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>>;
+
+    fn claim_host_queue_item<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        queue_item_id: &'a str,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>>;
+
+    fn mark_host_input_unknown<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, ()>;
+
+    fn withdraw_host_input<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputWithdrawal>>;
+
+    fn seal_host_input_producer<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        producer_id: &'a str,
+    ) -> ThreadStoreFuture<'a, ()>;
 }
 
 /// Adapts the local state runtime to the shared queue-storage interface.
@@ -154,5 +193,55 @@ impl QueueStore for LocalQueueStore {
                     },
                 })
         })
+    }
+
+    fn admit_host_input(
+        &self,
+        operation: HostInputOperation,
+    ) -> ThreadStoreFuture<'_, HostInputAdmission> {
+        queue_future(async move { self.queue().admit_host_input(&operation).await })
+    }
+
+    fn observe_host_input<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>> {
+        queue_future(self.queue().observe_host_input(producer_id, sequence))
+    }
+
+    fn claim_host_queue_item<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        queue_item_id: &'a str,
+    ) -> ThreadStoreFuture<'a, Option<HostInputRecord>> {
+        queue_future(self.queue().claim_host_queue_item(thread_id, queue_item_id))
+    }
+
+    fn mark_host_input_unknown<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, ()> {
+        queue_future(self.queue().mark_host_input_unknown(producer_id, sequence))
+    }
+
+    fn withdraw_host_input<'a>(
+        &'a self,
+        producer_id: &'a str,
+        sequence: u64,
+    ) -> ThreadStoreFuture<'a, Option<HostInputWithdrawal>> {
+        queue_future(self.queue().withdraw_host_input(producer_id, sequence))
+    }
+
+    fn seal_host_input_producer<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        producer_id: &'a str,
+    ) -> ThreadStoreFuture<'a, ()> {
+        queue_future(
+            self.queue()
+                .seal_host_input_producer(thread_id, producer_id),
+        )
     }
 }
