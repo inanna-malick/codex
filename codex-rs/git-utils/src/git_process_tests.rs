@@ -59,7 +59,7 @@ async fn assert_timed_out_git_wrapper_does_not_leave_child_process_running(
         .env("CHILD_SURVIVED_FILE", &child_survived_file)
         .env("RELEASE_WRAPPER_FILE", &release_wrapper_file);
 
-    let (mut wrapper, process_tree) = spawn_git_command(&mut command).expect("spawn Git wrapper");
+    let (mut wrapper, process_tree) = spawn_git_command(command).await.expect("spawn Git wrapper");
     let child_pid = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(child_pid) = std::fs::read_to_string(&child_pid_file)

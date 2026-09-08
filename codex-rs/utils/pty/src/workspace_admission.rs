@@ -175,6 +175,16 @@ pub async fn spawn_command(
     }
 }
 
+/// Capture an admitted command with Tokio's `Command::output` semantics.
+pub async fn command_output(
+    mut command: tokio::process::Command,
+) -> io::Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    spawn_command(command).await?.wait_with_output().await
+}
+
 tokio::task_local! {
     static COMMAND_SCOPE: Arc<WriterScope>;
 }

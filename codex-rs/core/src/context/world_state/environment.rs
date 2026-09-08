@@ -413,7 +413,11 @@ async fn powershell_version(shell_path: &Path) -> Option<String> {
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
-    let version = tokio::time::timeout(Duration::from_secs(2), command.output())
+    #[cfg(target_os = "linux")]
+    let output = codex_utils_pty::workspace_admission::command_output(command);
+    #[cfg(not(target_os = "linux"))]
+    let output = command.output();
+    let version = tokio::time::timeout(Duration::from_secs(2), output)
         .await
         .ok()
         .and_then(Result::ok)

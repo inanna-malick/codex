@@ -133,5 +133,11 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         }
     }
 
-    cmd.kill_on_drop(true).spawn()
+    cmd.kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        codex_utils_pty::workspace_admission::spawn_command(cmd).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    cmd.spawn()
 }

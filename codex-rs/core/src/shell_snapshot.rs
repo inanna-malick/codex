@@ -298,13 +298,7 @@ async fn run_script_with_timeout(
     }
     handler.kill_on_drop(true);
     #[cfg(target_os = "linux")]
-    let output = async {
-        handler.stdout(Stdio::piped()).stderr(Stdio::piped());
-        codex_utils_pty::workspace_admission::spawn_command(handler)
-            .await?
-            .wait_with_output()
-            .await
-    };
+    let output = codex_utils_pty::workspace_admission::command_output(handler);
     #[cfg(not(target_os = "linux"))]
     let output = handler.output();
     let output = timeout(snapshot_timeout, output)
