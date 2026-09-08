@@ -21,6 +21,8 @@ mod buffered_replay;
 mod connector_policy;
 #[path = "tests/disconnect_tests.rs"]
 mod disconnect;
+#[cfg(unix)]
+mod host_input;
 #[path = "tests/key_chords.rs"]
 mod key_chords;
 #[path = "tests/luna_reserve_recovery_tests.rs"]

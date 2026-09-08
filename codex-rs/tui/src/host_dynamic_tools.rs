@@ -1,4 +1,6 @@
 mod completions;
+#[cfg(unix)]
+mod input_control;
 
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
@@ -57,11 +59,15 @@ struct HostDynamicToolRegistration {
     protocol_version: u32,
     dynamic_tools: Vec<DynamicToolSpec>,
     scope: HostDynamicToolScope,
+    #[serde(default)]
+    input_control_socket: Option<AbsolutePathBuf>,
 }
 
 #[derive(Debug)]
 pub(crate) struct HostDynamicTools {
     registration: HostDynamicToolRegistration,
+    #[cfg(unix)]
+    input_control: tokio::sync::Mutex<Option<input_control::InputControl>>,
     identities: HashMap<(Option<String>, String), DynamicToolKind>,
     primary_thread_id: Mutex<Option<ThreadId>>,
     completions: Mutex<completions::HostToolCompletions>,
@@ -84,6 +90,8 @@ pub(crate) enum HostDynamicToolRouting {
 struct SessionRequest<'a> {
     protocol_version: u32,
     thread_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_control_socket: Option<&'a AbsolutePathBuf>,
 }
 
 #[derive(Serialize)]
@@ -137,8 +145,17 @@ impl HostDynamicTools {
                         color_eyre::eyre::eyre!("host dynamic-tools registration timed out")
                     })??;
             let identities = validate_registration(&registration)?;
+            if let Some(input_socket) = &registration.input_control_socket
+                && (input_socket.as_path().parent() != socket_path.as_path().parent()
+                    || input_socket == &socket_path)
+            {
+                color_eyre::eyre::bail!(
+                    "host input socket must be a distinct path in the private host socket directory"
+                );
+            }
             Ok(Some(Arc::new(Self {
                 registration,
+                input_control: tokio::sync::Mutex::new(None),
                 identities,
                 primary_thread_id: Mutex::new(None),
                 completions: Mutex::new(completions::HostToolCompletions::default()),
@@ -186,14 +203,48 @@ impl HostDynamicTools {
             .is_none_or(|primary_thread_id| primary_thread_id == thread_id)
     }
 
+    pub(crate) async fn attach_primary_with_input(
+        &self,
+        thread_id: ThreadId,
+        handle: codex_app_server_client::AppServerRequestHandle,
+    ) -> color_eyre::Result<()> {
+        #[cfg(not(unix))]
+        let _ = handle;
+        if self.is_disabled() || !self.should_attach(thread_id) {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if let Some(socket) = &self.registration.input_control_socket {
+            let mut control = self.input_control.lock().await;
+            if let Some(control) = control.as_ref() {
+                control.update_handle(handle);
+            } else {
+                match input_control::InputControl::start(socket.clone(), thread_id, handle) {
+                    Ok(listener) => *control = Some(listener),
+                    Err(error) => {
+                        tracing::warn!(%error, "hosted input is unavailable; continuing without active steering")
+                    }
+                }
+            }
+        }
+        self.attach_primary(thread_id).await
+    }
+
     pub(crate) async fn attach_primary(&self, thread_id: ThreadId) -> color_eyre::Result<()> {
         if self.is_disabled() || !self.should_attach(thread_id) {
             return Ok(());
         }
         #[cfg(unix)]
+        let input_socket = self
+            .input_control
+            .lock()
+            .await
+            .as_ref()
+            .map(|control| control.socket.clone());
+        #[cfg(unix)]
         tokio::time::timeout(
             SETTLEMENT_REQUEST_TIMEOUT,
-            send_session(&self.client, thread_id),
+            send_session(&self.client, thread_id, input_socket.as_ref()),
         )
         .await
         .map_err(|_| {
@@ -334,11 +385,16 @@ async fn fetch_registration(
 }
 
 #[cfg(unix)]
-async fn send_session(client: &reqwest::Client, thread_id: ThreadId) -> color_eyre::Result<()> {
+async fn send_session(
+    client: &reqwest::Client,
+    thread_id: ThreadId,
+    input_control_socket: Option<&AbsolutePathBuf>,
+) -> color_eyre::Result<()> {
     let thread_id = thread_id.to_string();
     let response = send_request(client.post(endpoint(SESSION_PATH)).json(&SessionRequest {
         protocol_version: PROTOCOL_VERSION,
         thread_id: &thread_id,
+        input_control_socket,
     }))
     .await?;
     require_status(response.status(), reqwest::StatusCode::NO_CONTENT)
@@ -450,3 +506,5 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use tests::spawn_host;
+#[cfg(all(test, unix))]
+pub(crate) use tests::spawn_host_with_input;

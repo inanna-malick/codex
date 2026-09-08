@@ -94,6 +94,39 @@ fn spawn_host_with_completion_delay(
     mpsc::Receiver<RecordedRequest>,
     std::thread::JoinHandle<std::io::Result<()>>,
 )> {
+    spawn_host_configured(
+        socket_path,
+        request_count,
+        completion_delay,
+        /*input_control_socket*/ None,
+    )
+}
+
+pub(crate) fn spawn_host_with_input(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    input_control_socket: std::path::PathBuf,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_host_configured(
+        socket_path,
+        request_count,
+        Duration::ZERO,
+        Some(input_control_socket),
+    )
+}
+
+fn spawn_host_configured(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    completion_delay: Duration,
+    input_control_socket: Option<std::path::PathBuf>,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
     let listener = UnixListener::bind(socket_path)?;
     let (request_tx, request_rx) = mpsc::channel();
     let task = std::thread::spawn(move || {
@@ -114,7 +147,8 @@ fn spawn_host_with_completion_delay(
                             "description": "Evaluate source",
                             "deferLoading": false
                         }],
-                        "scope": "primaryThread"
+                        "scope": "primaryThread",
+                        "inputControlSocket": input_control_socket,
                     }))?,
                 )),
                 SESSION_PATH | "/v1/dynamic-tools/completed" => {
@@ -230,6 +264,7 @@ fn registration_rejects_duplicates_and_tui_namespace() {
         .expect("custom spec")
     };
     let registration = HostDynamicToolRegistration {
+        input_control_socket: None,
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![custom("same"), custom("same")],
         scope: HostDynamicToolScope::PrimaryThread,
@@ -237,6 +272,7 @@ fn registration_rejects_duplicates_and_tui_namespace() {
     assert!(validate_registration(&registration).is_err());
 
     let registration = HostDynamicToolRegistration {
+        input_control_socket: None,
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![
             serde_json::from_value(json!({

@@ -454,7 +454,8 @@ impl AppServerSession {
         if let Some(host) = &self.host_dynamic_tools
             && host.should_attach(thread_id)
         {
-            host.attach_primary(thread_id).await?;
+            host.attach_primary_with_input(thread_id, self.request_handle())
+                .await?;
         }
         Ok(())
     }
@@ -884,7 +885,8 @@ impl AppServerSession {
             self.remember_task_tool_thread(started.session.thread_id);
         }
         if host_tools_required && let Some(host) = &self.host_dynamic_tools {
-            host.attach_primary(started.session.thread_id).await?;
+            host.attach_primary_with_input(started.session.thread_id, self.request_handle())
+                .await?;
         }
         Ok(started)
     }
@@ -1777,7 +1779,8 @@ pub(crate) async fn start_thread_with_request_handle(
             .await?;
     started.task_tools_available = task_tools_available;
     if host_tools_required && let Some(host) = host_dynamic_tools {
-        host.attach_primary(started.session.thread_id).await?;
+        host.attach_primary_with_input(started.session.thread_id, request_handle.clone())
+            .await?;
     }
     Ok(started)
 }

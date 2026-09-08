@@ -232,24 +232,25 @@ with:
 codex --host-dynamic-tools-socket /absolute/private/actor/dynamic-tools.sock
 ```
 
-This protocol-version 2 bridge is available on Linux and macOS, is restricted to the bootstrap
+This protocol-version 3 bridge is available on Linux and macOS, is restricted to the bootstrap
 primary thread, and uses HTTP only for framing over the Unix socket. The route names retain their
-`/v1` prefix. Codex never creates or removes the socket. The host must bind it before launch in an
+`/v1` prefix. Codex never creates or removes the host-tools socket. The host must bind it before launch in an
 owner-only directory and retire the endpoint with the actor.
 
-The service implements three routes:
+The service implements these routes:
 
 ```text
 GET  /v1/dynamic-tools/registration
 POST /v1/dynamic-tools/session
 POST /v1/dynamic-tools/call
+POST /v1/dynamic-tools/completed
 ```
 
 Registration returns the dynamic tool definitions before Codex starts its App Server:
 
 ```json
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
   "dynamicTools": [
     {
       "type": "custom",
@@ -267,7 +268,7 @@ rollout durability barrier before attaching it. After `thread/start`, `thread/re
 CLI `thread/fork`, Codex attaches the resulting thread before submitting its first turn:
 
 ```json
-{"protocolVersion":2,"threadId":"019..."}
+{"protocolVersion":3,"threadId":"019..."}
 ```
 
 The endpoint returns HTTP 204 only after validating that the thread belongs to the actor. The
@@ -279,7 +280,7 @@ Calls contain the existing callback fields plus the bridge version:
 
 ```json
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
   "threadId": "019...",
   "turnId": "turn-123",
   "callId": "call-456",
@@ -296,7 +297,34 @@ Use `success: false` for infrastructure failures.
 
 Codex never retries `/call`. If the socket closes after execution begins, the outcome is
 indeterminate and the model must not assume that no effects occurred. Later foreground threads,
-background agents, helper threads, and derived forks do not receive this authority in v1.
+background agents, helper threads, and derived forks do not receive this authority.
+
+### Optional input into the owning TUI
+
+Registration may include `"inputControlSocket":"/absolute/private/actor/input.sock"`.
+It must be a distinct path in the same private directory as the host-tools socket.
+Codex binds that fresh Unix socket and echoes the field in `/session` only if the
+listener started. An occupied/unusable path disables active input without failing
+TUI startup. Omission means queue/session readiness only; hosts must not infer
+active-input support from the bridge version. The host retains directory cleanup
+ownership. Reconnecting the owning App Server refreshes the listener's request handle.
+
+The host sends `POST /v1/input` to that socket with exactly:
+
+```json
+{"threadId":"019...","clientUserMessageId":"update-7","message":"Correct the contract"}
+```
+
+The listener forwards text through the existing TUI App Server connection using
+native atomic `turn/start` (start or steer). It neither starts a daemon nor resumes
+a thread. A different thread is rejected, and additional configuration fields are
+rejected. HTTP 202 means native acceptance, not model-visible presentation. The
+host confirms presentation using the correlated persisted `userMessage.clientId`
+(`event_msg/item_completed/item` with type `UserMessage` and `client_id` in paginated
+rollouts; `event_msg/user_message/client_id` in legacy rollouts). Native acceptance is bounded
+at 60 seconds; an error, disconnect or timeout may follow successful submission,
+so the host must not automatically retry. Operator input and approval interactions
+continue through the normal TUI.
 
 ## Nix package layout
 
