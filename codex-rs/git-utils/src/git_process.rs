@@ -3,10 +3,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+#[cfg(target_os = "linux")]
+use codex_utils_pty::CommandChild as Child;
 #[cfg(windows)]
 use codex_utils_pty::JobObject;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
+#[cfg(not(target_os = "linux"))]
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::timeout;

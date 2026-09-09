@@ -4922,8 +4922,11 @@ dependencies = [
  "log",
  "portable-pty",
  "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
  "shared_library",
  "tokio",
+ "uuid",
  "winapi",
 ]
 

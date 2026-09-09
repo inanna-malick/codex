@@ -307,6 +307,8 @@ async fn spawn_process_preserving_fds(
     let io = crate::unix_io::PtyIo::new(master.as_raw_fd())?;
     #[cfg(target_os = "linux")]
     let writer_scope = crate::workspace_admission::current_scope();
+    #[cfg(target_os = "linux")]
+    let resource_scope = writer_scope.clone();
     let mut command = StdCommand::new(program);
     if let Some(arg0) = arg0 {
         command.arg0(arg0);
@@ -376,6 +378,7 @@ async fn spawn_process_preserving_fds(
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
+    let resource_output = stdout_tx.clone();
     let (reader_handle, writer_handle) = io.spawn(
         stdout_tx,
         writer_rx,
@@ -391,6 +394,25 @@ async fn spawn_process_preserving_fds(
         let code = match child.wait() {
             Ok(status) => exit_code_from_status(status),
             Err(_) => -1,
+        };
+        #[cfg(target_os = "linux")]
+        let code = match resource_scope
+            .as_ref()
+            .map(|scope| tokio::runtime::Handle::current().block_on(scope.resource_exhausted()))
+        {
+            Some(Ok(true)) => {
+                let _ = resource_output.blocking_send(
+                    b"\r\nCommand resource limit exceeded (OOM); no automatic retry.\r\n".to_vec(),
+                );
+                137
+            }
+            Some(Err(error)) => {
+                let _ = resource_output.blocking_send(
+                    format!("\r\nCommand resource outcome unconfirmed: {error}\r\n").into_bytes(),
+                );
+                if code == 0 { 1 } else { code }
+            }
+            _ => code,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {

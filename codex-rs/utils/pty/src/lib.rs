@@ -49,3 +49,11 @@ pub use win::PsuedoCon;
 pub use win::conpty::RawConPty;
 #[cfg(windows)]
 pub use windows_input::WindowsTtyInputNormalizer;
+
+#[cfg(target_os = "linux")]
+mod command_resources;
+
+#[cfg(target_os = "linux")]
+mod command_child;
+#[cfg(target_os = "linux")]
+pub use command_child::CommandChild;

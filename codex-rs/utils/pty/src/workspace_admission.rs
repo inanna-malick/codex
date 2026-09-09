@@ -110,20 +110,32 @@ impl WorkspaceAdmission {
         let root = Path::new("/sys/fs/cgroup").join(relative);
         // Exclusive creation refuses a retained directory from a reused PID.
         // A pathname never substitutes for the opened cgroup control file.
-        let path = root.join(format!("codex-writers-{}", std::process::id()));
-        std::fs::create_dir(&path)?;
+        let managed = std::env::var_os("CODEX_COMMAND_WRITER_CGROUP");
+        let owned = managed.is_none();
+        let path = managed
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join(format!("codex-writers-{}", std::process::id())));
+        if owned {
+            std::fs::create_dir(&path)?;
+        }
         let scope = WriterScope {
+            owned,
+            resource_receipt: None,
             join: match File::options().write(true).open(path.join("cgroup.procs")) {
                 Ok(file) => file,
                 Err(error) => {
-                    let _ = std::fs::remove_dir(&path);
+                    if owned {
+                        let _ = std::fs::remove_dir(&path);
+                    }
                     return Err(error);
                 }
             },
             events: match File::open(path.join("cgroup.events")) {
                 Ok(file) => file,
                 Err(error) => {
-                    let _ = std::fs::remove_dir(&path);
+                    if owned {
+                        let _ = std::fs::remove_dir(&path);
+                    }
                     return Err(error);
                 }
             },
@@ -166,9 +178,43 @@ impl WorkspaceAdmission {
         }
     }
 
-    pub async fn track_process<F: Future>(&self, future: F) -> F::Output {
+    pub async fn track_process<F, T>(&self, future: F) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        let mut grant = crate::command_resources::Grant::acquire().await?;
+        let scope = grant
+            .as_ref()
+            .map(super::command_resources::Grant::scope)
+            .unwrap_or_else(|| self.scope.clone());
         let _admission = self.mutation().await;
-        COMMAND_SCOPE.scope(self.scope.clone(), future).await
+        let result = COMMAND_SCOPE.scope(scope, future).await;
+        if result.is_ok()
+            && let Some(grant) = grant.as_mut()
+        {
+            grant.started();
+        }
+        result
+    }
+
+    async fn spawn_command(
+        &self,
+        mut command: tokio::process::Command,
+    ) -> io::Result<crate::CommandChild> {
+        let mut grant = crate::command_resources::Grant::acquire().await?;
+        let scope = grant
+            .as_ref()
+            .map(super::command_resources::Grant::scope)
+            .unwrap_or_else(|| self.scope.clone());
+        let _admission = self.mutation().await;
+        // SAFETY: scope attachment uses only retained descriptors and async-signal-safe calls.
+        let child_scope = scope.clone();
+        unsafe { command.pre_exec(move || child_scope.enter_child()) };
+        let child = command.spawn()?;
+        if let Some(grant) = grant.as_mut() {
+            grant.started();
+        }
+        Ok(crate::CommandChild::new(child, Some(scope)))
     }
 
     async fn disable_for_external_executor(&self) {
@@ -180,19 +226,6 @@ impl WorkspaceAdmission {
             let _ = self.external_executor.set(guard);
         }
     }
-
-    async fn spawn_command(
-        &self,
-        mut command: tokio::process::Command,
-    ) -> io::Result<tokio::process::Child> {
-        let _admission = self.mutation().await;
-        let scope = self.scope.clone();
-        // SAFETY: the callback uses only the retained descriptor and
-        // async-signal-safe syscalls. Admission spans attachment and exec.
-        unsafe { command.pre_exec(move || scope.enter_child()) };
-        command.spawn()
-    }
-
     pub fn process_identity(&self) -> &ProcessIdentity {
         &self.identity
     }
@@ -213,9 +246,19 @@ pub async fn disable_publication_for_external_executor() {
 
 /// Wrap only executor commands. Long-lived orchestration transports do not
 /// participate in this task-local scope and cannot block their own publication.
-pub async fn track_process<F: Future>(future: F) -> F::Output {
+pub async fn track_process<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
     match availability() {
         Availability::Ready(owner) => owner.track_process(future).await,
+        Availability::Disabled | Availability::Unavailable(_)
+            if std::env::var_os("CODEX_COMMAND_RESOURCE_SOCKET").is_some() =>
+        {
+            Err(anyhow::anyhow!(
+                "managed command resources unavailable; command not started"
+            ))
+        }
         Availability::Disabled | Availability::Unavailable(_) => future.await,
     }
 }
@@ -225,10 +268,19 @@ pub async fn track_process<F: Future>(future: F) -> F::Output {
 /// the caller keeps its existing waiting, output, and cancellation behavior.
 pub async fn spawn_command(
     mut command: tokio::process::Command,
-) -> io::Result<tokio::process::Child> {
+) -> io::Result<crate::CommandChild> {
     match availability() {
         Availability::Ready(owner) => owner.spawn_command(command).await,
-        Availability::Disabled | Availability::Unavailable(_) => command.spawn(),
+        Availability::Disabled | Availability::Unavailable(_)
+            if std::env::var_os("CODEX_COMMAND_RESOURCE_SOCKET").is_some() =>
+        {
+            Err(io::Error::other(
+                "managed command resources unavailable; command not started",
+            ))
+        }
+        Availability::Disabled | Availability::Unavailable(_) => command
+            .spawn()
+            .map(|child| crate::CommandChild::new(child, None)),
     }
 }
 
@@ -251,12 +303,34 @@ pub(crate) fn current_scope() -> Option<Arc<WriterScope>> {
 }
 
 pub(crate) struct WriterScope {
+    owned: bool,
+    resource_receipt: Option<crate::command_resources::Receipt>,
     path: PathBuf,
     join: File,
     events: File,
 }
 
 impl WriterScope {
+    pub(crate) fn command(
+        path: PathBuf,
+        receipt: crate::command_resources::Receipt,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            join: File::options()
+                .write(true)
+                .open(path.join("cgroup.procs"))?,
+            events: File::open(path.join("cgroup.events"))?,
+            resource_receipt: Some(receipt),
+            path,
+            owned: false,
+        })
+    }
+    pub(crate) async fn resource_exhausted(&self) -> io::Result<bool> {
+        match &self.resource_receipt {
+            Some(receipt) => receipt.resource_exhausted().await,
+            None => Ok(false),
+        }
+    }
     fn populated(&self) -> io::Result<bool> {
         let mut buffer = [0u8; 256];
         let count = self.events.read_at(&mut buffer, 0)?;
@@ -299,7 +373,9 @@ impl WriterScope {
 impl Drop for WriterScope {
     fn drop(&mut self) {
         // rmdir succeeds only for an empty cgroup; never kill remaining work.
-        let _ = std::fs::remove_dir(&self.path);
+        if self.owned {
+            let _ = std::fs::remove_dir(&self.path);
+        }
     }
 }
 

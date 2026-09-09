@@ -1,8 +1,11 @@
 use codex_network_proxy::NetworkProxy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+#[cfg(target_os = "linux")]
+use codex_utils_pty::CommandChild as Child;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(not(target_os = "linux"))]
 use tokio::process::Child;
 use tokio::process::Command;
 use tracing::trace;

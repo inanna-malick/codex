@@ -11,9 +11,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_channel::Sender;
+#[cfg(target_os = "linux")]
+use codex_utils_pty::CommandChild as Child;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
+#[cfg(not(target_os = "linux"))]
 use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 

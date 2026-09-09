@@ -149,6 +149,8 @@ async fn spawn_process_with_stdin_mode(
 
     #[cfg(target_os = "linux")]
     let writer_scope = crate::workspace_admission::current_scope();
+    #[cfg(target_os = "linux")]
+    let resource_scope = writer_scope.clone();
     let mut command = Command::new(program);
     #[cfg(unix)]
     if let Some(arg0) = arg0 {
@@ -297,6 +299,26 @@ async fn spawn_process_with_stdin_mode(
                 exit_code_from_status(status)
             }
             Err(_) => -1,
+        };
+        #[cfg(target_os = "linux")]
+        let code = if let Some(scope) = resource_scope {
+            match scope.resource_exhausted().await {
+                Ok(true) => {
+                    let _=stderr_tx.send(b"Command resource limit exceeded (OOM); side effects may be partial.\n".to_vec()).await;
+                    137
+                }
+                Ok(false) => code,
+                Err(error) => {
+                    let _ = stderr_tx
+                        .send(
+                            format!("Command resource outcome unconfirmed: {error}\n").into_bytes(),
+                        )
+                        .await;
+                    if code == 0 { 1 } else { code }
+                }
+            }
+        } else {
+            code
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {

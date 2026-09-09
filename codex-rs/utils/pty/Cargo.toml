@@ -33,6 +33,11 @@ winapi = { version = "0.3.9", features = [
     "winerror",
     "winnt",
 ] }
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
