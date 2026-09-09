@@ -86,6 +86,7 @@ pub trait QueueStore: Send + Sync {
 
     fn withdraw_host_input<'a>(
         &'a self,
+        thread_id: ThreadId,
         producer_id: &'a str,
         sequence: u64,
     ) -> ThreadStoreFuture<'a, Option<HostInputWithdrawal>>;
@@ -247,10 +248,14 @@ impl QueueStore for LocalQueueStore {
 
     fn withdraw_host_input<'a>(
         &'a self,
+        thread_id: ThreadId,
         producer_id: &'a str,
         sequence: u64,
     ) -> ThreadStoreFuture<'a, Option<HostInputWithdrawal>> {
-        queue_future(self.queue().withdraw_host_input(producer_id, sequence))
+        queue_future(
+            self.queue()
+                .withdraw_host_input(thread_id, producer_id, sequence),
+        )
     }
 
     fn seal_host_input_producer<'a>(

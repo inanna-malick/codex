@@ -342,6 +342,8 @@ impl InProcessHostInputControl {
                 }
                 HostInputAdmission::Conflict => InProcessHostInputOutcome::Conflict,
                 HostInputAdmission::ProducerSealed => InProcessHostInputOutcome::ProducerSealed,
+                HostInputAdmission::Withdrawn => InProcessHostInputOutcome::Withdrawn,
+                HostInputAdmission::Compacted => InProcessHostInputOutcome::EvidenceUnavailable,
                 HostInputAdmission::AtCapacity => InProcessHostInputOutcome::AtCapacity,
             })
             .map_err(IoError::other)
@@ -403,11 +405,7 @@ impl InProcessHostInputControl {
         self.service
             .acknowledge_host_input(thread_id, producer_id, through_sequence)
             .await
-            .map(|record| {
-                record.map_or(InProcessHostInputOutcome::EvidenceUnavailable, |record| {
-                    host_input_state(record.state)
-                })
-            })
+            .map(|_| InProcessHostInputOutcome::Presented)
             .map_err(IoError::other)
     }
 }

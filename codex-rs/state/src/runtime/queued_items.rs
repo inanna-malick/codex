@@ -226,6 +226,29 @@ impl SqliteQueueStore {
                 HostInputAdmission::Conflict
             });
         }
+        let watermark: Option<i64> = sqlx::query_scalar(
+            "SELECT through_sequence FROM host_input_producer_watermarks
+             WHERE producer_id = ?",
+        )
+        .bind(&operation.producer_id)
+        .fetch_optional(transaction.as_mut())
+        .await?;
+        if watermark.is_some_and(|watermark| operation.sequence <= watermark as u64) {
+            transaction.rollback().await?;
+            return Ok(HostInputAdmission::Compacted);
+        }
+        let withdrawn: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM host_input_withdrawal_tombstones
+             WHERE producer_id = ? AND sequence = ?)",
+        )
+        .bind(&operation.producer_id)
+        .bind(i64::try_from(operation.sequence)?)
+        .fetch_one(transaction.as_mut())
+        .await?;
+        if withdrawn {
+            transaction.rollback().await?;
+            return Ok(HostInputAdmission::Withdrawn);
+        }
         let sealed: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM host_input_producer_seals WHERE producer_id = ?)",
         )
@@ -349,8 +372,9 @@ impl SqliteQueueStore {
         Ok(())
     }
 
-    /// Record host-observed presentation through a producer sequence. This is
-    /// monotonic and idempotent so the acknowledgement can be retried safely.
+    /// Compact a contiguous prefix after the host has durably observed every
+    /// terminal outcome. Missing or nonterminal rows make the acknowledgement
+    /// fail without changing the retained evidence.
     pub async fn acknowledge_host_input(
         &self,
         thread_id: ThreadId,
@@ -358,18 +382,92 @@ impl SqliteQueueStore {
         through_sequence: u64,
     ) -> anyhow::Result<Option<HostInputRecord>> {
         let mut transaction = self.pool.begin().await?;
+        let previous: Option<i64> = sqlx::query_scalar(
+            "SELECT through_sequence FROM host_input_producer_watermarks
+             WHERE producer_id = ?",
+        )
+        .bind(producer_id)
+        .fetch_optional(transaction.as_mut())
+        .await?;
+        let first = previous.map_or(1, |value| value.saturating_add(1));
+        if i64::try_from(through_sequence)? < first {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence, state FROM (
+                SELECT sequence, state FROM host_input_operations
+                 WHERE thread_id = ? AND producer_id = ? AND sequence BETWEEN ? AND ?
+                UNION ALL
+                SELECT sequence, 'withdrawn' FROM host_input_withdrawal_tombstones
+                 WHERE thread_id = ? AND producer_id = ? AND sequence BETWEEN ? AND ?
+             ) ORDER BY sequence",
+        )
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(first)
+        .bind(i64::try_from(through_sequence)?)
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(first)
+        .bind(i64::try_from(through_sequence)?)
+        .fetch_all(transaction.as_mut())
+        .await?;
+        let expected = usize::try_from(i64::try_from(through_sequence)? - first + 1)?;
+        if rows.len() != expected
+            || rows.iter().enumerate().any(|(offset, (sequence, state))| {
+                *sequence != first + offset as i64 || state == "ready"
+            })
+        {
+            transaction.rollback().await?;
+            anyhow::bail!("host input acknowledgement is not a contiguous terminal prefix");
+        }
         sqlx::query(
             "UPDATE host_input_operations SET state = 'presented', updated_at_ms = ?
-             WHERE thread_id = ? AND producer_id = ? AND sequence <= ?
-               AND state IN ('dispatching', 'unknown', 'presented')",
+             WHERE thread_id = ? AND producer_id = ? AND sequence BETWEEN ? AND ?
+               AND state IN ('dispatching', 'unknown')",
         )
         .bind(datetime_to_epoch_millis(Utc::now()))
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(first)
+        .bind(i64::try_from(through_sequence)?)
+        .execute(transaction.as_mut())
+        .await?;
+        let record = read_host_input(transaction.as_mut(), producer_id, through_sequence).await?;
+        sqlx::query(
+            "DELETE FROM host_input_withdrawal_tombstones
+             WHERE thread_id = ? AND producer_id = ? AND sequence <= ?",
+        )
         .bind(thread_id.to_string())
         .bind(producer_id)
         .bind(i64::try_from(through_sequence)?)
         .execute(transaction.as_mut())
         .await?;
-        let record = read_host_input(transaction.as_mut(), producer_id, through_sequence).await?;
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        sqlx::query(
+            "DELETE FROM host_input_operations
+             WHERE thread_id = ? AND producer_id = ? AND sequence <= ?",
+        )
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(i64::try_from(through_sequence)?)
+        .execute(transaction.as_mut())
+        .await?;
+        sqlx::query(
+            "INSERT INTO host_input_producer_watermarks
+                (thread_id, producer_id, through_sequence, acknowledged_at_ms)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(producer_id) DO UPDATE SET
+                through_sequence = excluded.through_sequence,
+                acknowledged_at_ms = excluded.acknowledged_at_ms",
+        )
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(i64::try_from(through_sequence)?)
+        .bind(now_ms)
+        .execute(transaction.as_mut())
+        .await?;
         transaction.commit().await?;
         Ok(record)
     }
@@ -378,13 +476,25 @@ impl SqliteQueueStore {
     /// absence from `queued_items` is not negative evidence.
     pub async fn withdraw_host_input(
         &self,
+        thread_id: ThreadId,
         producer_id: &str,
         sequence: u64,
     ) -> anyhow::Result<Option<HostInputWithdrawal>> {
         let mut transaction = self.pool.begin().await?;
         let Some(mut record) = read_host_input(transaction.as_mut(), producer_id, sequence).await?
         else {
-            transaction.rollback().await?;
+            sqlx::query(
+                "INSERT INTO host_input_withdrawal_tombstones
+                    (thread_id, producer_id, sequence, withdrawn_at_ms)
+                 VALUES (?, ?, ?, ?) ON CONFLICT(producer_id, sequence) DO NOTHING",
+            )
+            .bind(thread_id.to_string())
+            .bind(producer_id)
+            .bind(i64::try_from(sequence)?)
+            .bind(datetime_to_epoch_millis(Utc::now()))
+            .execute(transaction.as_mut())
+            .await?;
+            transaction.commit().await?;
             return Ok(None);
         };
         let outcome = match record.state {

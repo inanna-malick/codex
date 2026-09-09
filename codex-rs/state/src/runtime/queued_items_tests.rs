@@ -125,7 +125,7 @@ async fn withdrawal_is_a_durable_negative_fence() {
     queue.admit_host_input(&operation).await.unwrap();
     assert!(matches!(
         queue
-            .withdraw_host_input(&operation.producer_id, operation.sequence)
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
             .await
             .unwrap(),
         Some(HostInputWithdrawal::Withdrawn(_))
@@ -143,6 +143,44 @@ async fn withdrawal_is_a_durable_negative_fence() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_before_delayed_submit_persists_a_negative_tombstone() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    assert_eq!(
+        None,
+        runtime
+            .thread_queue()
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Withdrawn,
+        runtime
+            .thread_queue()
+            .admit_host_input(&operation)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        None,
+        runtime
+            .thread_queue()
+            .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Compacted,
+        runtime
+            .thread_queue()
+            .admit_host_input(&operation)
+            .await
+            .unwrap()
     );
 }
 
@@ -184,7 +222,7 @@ async fn dispatch_claim_survives_queue_consumption_and_restart() {
     assert!(matches!(
         reopened
             .thread_queue()
-            .withdraw_host_input(&operation.producer_id, operation.sequence)
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
             .await
             .unwrap(),
         Some(HostInputWithdrawal::Unknown(HostInputRecord {
@@ -197,7 +235,7 @@ async fn dispatch_claim_survives_queue_consumption_and_restart() {
 #[tokio::test]
 async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
     let (runtime, thread_id) = runtime_with_thread().await;
-    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 4);
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 1);
     let queue = runtime.thread_queue();
     queue.admit_host_input(&operation).await.unwrap();
     let queued = queue
@@ -209,22 +247,69 @@ async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
         .await
         .unwrap();
 
-    for _retry_after_lost_response in 0..2 {
-        let record = queue
+    let record = queue
+        .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+        .await
+        .unwrap()
+        .expect("acknowledged operation");
+    assert_eq!(HostInputState::Presented, record.state);
+    assert_eq!(
+        None,
+        queue
             .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
             .await
             .unwrap()
-            .expect("acknowledged operation");
-        assert_eq!(HostInputState::Presented, record.state);
-    }
+    );
     assert_eq!(
-        HostInputState::Presented,
+        None,
         queue
             .observe_host_input(&operation.producer_id, operation.sequence)
             .await
             .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Compacted,
+        queue.admit_host_input(&operation).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn prefix_acknowledgement_rejects_ready_and_noncontiguous_rows() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let first = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    let third = host_operation(thread_id, "run/inbox/actor-1.1", 3);
+    queue.admit_host_input(&first).await.unwrap();
+    queue.admit_host_input(&third).await.unwrap();
+    assert!(
+        queue
+            .acknowledge_host_input(thread_id, &first.producer_id, 1)
+            .await
+            .is_err()
+    );
+    let queued = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 2)
+        .await
+        .unwrap();
+    queue
+        .claim_host_queue_item(thread_id, &queued[0].id)
+        .await
+        .unwrap();
+    assert!(
+        queue
+            .acknowledge_host_input(thread_id, &first.producer_id, 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Some(HostInputRecord {
+            operation: first,
+            state: HostInputState::Dispatching,
+        }),
+        queue
+            .observe_host_input("run/inbox/actor-1.1", 1)
+            .await
             .unwrap()
-            .state
     );
 }
 

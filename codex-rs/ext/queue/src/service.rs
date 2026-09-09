@@ -319,7 +319,7 @@ impl QueuedItemService {
         let _dispatch_guard = self.dispatch_guard(thread_id).await;
         let outcome = self
             .queue
-            .withdraw_host_input(producer_id, sequence)
+            .withdraw_host_input(thread_id, producer_id, sequence)
             .await?;
         if outcome.is_some() {
             self.emit_changed(thread_id);
@@ -536,14 +536,17 @@ impl QueuedItemService {
             let submission = if start_or_steer {
                 thread.start_or_steer_turn(request).await
             } else {
-                thread.start_turn_if_idle(request).await.map(|submission| match submission {
-                    StartIfIdleSubmission::Started { turn_id } => {
-                        TurnInputSubmission::Started { turn_id }
-                    }
-                    StartIfIdleSubmission::NotSubmitted { reason } => {
-                        TurnInputSubmission::NotSubmitted { reason }
-                    }
-                })
+                thread
+                    .start_turn_if_idle(request)
+                    .await
+                    .map(|submission| match submission {
+                        StartIfIdleSubmission::Started { turn_id } => {
+                            TurnInputSubmission::Started { turn_id }
+                        }
+                        StartIfIdleSubmission::NotSubmitted { reason } => {
+                            TurnInputSubmission::NotSubmitted { reason }
+                        }
+                    })
             };
             match submission {
                 Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }) => {

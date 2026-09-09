@@ -181,13 +181,13 @@ async fn control(
     let native = match handle {
         AppServerRequestHandle::InProcess(handle) => handle.host_input_control(),
         AppServerRequestHandle::Remote(_) => None,
-    }
-    .ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "native input evidence is unavailable".to_string(),
-        )
-    })?;
+    };
+    let Some(native) = native else {
+        return Ok(axum::Json(protocol::Response {
+            binding,
+            outcome: protocol::Outcome::EvidenceUnavailable,
+        }));
+    };
     let outcome = match request {
         protocol::Request::Bind { .. } => protocol::Outcome::Admitted,
         protocol::Request::Submit { envelope, .. } => {

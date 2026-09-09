@@ -61,6 +61,8 @@ pub enum HostInputAdmission {
     Existing(HostInputRecord),
     Conflict,
     ProducerSealed,
+    Withdrawn,
+    Compacted,
     AtCapacity,
 }
 
