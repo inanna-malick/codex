@@ -71,4 +71,5 @@ pub enum HostInputWithdrawal {
     Withdrawn(HostInputRecord),
     Existing(HostInputRecord),
     Unknown(HostInputRecord),
+    Tombstoned,
 }

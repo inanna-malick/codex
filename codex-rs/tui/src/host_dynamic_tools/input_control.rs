@@ -126,6 +126,7 @@ fn protocol_outcome(
             protocol::Outcome::Rejected
         }
         Native::Unknown => protocol::Outcome::Unknown,
+        Native::Compacted => protocol::Outcome::Compacted,
         Native::EvidenceUnavailable => protocol::Outcome::EvidenceUnavailable,
     }
 }

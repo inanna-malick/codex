@@ -293,6 +293,7 @@ pub enum InProcessHostInputOutcome {
     Conflict,
     ProducerSealed,
     AtCapacity,
+    Compacted,
     EvidenceUnavailable,
 }
 
@@ -343,7 +344,7 @@ impl InProcessHostInputControl {
                 HostInputAdmission::Conflict => InProcessHostInputOutcome::Conflict,
                 HostInputAdmission::ProducerSealed => InProcessHostInputOutcome::ProducerSealed,
                 HostInputAdmission::Withdrawn => InProcessHostInputOutcome::Withdrawn,
-                HostInputAdmission::Compacted => InProcessHostInputOutcome::EvidenceUnavailable,
+                HostInputAdmission::Compacted => InProcessHostInputOutcome::Compacted,
                 HostInputAdmission::AtCapacity => InProcessHostInputOutcome::AtCapacity,
             })
             .map_err(IoError::other)
@@ -380,6 +381,7 @@ impl InProcessHostInputControl {
                     | HostInputWithdrawal::Existing(record)
                     | HostInputWithdrawal::Unknown(record),
                 ) => host_input_state(record.state),
+                Some(HostInputWithdrawal::Tombstoned) => InProcessHostInputOutcome::Withdrawn,
                 None => InProcessHostInputOutcome::EvidenceUnavailable,
             })
             .map_err(IoError::other)

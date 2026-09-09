@@ -151,7 +151,7 @@ async fn withdrawal_before_delayed_submit_persists_a_negative_tombstone() {
     let (runtime, thread_id) = runtime_with_thread().await;
     let operation = host_operation(thread_id, "run/inbox/actor-1.1", 1);
     assert_eq!(
-        None,
+        Some(HostInputWithdrawal::Tombstoned),
         runtime
             .thread_queue()
             .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)

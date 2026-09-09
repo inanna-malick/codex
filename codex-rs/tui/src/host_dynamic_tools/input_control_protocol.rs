@@ -117,6 +117,7 @@ pub(super) enum Outcome {
     Withdrawn,
     Rejected,
     Unknown,
+    Compacted,
     EvidenceUnavailable,
 }
 

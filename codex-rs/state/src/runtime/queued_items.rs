@@ -495,7 +495,7 @@ impl SqliteQueueStore {
             .execute(transaction.as_mut())
             .await?;
             transaction.commit().await?;
-            return Ok(None);
+            return Ok(Some(HostInputWithdrawal::Tombstoned));
         };
         let outcome = match record.state {
             HostInputState::Ready => {
