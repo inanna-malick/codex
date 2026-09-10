@@ -251,12 +251,10 @@ impl InputControl {
         self.handle.send_replace(handle);
     }
 
-    pub(super) async fn update_binding(&self, binding: protocol::ExpectedBinding) {
-        *self.binding.lock().await = binding;
-    }
-
-    pub(super) async fn binding(&self) -> protocol::ExpectedBinding {
-        self.binding.lock().await.clone()
+    pub(super) fn binding_state(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>> {
+        self.binding.clone()
     }
 
     pub(super) fn start(

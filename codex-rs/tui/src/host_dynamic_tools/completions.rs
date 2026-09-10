@@ -322,12 +322,16 @@ impl HostDynamicTools {
             return Ok(());
         }
         let primary = codex_protocol::ThreadId::from_string(thread_id)?;
-        let (input_socket, binding) = {
+        let (input_socket, binding_state) = {
             let control = self.input_control.lock().await;
             match control.as_ref() {
-                Some(control) => (Some(control.socket.clone()), Some(control.binding().await)),
+                Some(control) => (Some(control.socket.clone()), Some(control.binding_state())),
                 None => (None, None),
             }
+        };
+        let binding = match binding_state {
+            Some(binding) => Some(binding.lock().await.clone()),
+            None => None,
         };
         super::send_session(
             &self.client,

@@ -271,25 +271,31 @@ impl HostDynamicTools {
                 generation: self.session_generation.fetch_add(1, Ordering::AcqRel) + 1,
                 nonce: self.registration.input_control_nonce.clone(),
             };
-            let mut control = self.input_control.lock().await;
-            if let Some(control) = control.as_ref() {
-                control.update_handle(handle);
-                control.update_binding(binding.clone()).await;
-            } else {
-                match input_control::InputControl::start(
-                    socket.clone(),
-                    thread_id,
-                    handle,
-                    binding.clone(),
-                ) {
-                    Ok(listener) => *control = Some(listener),
-                    Err(error) => {
-                        tracing::warn!(%error, "hosted input is unavailable; continuing without active steering")
+            let (input_socket, binding_state) = {
+                let mut control = self.input_control.lock().await;
+                if let Some(control) = control.as_ref() {
+                    control.update_handle(handle);
+                } else {
+                    match input_control::InputControl::start(
+                        socket.clone(),
+                        thread_id,
+                        handle,
+                        binding.clone(),
+                    ) {
+                        Ok(listener) => *control = Some(listener),
+                        Err(error) => {
+                            tracing::warn!(%error, "hosted input is unavailable; continuing without active steering")
+                        }
                     }
                 }
+                match control.as_ref() {
+                    Some(control) => (Some(control.socket.clone()), Some(control.binding_state())),
+                    None => (None, None),
+                }
+            };
+            if let Some(binding_state) = binding_state {
+                *binding_state.lock().await = binding.clone();
             }
-            let input_socket = control.as_ref().map(|control| control.socket.clone());
-            drop(control);
             tokio::time::timeout(
                 SETTLEMENT_REQUEST_TIMEOUT,
                 send_session(
@@ -318,12 +324,17 @@ impl HostDynamicTools {
         }
         let pending = self.recover_completions_before_reattach(thread_id).await?;
         #[cfg(unix)]
-        let (input_socket, binding) = {
+        let (input_socket, binding_state) = {
             let control = self.input_control.lock().await;
             match control.as_ref() {
-                Some(control) => (Some(control.socket.clone()), Some(control.binding().await)),
+                Some(control) => (Some(control.socket.clone()), Some(control.binding_state())),
                 None => (None, None),
             }
+        };
+        #[cfg(unix)]
+        let binding = match binding_state {
+            Some(binding) => Some(binding.lock().await.clone()),
+            None => None,
         };
         #[cfg(unix)]
         tokio::time::timeout(
