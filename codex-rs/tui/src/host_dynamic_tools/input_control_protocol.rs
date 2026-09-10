@@ -80,6 +80,9 @@ pub(super) struct Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 pub(super) enum Request {
+    Bind {
+        binding: Binding,
+    },
     Submit {
         binding: Binding,
         envelope: Envelope,
@@ -241,6 +244,7 @@ mod tests {
     use super::*;
 
     const GOLDEN_JSON: &str = "{\"producerId\":\"run-7/inbox-2/actor-3.1\",\"sequence\":9,\"purpose\":\"assignment\",\"mode\":\"queueOnly\",\"target\":{\"conversation\":\"00000000-0000-0000-0000-000000000004\",\"actor\":\"actor-3.1\",\"correlation\":\"request-5\"},\"payload\":[104,101,108,108,111],\"contentDigest\":\"282cff748dac084436730b60201fc26b7b9b4f2ccfbbbf4cbd6966e7fc4d5cd9\"}";
+    const BIND_JSON: &str = r#"{"operation":"bind","binding":{"protocolVersion":4,"launchId":"launch-1","instanceId":"instance-2","generation":7,"nonce":"nonce-3"}}"#;
     const COMPACTED_RESPONSE_JSON: &str = r#"{"binding":{"protocolVersion":4,"launchId":"launch-1","instanceId":"instance-2","generation":7,"nonce":"nonce-3"},"outcome":"compacted"}"#;
 
     #[test]
@@ -277,6 +281,13 @@ mod tests {
         actual.generation = expected.generation;
         actual.nonce = "wrong".into();
         assert_eq!(expected.validate(&actual), Err(BindingError::Nonce));
+    }
+
+    #[test]
+    fn bind_matches_host_wire_vector() {
+        let request: Request = serde_json::from_str(BIND_JSON).unwrap();
+        assert!(matches!(request, Request::Bind { .. }));
+        assert_eq!(serde_json::to_string(&request).unwrap(), BIND_JSON);
     }
 
     #[test]

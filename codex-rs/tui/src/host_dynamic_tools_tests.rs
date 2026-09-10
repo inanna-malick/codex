@@ -214,16 +214,25 @@ async fn reattach_rejects_stale_generation_and_remote_reports_unavailable() -> c
         second_attachment.body["applicationInstanceId"]
     );
 
+    let binding = |attachment: &RecordedRequest| {
+        json!({
+            "protocolVersion": 4,
+            "launchId": attachment.body["launchId"],
+            "instanceId": attachment.body["applicationInstanceId"],
+            "generation": attachment.body["sessionGeneration"],
+            "nonce": attachment.body["inputControlNonce"],
+        })
+    };
+    let bind = |attachment: &RecordedRequest| {
+        json!({
+            "operation": "bind",
+            "binding": binding(attachment),
+        })
+    };
     let query = |attachment: &RecordedRequest| {
         json!({
             "operation": "query",
-            "binding": {
-                "protocolVersion": 4,
-                "launchId": attachment.body["launchId"],
-                "instanceId": attachment.body["applicationInstanceId"],
-                "generation": attachment.body["sessionGeneration"],
-                "nonce": attachment.body["inputControlNonce"],
-            },
+            "binding": binding(attachment),
             "producer_id": "run/inbox/actor-1.1",
             "sequence": 1,
         })
@@ -232,6 +241,36 @@ async fn reattach_rejects_stale_generation_and_remote_reports_unavailable() -> c
         .unix_socket(input_socket)
         .no_proxy()
         .build()?;
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&bind(&first_attachment))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&bind(&second_attachment))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["outcome"],
+        json!("admitted")
+    );
+    let mut foreign_bind = bind(&second_attachment);
+    foreign_bind["binding"]["nonce"] = json!("foreign");
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&foreign_bind)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
     assert_eq!(
         client
             .post("http://localhost/v1/input/control")

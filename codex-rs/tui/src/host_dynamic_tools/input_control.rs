@@ -143,7 +143,8 @@ async fn control(
         )
     })?;
     let binding = match &request {
-        protocol::Request::Submit { binding, .. }
+        protocol::Request::Bind { binding }
+        | protocol::Request::Submit { binding, .. }
         | protocol::Request::Query { binding, .. }
         | protocol::Request::Withdraw { binding, .. }
         | protocol::Request::Seal { binding, .. }
@@ -160,6 +161,12 @@ async fn control(
                 "stale or foreign native binding".to_string(),
             )
         })?;
+    if matches!(&request, protocol::Request::Bind { .. }) {
+        return Ok(axum::Json(protocol::Response {
+            binding,
+            outcome: protocol::Outcome::Admitted,
+        }));
+    }
     let handle = target.handle.borrow().clone();
     let native = match handle {
         AppServerRequestHandle::InProcess(handle) => handle.host_input_control(),
@@ -172,6 +179,7 @@ async fn control(
         }));
     };
     let outcome = match request {
+        protocol::Request::Bind { .. } => unreachable!("bind returned after validation"),
         protocol::Request::Submit { envelope, .. } => {
             let envelope = envelope.validate(target.thread).map_err(|_| {
                 (
