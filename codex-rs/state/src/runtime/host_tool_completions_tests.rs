@@ -80,3 +80,110 @@ async fn ready_completion_survives_runtime_restart_and_acknowledges_once() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn exact_thread_call_keys_and_terminal_states_do_not_alias() {
+    let home = unique_temp_dir();
+    let state = runtime(&home).await;
+    let first_thread = ThreadId::new();
+    let second_thread = ThreadId::new();
+    let first = HostToolCompletionKey {
+        thread_id: first_thread,
+        context_call_id: "shared-call".to_string(),
+    };
+    let second = HostToolCompletionKey {
+        thread_id: second_thread,
+        context_call_id: "shared-call".to_string(),
+    };
+    state
+        .thread_queue()
+        .register_host_tool_completion(&first)
+        .await
+        .unwrap();
+    state
+        .thread_queue()
+        .register_host_tool_completion(&second)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        HostToolCompletionState::ReattachedWithoutCompletion,
+        state
+            .thread_queue()
+            .mark_host_tool_completion_reattached(&first)
+            .await
+            .unwrap()
+            .state
+    );
+    assert!(
+        state
+            .thread_queue()
+            .mark_host_tool_completion_ready(&first)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot transition")
+    );
+    assert_eq!(
+        vec![HostToolCompletionRecord {
+            key: second,
+            state: HostToolCompletionState::Pending,
+        }],
+        state
+            .thread_queue()
+            .list_unresolved_host_tool_completions(second_thread)
+            .await
+            .unwrap()
+    );
+    assert!(
+        state
+            .thread_queue()
+            .list_unresolved_host_tool_completions(first_thread)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unresolved_capacity_still_allows_idempotent_existing_registration() {
+    let home = unique_temp_dir();
+    let state = runtime(&home).await;
+    let thread_id = ThreadId::new();
+    let mut first = None;
+    for index in 0..MAX_UNRESOLVED_HOST_TOOL_COMPLETIONS {
+        let key = HostToolCompletionKey {
+            thread_id,
+            context_call_id: format!("call-{index}"),
+        };
+        state
+            .thread_queue()
+            .register_host_tool_completion(&key)
+            .await
+            .unwrap();
+        first.get_or_insert(key);
+    }
+    let first = first.unwrap();
+    assert_eq!(
+        HostToolCompletionState::Pending,
+        state
+            .thread_queue()
+            .register_host_tool_completion(&first)
+            .await
+            .unwrap()
+            .state
+    );
+    let overflow = HostToolCompletionKey {
+        thread_id,
+        context_call_id: "overflow".to_string(),
+    };
+    assert!(
+        state
+            .thread_queue()
+            .register_host_tool_completion(&overflow)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("too many unresolved")
+    );
+}
