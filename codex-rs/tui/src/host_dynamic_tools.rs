@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -64,6 +65,10 @@ struct HostDynamicToolRegistration {
     scope: HostDynamicToolScope,
     #[serde(default)]
     input_control_socket: Option<AbsolutePathBuf>,
+    #[serde(default)]
+    launch_id: String,
+    #[serde(default)]
+    input_control_nonce: String,
 }
 
 pub(crate) struct HostDynamicTools {
@@ -76,6 +81,8 @@ pub(crate) struct HostDynamicTools {
     completions: Mutex<completions::HostToolCompletions>,
     settlement_sender: Mutex<Option<tokio::sync::mpsc::Sender<completions::SettlementWork>>>,
     disabled: AtomicBool,
+    application_instance_id: String,
+    session_generation: AtomicU64,
     #[cfg(unix)]
     client: reqwest::Client,
 }
@@ -106,6 +113,14 @@ struct SessionRequest<'a> {
     thread_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_control_socket: Option<&'a AbsolutePathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_instance_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_control_nonce: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -198,6 +213,8 @@ impl HostDynamicTools {
                 completions: Mutex::new(completions::HostToolCompletions::default()),
                 settlement_sender: Mutex::new(None),
                 disabled: AtomicBool::new(false),
+                application_instance_id: uuid::Uuid::new_v4().to_string(),
+                session_generation: AtomicU64::new(0),
                 client,
             })))
         }
@@ -252,17 +269,49 @@ impl HostDynamicTools {
         }
         #[cfg(unix)]
         if let Some(socket) = &self.registration.input_control_socket {
+            let binding = input_control::protocol::ExpectedBinding {
+                launch_id: self.registration.launch_id.clone(),
+                instance_id: self.application_instance_id.clone(),
+                generation: self.session_generation.fetch_add(1, Ordering::AcqRel) + 1,
+                nonce: self.registration.input_control_nonce.clone(),
+            };
             let mut control = self.input_control.lock().await;
             if let Some(control) = control.as_ref() {
                 control.update_handle(handle);
+                control.update_binding(binding.clone()).await;
             } else {
-                match input_control::InputControl::start(socket.clone(), thread_id, handle) {
+                match input_control::InputControl::start(
+                    socket.clone(),
+                    thread_id,
+                    handle,
+                    binding.clone(),
+                ) {
                     Ok(listener) => *control = Some(listener),
                     Err(error) => {
                         tracing::warn!(%error, "hosted input is unavailable; continuing without active steering")
                     }
                 }
             }
+            let input_socket = control.as_ref().map(|control| control.socket.clone());
+            drop(control);
+            tokio::time::timeout(
+                SETTLEMENT_REQUEST_TIMEOUT,
+                send_session(
+                    &self.client,
+                    thread_id,
+                    input_socket.as_ref(),
+                    input_socket.as_ref().map(|_| &binding),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                color_eyre::eyre::eyre!("host dynamic-tools session attachment timed out")
+            })??;
+            *self
+                .primary_thread_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread_id);
+            return Ok(());
         }
         self.attach_primary(thread_id).await
     }
@@ -275,16 +324,22 @@ impl HostDynamicTools {
             .recover_completions_before_reattach(thread_id)
             .await?;
         #[cfg(unix)]
-        let input_socket = self
-            .input_control
-            .lock()
-            .await
-            .as_ref()
-            .map(|control| control.socket.clone());
+        let (input_socket, binding) = {
+            let control = self.input_control.lock().await;
+            match control.as_ref() {
+                Some(control) => (Some(control.socket.clone()), Some(control.binding().await)),
+                None => (None, None),
+            }
+        };
         #[cfg(unix)]
         tokio::time::timeout(
             SETTLEMENT_REQUEST_TIMEOUT,
-            send_session(&self.client, thread_id, input_socket.as_ref()),
+            send_session(
+                &self.client,
+                thread_id,
+                input_socket.as_ref(),
+                binding.as_ref(),
+            ),
         )
         .await
         .map_err(|_| {
@@ -364,6 +419,11 @@ fn validate_registration(
     if registration.dynamic_tools.is_empty() {
         color_eyre::eyre::bail!("host dynamic-tools registration is empty");
     }
+    if registration.input_control_socket.is_some()
+        && (registration.launch_id.is_empty() || registration.input_control_nonce.is_empty())
+    {
+        color_eyre::eyre::bail!("host input control challenge is incomplete");
+    }
     let mut identities = HashMap::new();
     for spec in &registration.dynamic_tools {
         match spec {
@@ -439,12 +499,17 @@ async fn send_session(
     client: &reqwest::Client,
     thread_id: ThreadId,
     input_control_socket: Option<&AbsolutePathBuf>,
+    binding: Option<&input_control::protocol::ExpectedBinding>,
 ) -> color_eyre::Result<()> {
     let thread_id = thread_id.to_string();
     let response = send_request(client.post(endpoint(SESSION_PATH)).json(&SessionRequest {
         protocol_version: PROTOCOL_VERSION,
         thread_id: &thread_id,
         input_control_socket,
+        launch_id: binding.map(|binding| binding.launch_id.as_str()),
+        application_instance_id: binding.map(|binding| binding.instance_id.as_str()),
+        session_generation: binding.map(|binding| binding.generation),
+        input_control_nonce: binding.map(|binding| binding.nonce.as_str()),
     }))
     .await?;
     require_status(response.status(), reqwest::StatusCode::NO_CONTENT)

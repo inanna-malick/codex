@@ -80,9 +80,6 @@ pub(super) struct Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 pub(super) enum Request {
-    Bind {
-        binding: Binding,
-    },
     Submit {
         binding: Binding,
         envelope: Envelope,
@@ -129,11 +126,11 @@ pub(super) struct Response {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ExpectedBinding {
-    pub launch_id: String,
-    pub instance_id: String,
-    pub generation: u64,
-    pub nonce: String,
+pub(in crate::host_dynamic_tools) struct ExpectedBinding {
+    pub(in crate::host_dynamic_tools) launch_id: String,
+    pub(in crate::host_dynamic_tools) instance_id: String,
+    pub(in crate::host_dynamic_tools) generation: u64,
+    pub(in crate::host_dynamic_tools) nonce: String,
 }
 
 impl ExpectedBinding {

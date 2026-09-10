@@ -149,6 +149,8 @@ fn spawn_host_configured(
                         }],
                         "scope": "primaryThread",
                         "inputControlSocket": input_control_socket,
+                        "launchId": "launch-test",
+                        "inputControlNonce": "nonce-test",
                     }))?,
                 )),
                 SESSION_PATH | "/v1/dynamic-tools/completed" => {
@@ -265,6 +267,8 @@ fn registration_rejects_duplicates_and_tui_namespace() {
     };
     let registration = HostDynamicToolRegistration {
         input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![custom("same"), custom("same")],
         scope: HostDynamicToolScope::PrimaryThread,
@@ -273,6 +277,8 @@ fn registration_rejects_duplicates_and_tui_namespace() {
 
     let registration = HostDynamicToolRegistration {
         input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![
             serde_json::from_value(json!({

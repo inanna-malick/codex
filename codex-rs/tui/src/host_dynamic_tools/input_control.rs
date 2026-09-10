@@ -3,7 +3,7 @@
 
 #[allow(dead_code)]
 #[path = "input_control_protocol.rs"]
-mod protocol;
+pub(super) mod protocol;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
@@ -28,6 +28,7 @@ pub(super) struct InputControl {
     pub(super) socket: AbsolutePathBuf,
     shutdown: CancellationToken,
     handle: watch::Sender<AppServerRequestHandle>,
+    binding: std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>>,
 }
 
 impl std::fmt::Debug for InputControl {
@@ -49,7 +50,7 @@ impl Drop for InputControl {
 pub(super) struct InputTarget {
     pub(super) thread: ThreadId,
     pub(super) handle: watch::Receiver<AppServerRequestHandle>,
-    binding: std::sync::Arc<tokio::sync::Mutex<Option<protocol::ExpectedBinding>>>,
+    binding: std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>>,
 }
 
 #[derive(Deserialize)]
@@ -142,42 +143,18 @@ async fn control(
         )
     })?;
     let binding = match &request {
-        protocol::Request::Bind { binding }
-        | protocol::Request::Submit { binding, .. }
+        protocol::Request::Submit { binding, .. }
         | protocol::Request::Query { binding, .. }
         | protocol::Request::Withdraw { binding, .. }
         | protocol::Request::Seal { binding, .. }
         | protocol::Request::Acknowledge { binding, .. } => binding.clone(),
     };
-    {
-        let mut expected = target.binding.lock().await;
-        if let Some(expected) = expected.as_ref() {
-            expected.validate(&binding).map_err(|_| {
-                (
-                    StatusCode::CONFLICT,
-                    "stale or foreign native binding".to_string(),
-                )
-            })?;
-        } else if matches!(&request, protocol::Request::Bind { .. })
-            && binding.protocol_version == protocol::INPUT_CONTROL_PROTOCOL_VERSION
-            && !binding.launch_id.is_empty()
-            && !binding.instance_id.is_empty()
-            && binding.generation != 0
-            && !binding.nonce.is_empty()
-        {
-            *expected = Some(protocol::ExpectedBinding {
-                launch_id: binding.launch_id.clone(),
-                instance_id: binding.instance_id.clone(),
-                generation: binding.generation,
-                nonce: binding.nonce.clone(),
-            });
-        } else {
-            return Err((
-                StatusCode::PRECONDITION_REQUIRED,
-                "native binding challenge is required".to_string(),
-            ));
-        }
-    }
+    target.binding.lock().await.validate(&binding).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "stale or foreign native binding".to_string(),
+        )
+    })?;
     let handle = target.handle.borrow().clone();
     let native = match handle {
         AppServerRequestHandle::InProcess(handle) => handle.host_input_control(),
@@ -190,7 +167,6 @@ async fn control(
         }));
     };
     let outcome = match request {
-        protocol::Request::Bind { .. } => protocol::Outcome::Admitted,
         protocol::Request::Submit { envelope, .. } => {
             let envelope = envelope.validate(target.thread).map_err(|_| {
                 (
@@ -270,14 +246,24 @@ impl InputControl {
         self.handle.send_replace(handle);
     }
 
+    pub(super) async fn update_binding(&self, binding: protocol::ExpectedBinding) {
+        *self.binding.lock().await = binding;
+    }
+
+    pub(super) async fn binding(&self) -> protocol::ExpectedBinding {
+        self.binding.lock().await.clone()
+    }
+
     pub(super) fn start(
         socket: AbsolutePathBuf,
         thread: ThreadId,
         handle: AppServerRequestHandle,
+        binding: protocol::ExpectedBinding,
     ) -> std::io::Result<Self> {
         // Bind only a fresh, host-selected path. Never unlink a competing owner.
         let listener = UnixListener::bind(socket.as_path())?;
         let (handle, receiver) = watch::channel(handle);
+        let binding = std::sync::Arc::new(tokio::sync::Mutex::new(binding));
         let router = Router::new()
             .route("/v1/input", post(present))
             .route("/v1/input/control", post(control));
@@ -291,7 +277,7 @@ impl InputControl {
             .with_state(InputTarget {
                 thread,
                 handle: receiver,
-                binding: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                binding: binding.clone(),
             });
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();
@@ -307,6 +293,7 @@ impl InputControl {
             socket,
             shutdown,
             handle,
+            binding,
         })
     }
 }

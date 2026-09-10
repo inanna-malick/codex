@@ -57,14 +57,63 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
     let thread = started.session.thread_id;
     let _registration = callbacks.recv()?;
     let attachment = callbacks.recv()?;
-    assert_eq!(
-        attachment.body,
-        json!({"protocolVersion":3,"threadId":thread,"inputControlSocket":input})
+    assert_eq!(attachment.body["protocolVersion"], json!(3));
+    assert_eq!(attachment.body["threadId"], json!(thread));
+    assert_eq!(attachment.body["inputControlSocket"], json!(input));
+    assert_eq!(attachment.body["launchId"], json!("launch-test"));
+    assert_eq!(attachment.body["inputControlNonce"], json!("nonce-test"));
+    assert_eq!(attachment.body["sessionGeneration"], json!(1));
+    assert!(
+        attachment.body["applicationInstanceId"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
     );
+    let binding = json!({
+        "protocolVersion": 4,
+        "launchId": attachment.body["launchId"],
+        "instanceId": attachment.body["applicationInstanceId"],
+        "generation": attachment.body["sessionGeneration"],
+        "nonce": attachment.body["inputControlNonce"],
+    });
+    let query = json!({
+        "operation": "query",
+        "binding": binding.clone(),
+        "producer_id": "run/inbox/actor-1.1",
+        "sequence": 1,
+    });
     let client = reqwest::Client::builder()
         .unix_socket(input.as_path())
         .no_proxy()
         .build()?;
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&query)
+        .send()
+        .await?;
+    let status = response.status();
+    let response_body = response.bytes().await?;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&response_body).into_owned()),
+        (
+            reqwest::StatusCode::OK,
+            serde_json::to_string(&json!({"binding": binding, "outcome": "evidenceUnavailable"}))?
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response_body)?,
+        json!({"binding": binding, "outcome": "evidenceUnavailable"})
+    );
+    let mut stale_query = query;
+    stale_query["binding"]["generation"] = json!(2);
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&stale_query)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
     let payload = json!({"threadId":thread,"clientUserMessageId":"update-7","message":"correct the contract"});
     assert_eq!(
         client
