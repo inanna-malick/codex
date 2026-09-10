@@ -7,6 +7,8 @@ use codex_app_server_protocol::ServerNotification;
 
 use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_rollout::CompletedCallBoundary;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutRecorder;
 use serde::Serialize;
 
 use super::HostDynamicTools;
@@ -14,6 +16,7 @@ use super::HostDynamicTools;
 #[derive(Debug, Default)]
 pub(super) struct HostToolCompletions {
     batch: Option<CompletedCallBoundary>,
+    batch_calls: BTreeSet<String>,
     pending: BTreeSet<String>,
     ready: BTreeSet<String>,
 }
@@ -23,7 +26,10 @@ impl HostToolCompletions {
         if self.pending.len() + self.ready.len() >= 256 {
             color_eyre::eyre::bail!("too many unacknowledged hosted tool completions");
         }
-        self.pending.insert(call_id);
+        self.pending.insert(call_id.clone());
+        if self.batch.is_some() {
+            self.batch_calls.insert(call_id);
+        }
         Ok(())
     }
 }
@@ -119,6 +125,7 @@ impl HostDynamicTools {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.batch = None;
+        state.batch_calls.clear();
         let calls = state
             .pending
             .union(&state.ready)
@@ -169,6 +176,9 @@ impl HostDynamicTools {
                 && let Some(id) = CompletedCallBoundary::invocation_id(&notification.item)
             {
                 state.batch = Some(CompletedCallBoundary::new(id));
+                if state.pending.contains(id) {
+                    state.batch_calls.insert(id.to_owned());
+                }
             }
             let closed = state
                 .batch
@@ -179,9 +189,13 @@ impl HostDynamicTools {
                 .unwrap_or(false);
             if closed {
                 state.batch = None;
-                let pending = std::mem::take(&mut state.pending);
-                state.ready.extend(pending.iter().cloned());
-                pending.into_iter().collect::<Vec<_>>()
+                let batch_calls = std::mem::take(&mut state.batch_calls);
+                let ready = batch_calls
+                    .into_iter()
+                    .filter(|call| state.pending.remove(call))
+                    .collect::<Vec<_>>();
+                state.ready.extend(ready.iter().cloned());
+                ready
             } else {
                 Vec::new()
             }
@@ -196,40 +210,17 @@ impl HostDynamicTools {
         let (thread_id, ready) = match work {
             SettlementWork::Acknowledge { thread_id, calls } => (thread_id, calls),
             SettlementWork::Reattach { thread_id, calls } => {
-                let outstanding = {
-                    let state = self
-                        .completions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    calls
-                        .iter()
-                        .any(|id| state.pending.contains(id) || state.ready.contains(id))
-                };
-                if outstanding {
-                    // Interrupted calls have no durable result boundary. Reattachment
-                    // settles these effects without inventing a completion or replaying them.
-                    let primary = codex_protocol::ThreadId::from_string(&thread_id)?;
-                    self.attach_primary(primary).await?;
-                    let mut state = self
-                        .completions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state.pending.retain(|id| !calls.contains(id));
-                    state.ready.retain(|id| !calls.contains(id));
-                }
+                self.reattach_pending(&thread_id, &calls).await?;
                 return Ok(());
             }
         };
         for call_id in ready {
-            if !self
-                .completions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ready
-                .contains(&call_id)
-            {
-                continue;
-            }
+            let key = completion_key(&thread_id, &call_id)?;
+            self.state_db
+                .thread_queue()
+                .mark_host_tool_completion_ready(&key)
+                .await
+                .map_err(store_error)?;
             #[cfg(unix)]
             for attempt in 0..3 {
                 let result = self
@@ -253,6 +244,11 @@ impl HostDynamicTools {
                     }
                 }
             }
+            self.state_db
+                .thread_queue()
+                .acknowledge_host_tool_completion(&key)
+                .await
+                .map_err(store_error)?;
             self.completions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -261,6 +257,122 @@ impl HostDynamicTools {
         }
         Ok(())
     }
+
+    pub(super) async fn recover_completions_before_reattach(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+    ) -> color_eyre::Result<BTreeSet<String>> {
+        let unresolved = self
+            .state_db
+            .thread_queue()
+            .list_unresolved_host_tool_completions(thread_id)
+            .await
+            .map_err(store_error)?;
+        if unresolved.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let metadata = self
+            .state_db
+            .get_thread(thread_id)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| color_eyre::eyre::eyre!("hosted completion thread is not persisted"))?;
+        let (items, history_thread, parse_errors) =
+            RolloutRecorder::load_rollout_items(&metadata.rollout_path).await?;
+        if history_thread != Some(thread_id) || parse_errors != 0 {
+            color_eyre::eyre::bail!(
+                "hosted completion history identity or integrity is unconfirmed"
+            );
+        }
+        let thread = thread_id.to_string();
+        let mut pending = BTreeSet::new();
+        let mut ready = Vec::new();
+        for record in unresolved {
+            match record.state {
+                codex_state::HostToolCompletionState::Ready => {
+                    ready.push(record.key.context_call_id);
+                }
+                codex_state::HostToolCompletionState::Pending => {
+                    if completion_is_closed(&items, &record.key.context_call_id)? {
+                        ready.push(record.key.context_call_id);
+                    } else {
+                        pending.insert(record.key.context_call_id);
+                    }
+                }
+                codex_state::HostToolCompletionState::Acknowledged
+                | codex_state::HostToolCompletionState::ReattachedWithoutCompletion => {}
+            }
+        }
+        if !ready.is_empty() {
+            self.execute_settlement(SettlementWork::Acknowledge {
+                thread_id: thread.clone(),
+                calls: ready,
+            })
+            .await?;
+        }
+        Ok(pending)
+    }
+
+    async fn reattach_pending(
+        &self,
+        thread_id: &str,
+        calls: &BTreeSet<String>,
+    ) -> color_eyre::Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let primary = codex_protocol::ThreadId::from_string(thread_id)?;
+        super::send_session(&self.client, primary, None).await?;
+        self.settle_reattached_pending(thread_id, calls).await
+    }
+
+    pub(super) async fn settle_reattached_pending(
+        &self,
+        thread_id: &str,
+        calls: &BTreeSet<String>,
+    ) -> color_eyre::Result<()> {
+        for call_id in calls {
+            self.state_db
+                .thread_queue()
+                .mark_host_tool_completion_reattached(&completion_key(thread_id, call_id)?)
+                .await
+                .map_err(store_error)?;
+        }
+        let mut state = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.retain(|id| !calls.contains(id));
+        state.ready.retain(|id| !calls.contains(id));
+        Ok(())
+    }
+}
+
+fn completion_key(
+    thread_id: &str,
+    context_call_id: &str,
+) -> color_eyre::Result<codex_state::HostToolCompletionKey> {
+    Ok(codex_state::HostToolCompletionKey {
+        thread_id: codex_protocol::ThreadId::from_string(thread_id)?,
+        context_call_id: context_call_id.to_owned(),
+    })
+}
+
+fn completion_is_closed(items: &[RolloutItem], call_id: &str) -> color_eyre::Result<bool> {
+    let mut boundary = CompletedCallBoundary::new(call_id);
+    let mut closed = false;
+    for item in items {
+        if let RolloutItem::ResponseItem(item) = item {
+            closed |= boundary
+                .observe(&item.item)
+                .map_err(|error| color_eyre::eyre::eyre!(error))?;
+        }
+    }
+    Ok(closed)
+}
+
+fn store_error(error: anyhow::Error) -> color_eyre::Report {
+    color_eyre::eyre::eyre!("{error:#}")
 }
 
 #[derive(Debug)]

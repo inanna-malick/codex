@@ -11,6 +11,7 @@ use codex_app_server_protocol::ThreadStartPersistence;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_rollout::StateDbHandle;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -65,18 +66,29 @@ struct HostDynamicToolRegistration {
     input_control_socket: Option<AbsolutePathBuf>,
 }
 
-#[derive(Debug)]
 pub(crate) struct HostDynamicTools {
     registration: HostDynamicToolRegistration,
     #[cfg(unix)]
     input_control: tokio::sync::Mutex<Option<input_control::InputControl>>,
     identities: HashMap<(Option<String>, String), DynamicToolKind>,
     primary_thread_id: Mutex<Option<ThreadId>>,
+    state_db: StateDbHandle,
     completions: Mutex<completions::HostToolCompletions>,
     settlement_sender: Mutex<Option<tokio::sync::mpsc::Sender<completions::SettlementWork>>>,
     disabled: AtomicBool,
     #[cfg(unix)]
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HostDynamicTools {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostDynamicTools")
+            .field("registration", &self.registration)
+            .field("primary_thread_id", &self.primary_thread_id())
+            .field("disabled", &self.is_disabled())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,12 +126,34 @@ impl HostDynamicTools {
         params.expected_dynamic_tools = Some(self.registration.dynamic_tools.clone());
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect(
         socket_path: Option<AbsolutePathBuf>,
+    ) -> color_eyre::Result<Option<Arc<Self>>> {
+        let home = tempfile::tempdir()?.keep();
+        let state_db = codex_state::StateRuntime::init(
+            codex_state::SqliteConfig::new_for_testing(
+                AbsolutePathBuf::from_absolute_path(home)?,
+            ),
+            "test-provider".to_string(),
+        )
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+        Self::connect_with_state(socket_path, Some(state_db)).await
+    }
+
+    pub(crate) async fn connect_with_state(
+        socket_path: Option<AbsolutePathBuf>,
+        state_db: Option<StateDbHandle>,
     ) -> color_eyre::Result<Option<Arc<Self>>> {
         let Some(socket_path) = socket_path else {
             return Ok(None);
         };
+        let state_db = state_db.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "host dynamic tools require durable completion storage"
+            )
+        })?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = socket_path;
@@ -160,6 +194,7 @@ impl HostDynamicTools {
                 input_control: tokio::sync::Mutex::new(None),
                 identities,
                 primary_thread_id: Mutex::new(None),
+                state_db,
                 completions: Mutex::new(completions::HostToolCompletions::default()),
                 settlement_sender: Mutex::new(None),
                 disabled: AtomicBool::new(false),
@@ -236,6 +271,9 @@ impl HostDynamicTools {
         if self.is_disabled() || !self.should_attach(thread_id) {
             return Ok(());
         }
+        let pending = self
+            .recover_completions_before_reattach(thread_id)
+            .await?;
         #[cfg(unix)]
         let input_socket = self
             .input_control
@@ -252,6 +290,8 @@ impl HostDynamicTools {
         .map_err(|_| {
             color_eyre::eyre::eyre!("host dynamic-tools session attachment timed out")
         })??;
+        self.settle_reattached_pending(&thread_id.to_string(), &pending)
+            .await?;
         *self
             .primary_thread_id
             .lock()
@@ -285,6 +325,14 @@ impl HostDynamicTools {
             return Ok(crate::dynamic_tools::failure_response(DISABLED_MESSAGE));
         }
         if let Some(call_id) = &params.context_call_id {
+            self.state_db
+                .thread_queue()
+                .register_host_tool_completion(&codex_state::HostToolCompletionKey {
+                    thread_id: ThreadId::from_string(&params.thread_id)?,
+                    context_call_id: call_id.clone(),
+                })
+                .await
+                .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
             self.completions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
