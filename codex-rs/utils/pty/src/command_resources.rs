@@ -27,7 +27,6 @@ enum Status {
     Running,
     Completed,
     ResourceExhausted,
-    AdmissionTimedOut,
     CancelledBeforeStart,
     CleanupUnconfirmed { detail: String },
 }
@@ -37,6 +36,20 @@ pub(super) struct Grant {
     scope: Arc<WriterScope>,
     submitted: bool,
 }
+tokio::task_local! {
+    static HOSTED_JOB: String;
+}
+
+pub fn managed_commands() -> bool {
+    std::env::var_os("CODEX_COMMAND_RESOURCE_SOCKET").is_some()
+}
+
+/// Reuse the resource identity already admitted for a private hosted command.
+/// This scopes execution, not environment variables inherited by child processes.
+pub async fn with_hosted_job<T>(id: String, future: impl std::future::Future<Output = T>) -> T {
+    HOSTED_JOB.scope(id, future).await
+}
+
 impl Grant {
     pub(super) async fn acquire() -> io::Result<Option<Self>> {
         let Some(socket) = std::env::var_os("CODEX_COMMAND_RESOURCE_SOCKET") else {
@@ -47,10 +60,13 @@ impl Grant {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .timeout(std::time::Duration::from_secs(310))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(io::Error::other)?;
-        let id = uuid::Uuid::new_v4().to_string();
+        let hosted = HOSTED_JOB.try_with(Clone::clone).ok();
+        let id = hosted
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // Cancellation during admission must cancel the queued identity too.
         let mut pending = Pending {
             client: client.clone(),
@@ -94,10 +110,6 @@ impl Grant {
                     submitted: false,
                 }))
             }
-            Status::AdmissionTimedOut => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "command resource admission timed out; command not started",
-            )),
             Status::CancelledBeforeStart => Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "command resource admission cancelled; command not started",
@@ -178,10 +190,7 @@ impl Receipt {
             Status::ResourceExhausted => Ok(true),
             Status::Completed | Status::Running => Ok(false),
             Status::CleanupUnconfirmed { detail } => Err(io::Error::other(detail)),
-            Status::Queued
-            | Status::Admitted { .. }
-            | Status::AdmissionTimedOut
-            | Status::CancelledBeforeStart => {
+            Status::Queued | Status::Admitted { .. } | Status::CancelledBeforeStart => {
                 Err(io::Error::other("command result is unconfirmed"))
             }
         }

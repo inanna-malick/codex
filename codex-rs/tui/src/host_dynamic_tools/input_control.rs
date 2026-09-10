@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 pub(super) struct InputControl {
     pub(super) socket: AbsolutePathBuf,
+    #[cfg(target_os = "linux")]
+    pub(super) commands: super::commands::Jobs,
     shutdown: CancellationToken,
     handle: watch::Sender<AppServerRequestHandle>,
 }
@@ -44,6 +46,8 @@ impl Drop for InputControl {
 
 #[derive(Clone)]
 pub(super) struct InputTarget {
+    #[cfg(target_os = "linux")]
+    pub(super) commands: super::commands::Jobs,
     pub(super) thread: ThreadId,
     pub(super) handle: watch::Receiver<AppServerRequestHandle>,
 }
@@ -122,15 +126,21 @@ impl InputControl {
         // Bind only a fresh, host-selected path. Never unlink a competing owner.
         let listener = UnixListener::bind(socket.as_path())?;
         let (handle, receiver) = watch::channel(handle);
+        #[cfg(target_os = "linux")]
+        let commands = super::commands::Jobs::default();
         let router = Router::new().route("/v1/input", post(present));
         #[cfg(target_os = "linux")]
         let router = router.route(
             "/v1/workspace/publication",
             post(super::workspace_control::publication),
         );
+        #[cfg(target_os = "linux")]
+        let router = router.route("/v1/commands", post(super::commands::dispatch));
         let router = router
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(InputTarget {
+                #[cfg(target_os = "linux")]
+                commands: commands.clone(),
                 thread,
                 handle: receiver,
             });
@@ -145,6 +155,8 @@ impl InputControl {
             }
         });
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            commands,
             socket,
             shutdown,
             handle,

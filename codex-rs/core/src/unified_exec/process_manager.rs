@@ -1297,6 +1297,35 @@ impl UnifiedExecProcessManager {
         if request.command.is_empty() {
             return Err(UnifiedExecError::MissingCommandLine);
         }
+        #[cfg(target_os = "linux")]
+        if codex_utils_pty::managed_commands() {
+            let command = request.command.clone();
+            let env = request.env.clone();
+            let arg0 = request.arg0.clone();
+            let sandbox = request.sandbox;
+            let spawned = codex_utils_pty::defer_process(async move {
+                let spawned = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
+                    command: &command,
+                    cwd: native_cwd.as_path(),
+                    env: &env,
+                    arg0: &arg0,
+                    sandbox,
+                    windows_sandbox: None,
+                    tty,
+                    stdin_open: tty,
+                    inherited_fds: &inherited_fds,
+                })
+                .await?;
+                spawn_lifecycle.after_spawn();
+                Ok((spawned, spawn_lifecycle))
+            });
+            return UnifiedExecProcess::from_spawned(
+                spawned,
+                sandbox,
+                Box::new(super::process::NoopSpawnLifecycle),
+            )
+            .await;
+        }
         let network_proxy_restricting_sid = {
             #[cfg(target_os = "windows")]
             {

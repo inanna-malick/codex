@@ -113,6 +113,10 @@ impl App {
     ) {
         if let Some(host) = app_server_client.host_dynamic_tools() {
             host.enqueue_settlement(&notification, &self.app_event_tx);
+            #[cfg(target_os = "linux")]
+            if host.command_output(&notification).await {
+                return;
+            }
         }
         if let ServerNotification::ThreadStatusChanged(status) = &notification {
             let _ = self.dynamic_tool_status_updates.send(status.clone());

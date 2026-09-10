@@ -1,5 +1,7 @@
+mod output_tail;
 pub mod pipe;
 mod process;
+pub use output_tail::OutputTail;
 pub mod process_group;
 pub mod pty;
 #[cfg(test)]
@@ -57,3 +59,12 @@ mod command_resources;
 mod command_child;
 #[cfg(target_os = "linux")]
 pub use command_child::CommandChild;
+
+#[cfg(target_os = "linux")]
+pub use command_resources::managed_commands;
+#[cfg(target_os = "linux")]
+pub use command_resources::with_hosted_job;
+#[cfg(target_os = "linux")]
+mod deferred;
+#[cfg(target_os = "linux")]
+pub use deferred::defer_process;

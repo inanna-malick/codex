@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod commands;
 mod completions;
 #[cfg(unix)]
 mod input_control;
@@ -105,6 +107,20 @@ struct CallRequest<'a> {
 }
 
 impl HostDynamicTools {
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn command_output(
+        &self,
+        notification: &codex_app_server_protocol::ServerNotification,
+    ) -> bool {
+        if let codex_app_server_protocol::ServerNotification::CommandExecOutputDelta(output) =
+            notification
+            && let Some(control) = self.input_control.lock().await.as_ref()
+        {
+            return control.commands.output(output);
+        }
+        false
+    }
+
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Acquire)
     }

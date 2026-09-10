@@ -251,9 +251,9 @@ impl CommandExecManager {
         };
 
         let sessions = Arc::clone(&self.sessions);
-        let (program, args) = command
-            .split_first()
-            .ok_or_else(|| invalid_request("command must not be empty"))?;
+        if command.is_empty() {
+            return Err(invalid_request("command must not be empty"));
+        }
         {
             let mut sessions = self.sessions.lock().await;
             if sessions.contains_key(&process_key) {
@@ -267,31 +267,53 @@ impl CommandExecManager {
                 CommandExecSession::Active { control_tx },
             );
         }
-        let spawned = if tty {
-            codex_utils_pty::spawn_pty_process(
-                program,
-                args,
-                cwd.as_path(),
-                &env,
-                &arg0,
-                size.unwrap_or_default(),
-                &[],
-            )
-            .await
-        } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
+        let spawn = async move {
+            let (program, args) = command.split_first().expect("validated command");
+            if tty {
+                codex_utils_pty::spawn_pty_process(
+                    program,
+                    args,
+                    cwd.as_path(),
+                    &env,
+                    &arg0,
+                    size.unwrap_or_default(),
+                    &[],
+                )
                 .await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(
-                program,
-                args,
-                cwd.as_path(),
-                &env,
-                &arg0,
-                &[],
-            )
-            .await
+            } else if stream_stdin {
+                codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
+                    .await
+            } else {
+                codex_utils_pty::spawn_pipe_process_no_stdin(
+                    program,
+                    args,
+                    cwd.as_path(),
+                    &env,
+                    &arg0,
+                    &[],
+                )
+                .await
+            }
         };
+        #[cfg(target_os = "linux")]
+        let spawned = if codex_utils_pty::managed_commands() {
+            let id = match &process_id {
+                InternalProcessId::Client(id) => id.clone(),
+                InternalProcessId::Generated(_) => uuid::Uuid::new_v4().to_string(),
+            };
+            Ok(codex_utils_pty::defer_process(async move {
+                codex_utils_pty::with_hosted_job(
+                    id,
+                    codex_utils_pty::workspace_admission::track_process(spawn),
+                )
+                .await
+                .map(|process| (process, ()))
+            }))
+        } else {
+            codex_utils_pty::workspace_admission::track_process(spawn).await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let spawned = spawn.await;
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -579,6 +601,11 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
+        #[cfg(target_os = "linux")]
+        let hosted_capture = stream_output && codex_utils_pty::managed_commands();
+        #[cfg(not(target_os = "linux"))]
+        let hosted_capture = false;
+        let mut tail = codex_utils_pty::OutputTail::default();
         let mut observed_num_bytes = 0usize;
         loop {
             let mut chunk = tokio::select! {
@@ -619,6 +646,11 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                         ),
                     )
                     .await;
+            }
+            // Hosted consumers transfer the final bounded capture to their job
+            // result, independently of when the TUI drains live output events.
+            if hosted_capture {
+                tail.push(capped_chunk);
             } else if !stream_output {
                 buffer.extend_from_slice(capped_chunk);
             }
@@ -626,7 +658,11 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                 break;
             }
         }
-        bytes_to_string_smart(&buffer)
+        if hosted_capture {
+            bytes_to_string_smart(&tail.read(codex_utils_pty::OutputTail::CAPACITY))
+        } else {
+            bytes_to_string_smart(&buffer)
+        }
     })
 }
 

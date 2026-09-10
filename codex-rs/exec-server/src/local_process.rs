@@ -412,7 +412,7 @@ impl LocalProcess {
             );
         }
 
-        let spawned_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
+        let spawn = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &prepared.command,
             cwd: prepared.cwd.as_path(),
             env: &prepared.env,
@@ -422,8 +422,39 @@ impl LocalProcess {
             tty: params.tty,
             stdin_open: params.tty || params.pipe_stdin,
             inherited_fds: &[],
-        })
-        .await;
+        });
+        #[cfg(target_os = "linux")]
+        let spawned_result = if codex_utils_pty::managed_commands() {
+            drop(spawn);
+            // Shell-snapshot preparation has finished; its selected files and
+            // network handles remain owned by the existing process entry.
+            let command = prepared.command.clone();
+            let cwd = prepared.cwd.clone();
+            let env = prepared.env.clone();
+            let arg0 = prepared.arg0.clone();
+            let sandbox = prepared.sandbox;
+            let tty = params.tty;
+            let stdin_open = tty || params.pipe_stdin;
+            Ok(codex_utils_pty::defer_process(async move {
+                codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
+                    command: &command,
+                    cwd: cwd.as_path(),
+                    env: &env,
+                    arg0: &arg0,
+                    sandbox,
+                    windows_sandbox: None,
+                    tty,
+                    stdin_open,
+                    inherited_fds: &[],
+                })
+                .await
+                .map(|process| (process, ()))
+            }))
+        } else {
+            spawn.await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let spawned_result = spawn.await;
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
