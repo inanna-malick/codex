@@ -103,7 +103,7 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
         serde_json::from_slice::<serde_json::Value>(&response_body)?,
         json!({"binding": binding, "outcome": "evidenceUnavailable"})
     );
-    let mut stale_query = query;
+    let mut stale_query = query.clone();
     stale_query["binding"]["generation"] = json!(2);
     assert_eq!(
         client

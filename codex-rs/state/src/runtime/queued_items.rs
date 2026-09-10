@@ -444,6 +444,16 @@ impl SqliteQueueStore {
         .bind(i64::try_from(through_sequence)?)
         .execute(transaction.as_mut())
         .await?;
+        sqlx::query(
+            "DELETE FROM queued_items WHERE id IN (
+                SELECT queue_item_id FROM host_input_operations
+                WHERE thread_id = ? AND producer_id = ? AND sequence <= ?)",
+        )
+        .bind(thread_id.to_string())
+        .bind(producer_id)
+        .bind(i64::try_from(through_sequence)?)
+        .execute(transaction.as_mut())
+        .await?;
         let now_ms = datetime_to_epoch_millis(Utc::now());
         sqlx::query(
             "DELETE FROM host_input_operations

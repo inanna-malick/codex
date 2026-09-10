@@ -149,12 +149,17 @@ async fn control(
         | protocol::Request::Seal { binding, .. }
         | protocol::Request::Acknowledge { binding, .. } => binding.clone(),
     };
-    target.binding.lock().await.validate(&binding).map_err(|_| {
-        (
-            StatusCode::CONFLICT,
-            "stale or foreign native binding".to_string(),
-        )
-    })?;
+    target
+        .binding
+        .lock()
+        .await
+        .validate(&binding)
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "stale or foreign native binding".to_string(),
+            )
+        })?;
     let handle = target.handle.borrow().clone();
     let native = match handle {
         AppServerRequestHandle::InProcess(handle) => handle.host_input_control(),

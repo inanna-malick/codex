@@ -118,6 +118,8 @@ fn spawn_host(
                         }],
                         "scope": "primaryThread",
                         "inputControlSocket": input_socket,
+                        "launchId": "launch-test",
+                        "inputControlNonce": "nonce-test",
                         }))?,
                     )
                 }
@@ -132,7 +134,7 @@ fn spawn_host(
     Ok((receiver, task))
 }
 
-fn post_host_input(socket: &Path, payload: &Value) -> Result<String> {
+fn post_input(socket: &Path, path: &str, payload: &Value) -> Result<String> {
     let body = serde_json::to_vec(payload)?;
     let deadline = Instant::now() + Duration::from_secs(/*secs*/ 10);
     let mut stream = loop {
@@ -147,7 +149,7 @@ fn post_host_input(socket: &Path, payload: &Value) -> Result<String> {
     };
     write!(
         stream,
-        "POST /v1/input HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.write_all(&body)?;
@@ -273,14 +275,19 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
     let thread_id = attachment.body["threadId"]
         .as_str()
         .context("attached thread id")?;
+    assert_eq!(attachment.body["protocolVersion"], json!(3));
+    assert_eq!(attachment.body["threadId"], json!(thread_id));
     assert_eq!(
-        attachment.body,
-        json!({
-            "protocolVersion": 3,
-            "threadId": thread_id,
-            "inputControlSocket": first_input_socket,
-        })
+        attachment.body["inputControlSocket"],
+        json!(first_input_socket)
     );
+    assert_eq!(attachment.body["launchId"], json!("launch-test"));
+    assert_eq!(attachment.body["inputControlNonce"], json!("nonce-test"));
+    assert_eq!(attachment.body["sessionGeneration"], json!(1));
+    let first_instance = attachment.body["applicationInstanceId"]
+        .as_str()
+        .context("first application instance")?
+        .to_string();
 
     spawned.session.request_terminate();
     tokio::time::timeout(Duration::from_secs(/*secs*/ 10), spawned.exit_rx)
@@ -313,17 +320,54 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
     assert_eq!(resumed_registration.method, "GET");
     assert_eq!(resumed_registration.path, "/v1/dynamic-tools/registration");
     let resumed_attachment = host_requests.recv_timeout(Duration::from_secs(/*secs*/ 10))?;
+    assert_eq!(resumed_attachment.method, "POST");
+    assert_eq!(resumed_attachment.path, "/v1/dynamic-tools/session");
+    assert_eq!(resumed_attachment.body["protocolVersion"], json!(3));
+    assert_eq!(resumed_attachment.body["threadId"], json!(thread_id));
     assert_eq!(
-        resumed_attachment,
-        HostRequest {
-            method: "POST".to_string(),
-            path: "/v1/dynamic-tools/session".to_string(),
-            body: json!({
-                "protocolVersion": 3,
-                "threadId": thread_id,
-                "inputControlSocket": resumed_input_socket,
-            }),
-        }
+        resumed_attachment.body["inputControlSocket"],
+        json!(resumed_input_socket)
+    );
+    assert_eq!(resumed_attachment.body["launchId"], json!("launch-test"));
+    assert_eq!(
+        resumed_attachment.body["inputControlNonce"],
+        json!("nonce-test")
+    );
+    assert_eq!(resumed_attachment.body["sessionGeneration"], json!(1));
+    let resumed_instance = resumed_attachment.body["applicationInstanceId"]
+        .as_str()
+        .context("resumed application instance")?;
+    assert_ne!(resumed_instance, first_instance);
+
+    let query = |instance: &str| {
+        json!({
+            "operation": "query",
+            "binding": {
+                "protocolVersion": 4,
+                "launchId": "launch-test",
+                "instanceId": instance,
+                "generation": 1,
+                "nonce": "nonce-test",
+            },
+            "producer_id": "run/inbox/actor-1.1",
+            "sequence": 1,
+        })
+    };
+    assert_eq!(
+        post_input(
+            &resumed_input_socket,
+            "/v1/input/control",
+            &query(&first_instance),
+        )?,
+        "HTTP/1.1 409 Conflict"
+    );
+    assert_eq!(
+        post_input(
+            &resumed_input_socket,
+            "/v1/input/control",
+            &query(resumed_instance),
+        )?,
+        "HTTP/1.1 200 OK"
     );
 
     let client_id = "native-fixture-input-1";
@@ -334,7 +378,7 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
             "clientUserMessageId": client_id,
             "message": "hosted correction",
         });
-        move || post_host_input(&input_socket, &payload)
+        move || post_input(&input_socket, "/v1/input", &payload)
     })
     .await??;
     assert_eq!(status, "HTTP/1.1 202 Accepted");

@@ -1045,6 +1045,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_input_control_retains_withdraws_seals_and_compacts() {
+        let client = start_test_client(SessionSource::Cli).await;
+        let control = client
+            .host_input_control()
+            .expect("state-backed runtime should expose host input control");
+        let thread_id = codex_protocol::ThreadId::new();
+        let producer_id = "run/inbox/actor-1.1";
+        let submission = |sequence| InProcessHostInputSubmission {
+            thread_id,
+            producer_id: producer_id.to_string(),
+            sequence,
+            purpose: "assignment".to_string(),
+            mode: "queueOnly".to_string(),
+            target_json: serde_json::json!({
+                "conversation": thread_id,
+                "actor": "actor-1.1",
+                "correlation": null,
+            })
+            .to_string(),
+            content_digest: "digest-v1".to_string(),
+            payload: r#"{"type":"userInput","items":[]}"#.to_string(),
+        };
+
+        assert_eq!(
+            control.submit(submission(1)).await.unwrap(),
+            InProcessHostInputOutcome::Admitted
+        );
+        assert_eq!(
+            control.query(producer_id, 1).await.unwrap(),
+            InProcessHostInputOutcome::Admitted
+        );
+        assert_eq!(
+            control.withdraw(thread_id, producer_id, 1).await.unwrap(),
+            InProcessHostInputOutcome::Withdrawn
+        );
+        assert_eq!(
+            control.submit(submission(1)).await.unwrap(),
+            InProcessHostInputOutcome::Withdrawn
+        );
+        assert_eq!(
+            control
+                .acknowledge(thread_id, producer_id, 1)
+                .await
+                .unwrap(),
+            InProcessHostInputOutcome::Presented
+        );
+        assert_eq!(
+            control.submit(submission(1)).await.unwrap(),
+            InProcessHostInputOutcome::Compacted
+        );
+        control.seal(thread_id, producer_id).await.unwrap();
+        assert_eq!(
+            control.submit(submission(2)).await.unwrap(),
+            InProcessHostInputOutcome::ProducerSealed
+        );
+
+        client
+            .shutdown()
+            .await
+            .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
     async fn in_process_start_uses_requested_session_source_for_thread_start() {
         for (requested_source, expected_source) in [
             (SessionSource::Cli, ApiSessionSource::Cli),

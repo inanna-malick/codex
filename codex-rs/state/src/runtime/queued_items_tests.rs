@@ -260,6 +260,10 @@ async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
             .await
             .unwrap()
     );
+    let reopened = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let queue = reopened.thread_queue();
     assert_eq!(
         None,
         queue
@@ -270,6 +274,13 @@ async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
     assert_eq!(
         HostInputAdmission::Compacted,
         queue.admit_host_input(&operation).await.unwrap()
+    );
+    assert!(
+        queue
+            .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
