@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// SQLite-backed persistence for durable, thread-scoped user messages.
 #[derive(Clone)]
 pub struct SqliteQueueStore {
-    pool: Arc<SqlitePool>,
+    pub(super) pool: Arc<SqlitePool>,
     change_version_connection: Arc<Mutex<Option<SqliteConnection>>>,
 }
 

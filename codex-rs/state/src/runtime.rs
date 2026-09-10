@@ -42,6 +42,7 @@ use tracing::warn;
 mod backfill;
 mod external_agent_config_imports;
 mod goals;
+mod host_tool_completions;
 mod logs;
 mod memories;
 mod projects;

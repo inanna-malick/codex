@@ -1,6 +1,7 @@
 mod backfill_state;
 mod graph;
 mod host_input;
+mod host_tool_completion;
 mod log;
 mod memories;
 mod project;
@@ -18,6 +19,9 @@ pub use host_input::HostInputOperation;
 pub use host_input::HostInputRecord;
 pub use host_input::HostInputState;
 pub use host_input::HostInputWithdrawal;
+pub use host_tool_completion::HostToolCompletionKey;
+pub use host_tool_completion::HostToolCompletionRecord;
+pub use host_tool_completion::HostToolCompletionState;
 pub use log::LogEntry;
 pub use log::LogQuery;
 pub use log::LogRow;
