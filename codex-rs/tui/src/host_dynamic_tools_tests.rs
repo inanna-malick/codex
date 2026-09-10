@@ -19,6 +19,26 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+async fn register_host_tool_completion(
+    host: &HostDynamicTools,
+    thread_id: ThreadId,
+    context_call_id: &str,
+) -> color_eyre::Result<()> {
+    host.state_db
+        .thread_queue()
+        .register_host_tool_completion(&codex_state::HostToolCompletionKey {
+            thread_id,
+            context_call_id: context_call_id.to_owned(),
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+    host.completions
+        .lock()
+        .unwrap()
+        .register(context_call_id.to_owned())?;
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct RecordedRequest {
     pub(crate) method: String,
@@ -428,7 +448,7 @@ async fn completion_waits_for_sibling_result_and_acknowledges_once() -> color_ey
     host.attach_primary(thread).await?;
     requests.recv()?;
     requests.recv()?;
-    host.completions.lock().unwrap().register("outer".into())?;
+    register_host_tool_completion(&host, thread, "outer").await?;
     let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
         thread_id: thread.to_string(),
         turn_id: "turn".into(),
@@ -473,10 +493,7 @@ async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
     host.attach_primary(thread).await?;
     requests.recv()?;
     requests.recv()?;
-    host.completions
-        .lock()
-        .unwrap()
-        .register("interrupted".into())?;
+    register_host_tool_completion(&host, thread, "interrupted").await?;
     host.settle_turn(&thread.to_string()).await?;
     assert_eq!(
         requests.recv()?,
@@ -506,7 +523,7 @@ async fn completion_accepts_acknowledgement_after_five_seconds() -> color_eyre::
         .expect("configured host");
     let thread = ThreadId::new();
     host.attach_primary(thread).await?;
-    host.completions.lock().unwrap().register("outer".into())?;
+    register_host_tool_completion(&host, thread, "outer").await?;
     for item in [
         json!({"type":"function_call", "call_id":"outer", "name":"exec", "arguments":"{}"}),
         json!({"type":"function_call_output", "call_id":"outer", "output":"done"}),
