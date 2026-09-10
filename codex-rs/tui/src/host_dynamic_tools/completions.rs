@@ -322,7 +322,20 @@ impl HostDynamicTools {
             return Ok(());
         }
         let primary = codex_protocol::ThreadId::from_string(thread_id)?;
-        super::send_session(&self.client, primary, None).await?;
+        let (input_socket, binding) = {
+            let control = self.input_control.lock().await;
+            match control.as_ref() {
+                Some(control) => (Some(control.socket.clone()), Some(control.binding().await)),
+                None => (None, None),
+            }
+        };
+        super::send_session(
+            &self.client,
+            primary,
+            input_socket.as_ref(),
+            binding.as_ref(),
+        )
+        .await?;
         self.settle_reattached_pending(thread_id, calls).await
     }
 

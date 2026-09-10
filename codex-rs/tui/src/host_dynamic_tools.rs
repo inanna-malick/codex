@@ -147,9 +147,7 @@ impl HostDynamicTools {
     ) -> color_eyre::Result<Option<Arc<Self>>> {
         let home = tempfile::tempdir()?.keep();
         let state_db = codex_state::StateRuntime::init(
-            codex_state::SqliteConfig::new_for_testing(
-                AbsolutePathBuf::from_absolute_path(home)?,
-            ),
+            codex_state::SqliteConfig::new_for_testing(AbsolutePathBuf::from_absolute_path(home)?),
             "test-provider".to_string(),
         )
         .await
@@ -165,9 +163,7 @@ impl HostDynamicTools {
             return Ok(None);
         };
         let state_db = state_db.ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "host dynamic tools require durable completion storage"
-            )
+            color_eyre::eyre::eyre!("host dynamic tools require durable completion storage")
         })?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -320,9 +316,7 @@ impl HostDynamicTools {
         if self.is_disabled() || !self.should_attach(thread_id) {
             return Ok(());
         }
-        let pending = self
-            .recover_completions_before_reattach(thread_id)
-            .await?;
+        let pending = self.recover_completions_before_reattach(thread_id).await?;
         #[cfg(unix)]
         let (input_socket, binding) = {
             let control = self.input_control.lock().await;
