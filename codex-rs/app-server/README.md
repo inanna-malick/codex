@@ -1979,6 +1979,7 @@ Streaming stdin/stdout uses base64 so PTY sessions can carry arbitrary bytes:
 - `command/exec/outputDelta.processId` is always the client-supplied string id from the original `command/exec` request.
 - `command/exec/outputDelta.stream` is `stdout` or `stderr`. PTY mode multiplexes terminal output through `stdout`.
 - `command/exec/outputDelta.capReached` is `true` on the final streamed chunk for a stream when `outputBytesCap` truncates that stream; later output on that stream is dropped.
+- `command/exec/outputDelta.endOfStream` is null on ordinary chunks. A final notification per stream reports `complete`, `capped`, or `drainTimeout`; the latter two mean output is incomplete. Consumers retaining live byte cursors join both stream ends with the command response, since client tasks may process responses and notifications separately.
 - `command/exec.params.env` overrides the server-computed environment per key; set a key to `null` to unset an inherited variable.
 - `command/exec/resize` is only supported for PTY-backed `command/exec` sessions.
 

@@ -982,6 +982,18 @@
           "description": "Base64-encoded output bytes.",
           "type": "string"
         },
+        "endOfStream": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandExecOutputEnd"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Final stream disposition; absent on ordinary chunks. This can precede or follow delivery of the command response in a client's event loop."
+        },
         "processId": {
           "description": "Client-supplied, connection-scoped `processId` from the original `command/exec` request.",
           "type": "string"
@@ -1002,6 +1014,15 @@
         "stream"
       ],
       "type": "object"
+    },
+    "CommandExecOutputEnd": {
+      "description": "Why no further output notifications will be emitted for a stream.",
+      "enum": [
+        "complete",
+        "capped",
+        "drainTimeout"
+      ],
+      "type": "string"
     },
     "CommandExecOutputStream": {
       "description": "Stream label for `command/exec/outputDelta` notifications.",

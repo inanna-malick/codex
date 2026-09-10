@@ -1785,6 +1785,7 @@ fn command_exec_output_delta_round_trips() {
         stream: CommandExecOutputStream::Stdout,
         delta_base64: "AQI=".to_string(),
         cap_reached: false,
+        end_of_stream: None,
     };
 
     let value = serde_json::to_value(&notification)
@@ -1796,6 +1797,7 @@ fn command_exec_output_delta_round_trips() {
             "stream": "stdout",
             "deltaBase64": "AQI=",
             "capReached": false,
+            "endOfStream": null,
         })
     );
 

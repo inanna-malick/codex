@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+use codex_app_server_protocol::CommandExecOutputEnd;
 use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecResizeResponse;
@@ -607,13 +608,13 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
         let hosted_capture = false;
         let mut tail = codex_utils_pty::OutputTail::default();
         let mut observed_num_bytes = 0usize;
-        loop {
+        let end = loop {
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => break,
+                    None => break CommandExecOutputEnd::Complete,
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => break,
+                _ = stdio_timeout_rx.wait_for(|&v| v) => break CommandExecOutputEnd::DrainTimeout,
             };
             // Individual chunks are at most 8KiB, so overshooting a bit is acceptable.
             while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
@@ -642,6 +643,7 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                                 stream,
                                 delta_base64: STANDARD.encode(capped_chunk),
                                 cap_reached,
+                                end_of_stream: None,
                             },
                         ),
                     )
@@ -655,8 +657,24 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                 buffer.extend_from_slice(capped_chunk);
             }
             if cap_reached {
-                break;
+                break CommandExecOutputEnd::Capped;
             }
+        };
+        if let (true, Some(process_id)) = (stream_output, process_id.as_ref()) {
+            outgoing
+                .send_server_notification_to_connection_and_wait(
+                    connection_id,
+                    ServerNotification::CommandExecOutputDelta(
+                        CommandExecOutputDeltaNotification {
+                            process_id: process_id.clone(),
+                            stream,
+                            delta_base64: String::new(),
+                            cap_reached: false,
+                            end_of_stream: Some(end),
+                        },
+                    ),
+                )
+                .await;
         }
         if hosted_capture {
             bytes_to_string_smart(&tail.read(codex_utils_pty::OutputTail::CAPACITY))

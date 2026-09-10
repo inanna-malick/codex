@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+use codex_app_server_protocol::CommandExecOutputEnd;
 use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::CommandExecParams;
 use codex_app_server_protocol::CommandExecResizeParams;
@@ -25,7 +26,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::watch;
 
-const STREAM_CAP: usize = OutputTail::CAPACITY;
 const RETAINED_JOBS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -60,6 +60,7 @@ enum Operation {
     Start { spec: Spec },
     Wait,
     Output { bytes: usize },
+    Read { stream: Stream, position: Position },
     Input { text: String },
     CloseInput,
     Resize { rows: u16, columns: u16 },
@@ -76,12 +77,67 @@ pub(super) enum JobState {
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub(super) enum Response {
     State(JobState),
-    Output {
-        stdout: String,
-        stderr: String,
-        truncated: bool,
-    },
+    Output { stdout: Page, stderr: Page },
+    Page(Page),
     Acknowledged,
+}
+#[derive(Deserialize)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+#[derive(Deserialize)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Matches Haskell constructors on the private command relay"
+)]
+enum Position {
+    OutputBeginning,
+    OutputTail,
+    OutputOffset(i64),
+}
+#[derive(Serialize)]
+pub(super) struct Page {
+    text: String,
+    start: i64,
+    end: i64,
+    available_end: i64,
+    retained_start: i64,
+    lost_bytes: i64,
+    finished: bool,
+    lossy: bool,
+    leading_fragment: bool,
+    trailing_fragment: bool,
+}
+impl Page {
+    fn read(
+        buffer: &OutputTail,
+        position: Position,
+        bytes: usize,
+        finished: bool,
+    ) -> Result<Self, (StatusCode, String)> {
+        let offset = match position {
+            Position::OutputBeginning => Some(0),
+            Position::OutputTail => None,
+            Position::OutputOffset(n) => {
+                Some(u64::try_from(n).map_err(|_| failure("negative output position"))?)
+            }
+        };
+        let page = buffer.page(offset, bytes);
+        let text = String::from_utf8_lossy(&page.bytes);
+        Ok(Self {
+            lossy: matches!(text, std::borrow::Cow::Owned(_)),
+            text: text.into_owned(),
+            start: i64::try_from(page.start).map_err(failure)?,
+            end: i64::try_from(page.end).map_err(failure)?,
+            available_end: i64::try_from(page.available_end).map_err(failure)?,
+            retained_start: i64::try_from(page.retained_start).map_err(failure)?,
+            lost_bytes: i64::try_from(page.lost_bytes).map_err(failure)?,
+            finished,
+            leading_fragment: page.leading_fragment,
+            trailing_fragment: page.trailing_fragment,
+        })
+    }
 }
 struct Job {
     spec: Spec,
@@ -89,8 +145,10 @@ struct Job {
     stdout: OutputTail,
     stderr: OutputTail,
     expired: bool,
-    truncated: bool,
     cancelled: bool,
+    stdout_closed: bool,
+    stderr_closed: bool,
+    pending_finish: Option<JobState>,
 }
 #[derive(Default)]
 struct JobsState {
@@ -113,14 +171,40 @@ impl Jobs {
             return true;
         }
         let Ok(bytes) = STANDARD.decode(&notification.delta_base64) else {
+            job.phase.send_replace(JobState::Failed {
+                detail: "invalid command output encoding".into(),
+            });
+            Self::retain_completed(&mut state, &notification.process_id);
             return true;
         };
-        let buffer = match notification.stream {
-            CommandExecOutputStream::Stdout => &mut job.stdout,
-            CommandExecOutputStream::Stderr => &mut job.stderr,
+        let (buffer, closed) = match notification.stream {
+            CommandExecOutputStream::Stdout => (&mut job.stdout, &mut job.stdout_closed),
+            CommandExecOutputStream::Stderr => (&mut job.stderr, &mut job.stderr_closed),
         };
+        if *closed {
+            return true;
+        }
         buffer.push(&bytes);
-        job.truncated |= notification.cap_reached;
+        *closed = notification.end_of_stream.is_some();
+        // Hosted commands disable the app-server cap. Missing chunks must not
+        // silently acquire authoritative positions.
+        if notification.cap_reached
+            || matches!(
+                notification.end_of_stream,
+                Some(CommandExecOutputEnd::Capped | CommandExecOutputEnd::DrainTimeout)
+            )
+        {
+            job.pending_finish = Some(JobState::Failed {
+                detail: "command output stream ended without complete capture".into(),
+            });
+        }
+        if job.stdout_closed
+            && job.stderr_closed
+            && let Some(phase) = job.pending_finish.take()
+        {
+            job.phase.send_replace(phase);
+            Self::retain_completed(&mut state, &notification.process_id);
+        }
         true
     }
 
@@ -130,31 +214,40 @@ impl Jobs {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(job) = state.jobs.get_mut(id) {
-            let phase = match response {
-                Ok(response) => {
-                    job.stdout = OutputTail::default();
-                    job.stderr = OutputTail::default();
-                    job.stdout.push(response.stdout.as_bytes());
-                    job.stderr.push(response.stderr.as_bytes());
-                    job.truncated |=
-                        response.stdout.len() >= STREAM_CAP || response.stderr.len() >= STREAM_CAP;
+            if !matches!(*job.phase.borrow(), JobState::Starting) {
+                return;
+            }
+            let phase = match (job.pending_finish.take(), response) {
+                (Some(failure @ JobState::Failed { .. }), _) => failure,
+                (_, Ok(response)) => {
+                    // Stream notifications precede completion on the owning connection.
+                    // Retain their byte positions rather than replacing them with the
+                    // response's bounded, decoded tails.
                     JobState::Finished {
                         exit_code: response.exit_code,
                         cancelled: job.cancelled,
                     }
                 }
-                Err(detail) => JobState::Failed { detail },
+                (_, Err(detail)) => JobState::Failed { detail },
             };
-            job.phase.send_replace(phase);
-            state.completed.push_back(id.to_owned());
-            while state.completed.len() > RETAINED_JOBS {
-                if let Some(old) = state.completed.pop_front()
-                    && let Some(job) = state.jobs.get_mut(&old)
-                {
-                    job.stdout = OutputTail::default();
-                    job.stderr = OutputTail::default();
-                    job.expired = true;
-                }
+            if job.stdout_closed && job.stderr_closed || matches!(phase, JobState::Failed { .. }) {
+                job.phase.send_replace(phase);
+                Self::retain_completed(&mut state, id);
+            } else {
+                job.pending_finish = Some(phase);
+            }
+        }
+    }
+
+    fn retain_completed(state: &mut JobsState, id: &str) {
+        state.completed.push_back(id.to_owned());
+        while state.completed.len() > RETAINED_JOBS {
+            if let Some(old) = state.completed.pop_front()
+                && let Some(job) = state.jobs.get_mut(&old)
+            {
+                job.stdout = OutputTail::default();
+                job.stderr = OutputTail::default();
+                job.expired = true;
             }
         }
     }
@@ -216,8 +309,10 @@ pub(super) async fn dispatch(
                     stdout: OutputTail::default(),
                     stderr: OutputTail::default(),
                     expired: false,
-                    truncated: false,
                     cancelled: false,
+                    stdout_closed: false,
+                    stderr_closed: false,
+                    pending_finish: None,
                 },
             );
             size
@@ -291,13 +386,35 @@ pub(super) async fn dispatch(
             if job.expired {
                 return Err(failure("retained command output expired"));
             }
+            let finished = matches!(*job.phase.borrow(), JobState::Finished { .. });
             return Ok(Json(Response::Output {
-                stdout: String::from_utf8_lossy(&job.stdout.read(bytes / 2)).into_owned(),
-                stderr: String::from_utf8_lossy(&job.stderr.read(bytes / 2)).into_owned(),
-                truncated: job.truncated
-                    || job.stdout.truncated(bytes / 2)
-                    || job.stderr.truncated(bytes / 2),
+                stdout: Page::read(&job.stdout, Position::OutputTail, bytes, finished)?,
+                stderr: Page::read(&job.stderr, Position::OutputTail, bytes, finished)?,
             }));
+        }
+        Operation::Read { stream, position } => {
+            let state = target
+                .commands
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let job = state
+                .jobs
+                .get(&id)
+                .ok_or_else(|| failure("output expired"))?;
+            if job.expired {
+                return Err(failure("retained command output expired"));
+            }
+            let buffer = match stream {
+                Stream::Stdout => &job.stdout,
+                Stream::Stderr => &job.stderr,
+            };
+            return Ok(Json(Response::Page(Page::read(
+                buffer,
+                position,
+                8192,
+                matches!(*job.phase.borrow(), JobState::Finished { .. }),
+            )?)));
         }
         Operation::Input { text } => ClientRequest::CommandExecWrite {
             request_id: request_id(),
@@ -375,4 +492,137 @@ pub(super) async fn dispatch(
         .map_err(failure)?
         .map_err(|error| failure(error.message))?;
     Ok(Json(Response::Acknowledged))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jobs() -> Jobs {
+        let jobs = Jobs::default();
+        jobs.0.lock().unwrap().jobs.insert(
+            "test".into(),
+            Job {
+                spec: Spec {
+                    argv: vec!["true".into()],
+                    directory: None,
+                    environment: vec![],
+                    memory: 256,
+                    input: Input::Closed,
+                },
+                phase: watch::channel(JobState::Starting).0,
+                stdout: OutputTail::default(),
+                stderr: OutputTail::default(),
+                expired: false,
+                cancelled: false,
+                stdout_closed: false,
+                stderr_closed: false,
+                pending_finish: None,
+            },
+        );
+        jobs
+    }
+
+    fn output(jobs: &Jobs, stream: CommandExecOutputStream, bytes: &[u8], end_of_stream: bool) {
+        assert!(jobs.output(&CommandExecOutputDeltaNotification {
+            process_id: "test".into(),
+            stream,
+            delta_base64: STANDARD.encode(bytes),
+            cap_reached: false,
+            end_of_stream: end_of_stream.then_some(CommandExecOutputEnd::Complete),
+        }));
+    }
+
+    #[test]
+    fn completion_waits_for_both_streams_in_either_delivery_order() {
+        for response_first in [false, true] {
+            let jobs = jobs();
+            output(&jobs, CommandExecOutputStream::Stdout, b"first\n", false);
+            let before = jobs.0.lock().unwrap().jobs["test"]
+                .stdout
+                .page(Some(0), 8192);
+            let finish = || {
+                jobs.finish(
+                    "test",
+                    Ok(CommandExecResponse {
+                        exit_code: 0,
+                        stdout: "ignored-response-tail".into(),
+                        stderr: String::new(),
+                    }),
+                )
+            };
+            if response_first {
+                finish();
+            }
+            assert!(matches!(
+                *jobs.0.lock().unwrap().jobs["test"].phase.borrow(),
+                JobState::Starting
+            ));
+            output(&jobs, CommandExecOutputStream::Stdout, b"last\n", true);
+            assert!(matches!(
+                *jobs.0.lock().unwrap().jobs["test"].phase.borrow(),
+                JobState::Starting
+            ));
+            output(&jobs, CommandExecOutputStream::Stderr, b"", true);
+            if !response_first {
+                finish();
+            }
+            let state = jobs.0.lock().unwrap();
+            let job = &state.jobs["test"];
+            assert!(matches!(
+                *job.phase.borrow(),
+                JobState::Finished { exit_code: 0, .. }
+            ));
+            assert_eq!(job.stdout.page(Some(before.end), 8192).bytes, b"last\n");
+            assert_eq!(state.completed.len(), 1);
+        }
+    }
+
+    #[test]
+    fn incomplete_stream_end_cannot_become_successful_output() {
+        for end in [
+            CommandExecOutputEnd::Capped,
+            CommandExecOutputEnd::DrainTimeout,
+        ] {
+            let jobs = jobs();
+            jobs.finish(
+                "test",
+                Ok(CommandExecResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            );
+            assert!(jobs.output(&CommandExecOutputDeltaNotification {
+                process_id: "test".into(),
+                stream: CommandExecOutputStream::Stdout,
+                delta_base64: STANDARD.encode(b"partial"),
+                cap_reached: false,
+                end_of_stream: Some(end),
+            }));
+            output(&jobs, CommandExecOutputStream::Stderr, b"", true);
+            let state = jobs.0.lock().unwrap();
+            assert!(matches!(
+                *state.jobs["test"].phase.borrow(),
+                JobState::Failed { .. }
+            ));
+            assert_eq!(state.jobs["test"].stdout.read(8192), b"partial");
+            assert_eq!(state.completed.len(), 1);
+        }
+    }
+
+    #[test]
+    fn page_rendering_reports_loss_and_preserves_valid_unicode() {
+        let mut tail = OutputTail::default();
+        tail.push("αβ\n".as_bytes());
+        let page = Page::read(&tail, Position::OutputBeginning, 8192, true).unwrap();
+        assert_eq!(page.text, "αβ\n");
+        assert!(!page.lossy);
+        tail.push(&vec![b'x'; OutputTail::CAPACITY]);
+        let page = Page::read(&tail, Position::OutputBeginning, 8192, true).unwrap();
+        assert_eq!(page.lost_bytes, 5);
+        assert_eq!(page.retained_start, 5);
+        assert!(page.trailing_fragment);
+        assert!(Page::read(&tail, Position::OutputOffset(-1), 8192, true).is_err());
+    }
 }

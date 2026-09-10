@@ -71,6 +71,7 @@ export type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
 export type { CollaborationModeMask } from "./CollaborationModeMask";
 export type { CommandAction } from "./CommandAction";
 export type { CommandExecOutputDeltaNotification } from "./CommandExecOutputDeltaNotification";
+export type { CommandExecOutputEnd } from "./CommandExecOutputEnd";
 export type { CommandExecOutputStream } from "./CommandExecOutputStream";
 export type { CommandExecParams } from "./CommandExecParams";
 export type { CommandExecResizeParams } from "./CommandExecResizeParams";
