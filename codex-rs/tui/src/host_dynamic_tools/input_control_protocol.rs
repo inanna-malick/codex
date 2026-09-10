@@ -244,6 +244,7 @@ mod tests {
     use super::*;
 
     const GOLDEN_JSON: &str = "{\"producerId\":\"run-7/inbox-2/actor-3.1\",\"sequence\":9,\"purpose\":\"assignment\",\"mode\":\"queueOnly\",\"target\":{\"conversation\":\"00000000-0000-0000-0000-000000000004\",\"actor\":\"actor-3.1\",\"correlation\":\"request-5\"},\"payload\":[104,101,108,108,111],\"contentDigest\":\"282cff748dac084436730b60201fc26b7b9b4f2ccfbbbf4cbd6966e7fc4d5cd9\"}";
+    const COMPACTED_RESPONSE_JSON: &str = r#"{"binding":{"protocolVersion":4,"launchId":"launch-1","instanceId":"instance-2","generation":7,"nonce":"nonce-3"},"outcome":"compacted"}"#;
 
     #[test]
     fn golden_vector_rejects_changed_canonical_mode_before_admission() {
@@ -279,5 +280,15 @@ mod tests {
         actual.generation = expected.generation;
         actual.nonce = "wrong".into();
         assert_eq!(expected.validate(&actual), Err(BindingError::Nonce));
+    }
+
+    #[test]
+    fn compacted_outcome_matches_host_wire_vector() {
+        let response: Response = serde_json::from_str(COMPACTED_RESPONSE_JSON).unwrap();
+        assert_eq!(response.outcome, Outcome::Compacted);
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            COMPACTED_RESPONSE_JSON
+        );
     }
 }
