@@ -9,6 +9,8 @@ use codex_utils_pty::spawn_pty_process;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
@@ -134,7 +136,7 @@ fn spawn_host(
     Ok((receiver, task))
 }
 
-fn post_input(socket: &Path, path: &str, payload: &Value) -> Result<String> {
+fn post_input_response(socket: &Path, path: &str, payload: &Value) -> Result<(String, String)> {
     let body = serde_json::to_vec(payload)?;
     let deadline = Instant::now() + Duration::from_secs(/*secs*/ 10);
     let mut stream = loop {
@@ -155,7 +157,43 @@ fn post_input(socket: &Path, path: &str, payload: &Value) -> Result<String> {
     stream.write_all(&body)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    Ok(response.lines().next().unwrap_or_default().to_string())
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, body)| body.to_string());
+    Ok((status, body))
+}
+
+fn post_input(socket: &Path, path: &str, payload: &Value) -> Result<String> {
+    Ok(post_input_response(socket, path, payload)?.0)
+}
+
+fn host_input_digest(
+    mode: u8,
+    conversation: &str,
+    actor: &str,
+    correlation: Option<&str>,
+    payload: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tidepool-interactive-input-v1\0");
+    digest.update([mode]);
+    for field in [conversation.as_bytes(), actor.as_bytes()] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    match correlation {
+        Some(value) => {
+            digest.update([1]);
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update((payload.len() as u64).to_be_bytes());
+    digest.update(payload);
+    let bytes: [u8; 32] = digest.finalize().into();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn wait_for_output(
@@ -176,11 +214,11 @@ async fn wait_for_output(
     .with_context(|| format!("TUI output timed out waiting for {expected:?}: {captured}"))?
 }
 
-fn rollout_contains_correlated_input(root: &Path, client_id: &str) -> Result<bool> {
+fn rollout_contains_user_message(root: &Path, message: &str) -> Result<bool> {
     for entry in std::fs::read_dir(root)? {
         let path = entry?.path();
         if path.is_dir() {
-            if rollout_contains_correlated_input(&path, client_id)? {
+            if rollout_contains_user_message(&path, message)? {
                 return Ok(true);
             }
         } else if path
@@ -195,7 +233,7 @@ fn rollout_contains_correlated_input(root: &Path, client_id: &str) -> Result<boo
                     record["type"] == "event_msg"
                         && record["payload"]["type"] == "item_completed"
                         && record["payload"]["item"]["type"] == "UserMessage"
-                        && record["payload"]["item"]["client_id"] == client_id
+                        && record["payload"]["item"].to_string().contains(message)
                 })
             {
                 return Ok(true);
@@ -339,16 +377,19 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
         .context("resumed application instance")?;
     assert_ne!(resumed_instance, first_instance);
 
+    let binding = |instance: &str| {
+        json!({
+            "protocolVersion": 4,
+            "launchId": "launch-test",
+            "instanceId": instance,
+            "generation": 1,
+            "nonce": "nonce-test",
+        })
+    };
     let query = |instance: &str| {
         json!({
             "operation": "query",
-            "binding": {
-                "protocolVersion": 4,
-                "launchId": "launch-test",
-                "instanceId": instance,
-                "generation": 1,
-                "nonce": "nonce-test",
-            },
+            "binding": binding(instance),
             "producer_id": "run/inbox/actor-1.1",
             "sequence": 1,
         })
@@ -370,18 +411,54 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
         "HTTP/1.1 200 OK"
     );
 
-    let client_id = "native-fixture-input-1";
+    let bind = json!({"operation": "bind", "binding": binding(resumed_instance)});
+    let (status, body) = post_input_response(&resumed_input_socket, "/v1/input/control", &bind)?;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body)?["outcome"],
+        json!("admitted")
+    );
+
+    let message = b"hosted correction";
+    let submit = json!({
+        "operation": "submit",
+        "binding": binding(resumed_instance),
+        "envelope": {
+            "producerId": "run/inbox/actor-1.1",
+            "sequence": 1,
+            "purpose": "requestUpdate",
+            "mode": "startOrSteer",
+            "target": {
+                "conversation": thread_id,
+                "actor": "actor-1.1",
+                "correlation": "request-7",
+            },
+            "payload": message,
+            "contentDigest": host_input_digest(1, thread_id, "actor-1.1", Some("request-7"), message),
+        }
+    });
     let status = tokio::task::spawn_blocking({
         let input_socket = resumed_input_socket.clone();
-        let payload = json!({
-            "threadId": thread_id,
-            "clientUserMessageId": client_id,
-            "message": "hosted correction",
-        });
-        move || post_input(&input_socket, "/v1/input", &payload)
+        let submit = submit.clone();
+        move || post_input(&input_socket, "/v1/input/control", &submit)
     })
     .await??;
-    assert_eq!(status, "HTTP/1.1 202 Accepted");
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let invalid = [0xff];
+    let mut invalid_submit = submit.clone();
+    invalid_submit["envelope"]["sequence"] = json!(2);
+    invalid_submit["envelope"]["payload"] = json!(invalid);
+    invalid_submit["envelope"]["contentDigest"] = json!(host_input_digest(
+        1,
+        thread_id,
+        "actor-1.1",
+        Some("request-7"),
+        &invalid,
+    ));
+    assert_eq!(
+        post_input(&resumed_input_socket, "/v1/input/control", &invalid_submit,)?,
+        "HTTP/1.1 422 Unprocessable Entity"
+    );
     wait_for_output(&mut resumed_output, &mut captured, "hosted answer").await?;
 
     let requests = provider
@@ -396,7 +473,23 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
             .contains("hosted correction"),
         "host input did not reach the provider: {second_request}"
     );
-    assert!(rollout_contains_correlated_input(&codex_home, client_id)?);
+    assert!(rollout_contains_user_message(
+        &codex_home,
+        "hosted correction"
+    )?);
+    let acknowledge = json!({
+        "operation": "acknowledge",
+        "binding": binding(resumed_instance),
+        "producer_id": "run/inbox/actor-1.1",
+        "through_sequence": 1,
+    });
+    let (status, body) =
+        post_input_response(&resumed_input_socket, "/v1/input/control", &acknowledge)?;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body)?["outcome"],
+        json!("presented")
+    );
 
     resumed.session.request_terminate();
     if tokio::time::timeout(Duration::from_secs(/*secs*/ 10), resumed.exit_rx)

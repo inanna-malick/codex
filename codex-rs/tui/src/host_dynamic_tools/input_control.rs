@@ -189,12 +189,21 @@ async fn control(
             })?;
             let target_json = serde_json::to_string(&envelope.target)
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-            let payload = String::from_utf8(envelope.payload).map_err(|_| {
+            let message = String::from_utf8(envelope.payload).map_err(|_| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "hosted input payload is not utf-8".to_string(),
                 )
             })?;
+            let payload =
+                serde_json::to_string(&codex_protocol::turn_input::TurnInput::UserInput {
+                    content: vec![codex_protocol::user_input::UserInput::Text {
+                        text: message,
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                })
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
             let purpose = envelope.purpose.as_str().to_string();
             let mode = envelope.mode.as_str().to_string();
             protocol_outcome(
