@@ -686,6 +686,8 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::spawn_cancellable_host;
+#[cfg(all(test, unix))]
+pub(crate) use tests::spawn_cancellable_host_with_input;
 #[cfg(test)]
 pub(crate) use tests::spawn_host;
 #[cfg(all(test, unix))]

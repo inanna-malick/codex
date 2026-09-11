@@ -152,6 +152,26 @@ pub(crate) fn spawn_cancellable_host(
     mpsc::Receiver<RecordedRequest>,
     std::thread::JoinHandle<std::io::Result<()>>,
 )> {
+    spawn_cancellable_host_configured(socket_path, None)
+}
+
+pub(crate) fn spawn_cancellable_host_with_input(
+    socket_path: &std::path::Path,
+    input_control_socket: std::path::PathBuf,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_cancellable_host_configured(socket_path, Some(input_control_socket))
+}
+
+fn spawn_cancellable_host_configured(
+    socket_path: &std::path::Path,
+    input_control_socket: Option<std::path::PathBuf>,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
     let listener = UnixListener::bind(socket_path)?;
     let (request_tx, request_rx) = mpsc::channel();
     let cancelled = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -163,6 +183,7 @@ pub(crate) fn spawn_cancellable_host(
             let request_tx = request_tx.clone();
             let cancelled = cancelled.clone();
             let cancellation_attempts = cancellation_attempts.clone();
+            let input_control_socket = input_control_socket.clone();
             handlers.push(std::thread::spawn(move || {
                 let request = read_request(&stream)?;
                 request_tx
@@ -191,6 +212,7 @@ pub(crate) fn spawn_cancellable_host(
                                 }]
                             }],
                             "scope": "primaryThread",
+                            "inputControlSocket": input_control_socket,
                             "launchId": "launch-test",
                             "inputControlNonce": "nonce-test",
                         }))?,
