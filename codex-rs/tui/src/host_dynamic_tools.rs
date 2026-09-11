@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+mod command_output;
 mod commands;
 mod completions;
 #[cfg(unix)]

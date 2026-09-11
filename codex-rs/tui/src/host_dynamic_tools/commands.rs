@@ -1,4 +1,5 @@
 //! Private command control through the owning TUI's existing app-server connection.
+use super::command_output::RetainedOutput;
 use super::input_control::InputTarget;
 use axum::Json;
 use axum::extract::State;
@@ -16,7 +17,6 @@ use codex_app_server_protocol::CommandExecTerminalSize;
 use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecWriteParams;
 use codex_app_server_protocol::RequestId;
-use codex_utils_pty::OutputTail;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const RETAINED_JOBS: usize = 32;
+const RETAINED_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,7 +112,7 @@ pub(super) struct Page {
 }
 impl Page {
     fn read(
-        buffer: &OutputTail,
+        buffer: &RetainedOutput,
         position: Position,
         bytes: usize,
         finished: bool,
@@ -123,7 +124,7 @@ impl Page {
                 Some(u64::try_from(n).map_err(|_| failure("negative output position"))?)
             }
         };
-        let page = buffer.page(offset, bytes);
+        let page = buffer.page(offset, bytes).map_err(failure)?;
         let text = String::from_utf8_lossy(&page.bytes);
         Ok(Self {
             lossy: matches!(text, std::borrow::Cow::Owned(_)),
@@ -142,8 +143,8 @@ impl Page {
 struct Job {
     spec: Spec,
     phase: watch::Sender<JobState>,
-    stdout: OutputTail,
-    stderr: OutputTail,
+    stdout: RetainedOutput,
+    stderr: RetainedOutput,
     expired: bool,
     cancelled: bool,
     stdout_closed: bool,
@@ -154,6 +155,7 @@ struct Job {
 struct JobsState {
     jobs: HashMap<String, Job>,
     completed: VecDeque<String>,
+    retained_bytes: usize,
 }
 #[derive(Clone, Default)]
 pub(super) struct Jobs(Arc<Mutex<JobsState>>);
@@ -177,14 +179,28 @@ impl Jobs {
             Self::retain_completed(&mut state, &notification.process_id);
             return true;
         };
+        if match notification.stream {
+            CommandExecOutputStream::Stdout => job.stdout_closed,
+            CommandExecOutputStream::Stderr => job.stderr_closed,
+        } {
+            return true;
+        }
+        let growth = match notification.stream {
+            CommandExecOutputStream::Stdout => job.stdout.growth(bytes.len()),
+            CommandExecOutputStream::Stderr => job.stderr.growth(bytes.len()),
+        };
+        Self::make_room(&mut state, growth);
+        let available = RETAINED_BYTES.saturating_sub(state.retained_bytes);
+        let Some(job) = state.jobs.get_mut(&notification.process_id) else {
+            return false;
+        };
         let (buffer, closed) = match notification.stream {
             CommandExecOutputStream::Stdout => (&mut job.stdout, &mut job.stdout_closed),
             CommandExecOutputStream::Stderr => (&mut job.stderr, &mut job.stderr_closed),
         };
-        if *closed {
-            return true;
-        }
-        buffer.push(&bytes);
+        let before = buffer.retained_len();
+        buffer.push(&bytes, before.saturating_add(available));
+        let after = buffer.retained_len();
         *closed = notification.end_of_stream.is_some();
         // Hosted commands disable the app-server cap. Missing chunks must not
         // silently acquire authoritative positions.
@@ -198,11 +214,21 @@ impl Jobs {
                 detail: "command output stream ended without complete capture".into(),
             });
         }
-        if job.stdout_closed
-            && job.stderr_closed
-            && let Some(phase) = job.pending_finish.take()
-        {
+        let finished = job.stdout_closed && job.stderr_closed;
+        let phase = if finished {
+            job.pending_finish.take()
+        } else {
+            None
+        };
+        let settled = phase.is_some();
+        if let Some(phase) = phase {
             job.phase.send_replace(phase);
+        }
+        state.retained_bytes = state
+            .retained_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        if settled {
             Self::retain_completed(&mut state, &notification.process_id);
         }
         true
@@ -239,15 +265,31 @@ impl Jobs {
         }
     }
 
+    fn make_room(state: &mut JobsState, additional: usize) {
+        while state.retained_bytes.saturating_add(additional) > RETAINED_BYTES {
+            let Some(old) = state.completed.pop_front() else {
+                break;
+            };
+            Self::expire_output(state, &old);
+        }
+    }
+
+    fn expire_output(state: &mut JobsState, id: &str) {
+        if let Some(job) = state.jobs.get_mut(id) {
+            state.retained_bytes = state
+                .retained_bytes
+                .saturating_sub(job.stdout.retained_len() + job.stderr.retained_len());
+            job.stdout = RetainedOutput::default();
+            job.stderr = RetainedOutput::default();
+            job.expired = true;
+        }
+    }
+
     fn retain_completed(state: &mut JobsState, id: &str) {
         state.completed.push_back(id.to_owned());
         while state.completed.len() > RETAINED_JOBS {
-            if let Some(old) = state.completed.pop_front()
-                && let Some(job) = state.jobs.get_mut(&old)
-            {
-                job.stdout = OutputTail::default();
-                job.stderr = OutputTail::default();
-                job.expired = true;
+            if let Some(old) = state.completed.pop_front() {
+                Self::expire_output(state, &old);
             }
         }
     }
@@ -306,8 +348,8 @@ pub(super) async fn dispatch(
                 Job {
                     spec: spec.clone(),
                     phase: watch::channel(JobState::Starting).0,
-                    stdout: OutputTail::default(),
-                    stderr: OutputTail::default(),
+                    stdout: RetainedOutput::default(),
+                    stderr: RetainedOutput::default(),
                     expired: false,
                     cancelled: false,
                     stdout_closed: false,
@@ -371,8 +413,10 @@ pub(super) async fn dispatch(
             return Ok(Json(Response::State(phase.borrow().clone())));
         }
         Operation::Output { bytes } => {
-            if bytes > 65536 {
-                return Err(failure("output reads are bounded to 65536 bytes"));
+            if bytes > 1024 * 1024 {
+                return Err(failure(
+                    "output reads are bounded to 1048576 bytes per stream",
+                ));
             }
             let state = target
                 .commands
@@ -388,8 +432,8 @@ pub(super) async fn dispatch(
             }
             let finished = matches!(*job.phase.borrow(), JobState::Finished { .. });
             return Ok(Json(Response::Output {
-                stdout: Page::read(&job.stdout, Position::OutputTail, bytes, finished)?,
-                stderr: Page::read(&job.stderr, Position::OutputTail, bytes, finished)?,
+                stdout: Page::read(&job.stdout, Position::OutputBeginning, bytes, finished)?,
+                stderr: Page::read(&job.stderr, Position::OutputBeginning, bytes, finished)?,
             }));
         }
         Operation::Read { stream, position } => {
@@ -412,7 +456,7 @@ pub(super) async fn dispatch(
             return Ok(Json(Response::Page(Page::read(
                 buffer,
                 position,
-                8192,
+                64 * 1024,
                 matches!(*job.phase.borrow(), JobState::Finished { .. }),
             )?)));
         }
@@ -511,8 +555,8 @@ mod tests {
                     input: Input::Closed,
                 },
                 phase: watch::channel(JobState::Starting).0,
-                stdout: OutputTail::default(),
-                stderr: OutputTail::default(),
+                stdout: RetainedOutput::default(),
+                stderr: RetainedOutput::default(),
                 expired: false,
                 cancelled: false,
                 stdout_closed: false,
@@ -540,7 +584,8 @@ mod tests {
             output(&jobs, CommandExecOutputStream::Stdout, b"first\n", false);
             let before = jobs.0.lock().unwrap().jobs["test"]
                 .stdout
-                .page(Some(0), 8192);
+                .page(Some(0), 8192)
+                .unwrap();
             let finish = || {
                 jobs.finish(
                     "test",
@@ -573,7 +618,10 @@ mod tests {
                 *job.phase.borrow(),
                 JobState::Finished { exit_code: 0, .. }
             ));
-            assert_eq!(job.stdout.page(Some(before.end), 8192).bytes, b"last\n");
+            assert_eq!(
+                job.stdout.page(Some(before.end), 8192).unwrap().bytes,
+                b"last\n"
+            );
             assert_eq!(state.completed.len(), 1);
         }
     }
@@ -606,23 +654,65 @@ mod tests {
                 *state.jobs["test"].phase.borrow(),
                 JobState::Failed { .. }
             ));
-            assert_eq!(state.jobs["test"].stdout.read(8192), b"partial");
+            assert_eq!(
+                state.jobs["test"].stdout.page(Some(0), 8192).unwrap().bytes,
+                b"partial"
+            );
             assert_eq!(state.completed.len(), 1);
         }
     }
 
     #[test]
+    fn quota_evicts_completed_output_before_limiting_active_jobs() {
+        let jobs = jobs();
+        output(&jobs, CommandExecOutputStream::Stdout, b"live", false);
+        let mut state = jobs.0.lock().unwrap();
+        let mut completed = Job {
+            spec: state.jobs["test"].spec.clone(),
+            phase: watch::channel(JobState::Finished {
+                exit_code: 0,
+                cancelled: false,
+            })
+            .0,
+            stdout: RetainedOutput::default(),
+            stderr: RetainedOutput::default(),
+            expired: false,
+            cancelled: false,
+            stdout_closed: true,
+            stderr_closed: true,
+            pending_finish: None,
+        };
+        completed.stdout.push(b"old log", RETAINED_BYTES);
+        state.retained_bytes += completed.stdout.retained_len();
+        state.jobs.insert("done".into(), completed);
+        state.completed.push_back("done".into());
+        let live_bytes = state.jobs["test"].stdout.retained_len();
+        Jobs::make_room(&mut state, RETAINED_BYTES - live_bytes);
+        assert!(state.jobs["done"].expired);
+        assert!(!state.jobs["test"].expired);
+        assert_eq!(state.retained_bytes, live_bytes);
+        assert_eq!(state.jobs["done"].stdout.retained_len(), 0);
+        assert_eq!(
+            state.jobs["test"].stdout.page(Some(0), 64).unwrap().bytes,
+            b"live"
+        );
+    }
+
+    #[test]
     fn page_rendering_reports_loss_and_preserves_valid_unicode() {
-        let mut tail = OutputTail::default();
-        tail.push("αβ\n".as_bytes());
+        let mut tail = RetainedOutput::default();
+        tail.push("αβ\n".as_bytes(), RETAINED_BYTES);
         let page = Page::read(&tail, Position::OutputBeginning, 8192, true).unwrap();
         assert_eq!(page.text, "αβ\n");
         assert!(!page.lossy);
-        tail.push(&vec![b'x'; OutputTail::CAPACITY]);
+        tail.push(
+            &vec![b'x'; codex_utils_pty::OutputTail::CAPACITY],
+            codex_utils_pty::OutputTail::CAPACITY,
+        );
         let page = Page::read(&tail, Position::OutputBeginning, 8192, true).unwrap();
-        assert_eq!(page.lost_bytes, 5);
-        assert_eq!(page.retained_start, 5);
-        assert!(page.trailing_fragment);
+        assert_eq!(page.lost_bytes, 0);
+        assert_eq!(page.retained_start, 0);
+        assert_eq!(page.text, "αβ\n");
         assert!(Page::read(&tail, Position::OutputOffset(-1), 8192, true).is_err());
     }
 }

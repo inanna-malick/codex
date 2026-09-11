@@ -13,11 +13,16 @@ impl OutputTail {
     pub const CAPACITY: usize = 256 * 1024;
 
     pub fn push(&mut self, bytes: &[u8]) {
+        self.push_limited(bytes, Self::CAPACITY);
+    }
+
+    /// Retain at most the owner's remaining allowance while still advancing positions.
+    pub fn push_limited(&mut self, bytes: &[u8], allowance: usize) {
         let drop = self
             .bytes
             .len()
             .saturating_add(bytes.len())
-            .saturating_sub(Self::CAPACITY);
+            .saturating_sub(allowance.min(Self::CAPACITY));
         self.total = self.total.saturating_add(bytes.len() as u64);
         if drop != 0 {
             let preceding = if drop <= self.bytes.len() {
@@ -31,6 +36,14 @@ impl OutputTail {
         let retained_drop = drop.min(self.bytes.len());
         self.bytes.drain(..retained_drop);
         self.bytes.extend(&bytes[drop - retained_drop..]);
+    }
+
+    pub fn total_len(&self) -> u64 {
+        self.total
+    }
+
+    pub fn retained_len(&self) -> usize {
+        self.bytes.len()
     }
 
     pub fn read(&self, limit: usize) -> Vec<u8> {
@@ -59,25 +72,47 @@ pub struct OutputWindow {
     pub trailing_fragment: bool,
 }
 
+/// One contiguous retained segment, possibly followed by a retention gap.
+/// Positions always address the original byte stream, independently of decoding.
+pub struct OutputSegment<'a> {
+    pub bytes: &'a [u8],
+    pub start: u64,
+    pub available_end: u64,
+    pub leading_fragment: bool,
+}
+
 impl OutputTail {
     /// `None` selects a tail; an offset selects a forward page. Reads never consume.
     pub fn page(&self, offset: Option<u64>, limit: usize) -> OutputWindow {
-        let first = self.total - self.bytes.len() as u64;
-        let requested = offset.unwrap_or_else(|| self.total.saturating_sub(limit as u64));
-        let mut start = requested.max(first).min(self.total);
-        let mut index = (start - first) as usize;
-        let mut end = (index + limit).min(self.bytes.len());
-        // A tail prefers its first complete line when one fits within this window.
+        let bytes: Vec<_> = self.bytes.iter().copied().collect();
+        OutputSegment {
+            bytes: &bytes,
+            start: self.total - bytes.len() as u64,
+            available_end: self.total,
+            leading_fragment: self.first_is_fragment,
+        }
+        .page(offset, limit)
+    }
+}
+
+impl OutputSegment<'_> {
+    /// Page one segment without splitting valid UTF-8 or hiding an absent prefix.
+    pub fn page(&self, offset: Option<u64>, limit: usize) -> OutputWindow {
+        let requested = offset.unwrap_or_else(|| self.available_end.saturating_sub(limit as u64));
+        let mut start = requested
+            .max(self.start)
+            .min(self.start + self.bytes.len() as u64);
+        let mut index = (start - self.start) as usize;
+        let mut end = index.saturating_add(limit).min(self.bytes.len());
         if offset.is_none()
             && index > 0
             && self.bytes.get(index - 1) != Some(&b'\n')
-            && let Some(newline) = self.bytes.iter().skip(index).position(|b| *b == b'\n')
+            && let Some(newline) = self.bytes[index..].iter().position(|b| *b == b'\n')
             && index + newline + 1 < end
         {
             index += newline + 1;
-            start = first + index as u64;
+            start = self.start + index as u64;
         }
-        // Do not cut a valid UTF-8 sequence. Invalid bytes remain visible to decoding.
         if end < self.bytes.len() {
             while end > index && self.bytes[end] & 0xc0 == 0x80 {
                 end -= 1;
@@ -85,35 +120,22 @@ impl OutputTail {
         }
         if offset.is_some()
             && end < self.bytes.len()
-            && let Some(newline) = self
-                .bytes
-                .iter()
-                .skip(index)
-                .take(end - index)
-                .enumerate()
-                .filter_map(|(i, b)| (*b == b'\n').then_some(i))
-                .next_back()
+            && let Some(newline) = self.bytes[index..end].iter().rposition(|b| *b == b'\n')
         {
             end = index + newline + 1;
         }
         let leading_fragment = if index == 0 {
-            self.first_is_fragment
+            self.leading_fragment
         } else {
             self.bytes[index - 1] != b'\n'
         };
         OutputWindow {
-            bytes: self
-                .bytes
-                .iter()
-                .skip(index)
-                .take(end - index)
-                .copied()
-                .collect(),
+            bytes: self.bytes[index..end].to_vec(),
             start,
-            end: first + end as u64,
-            available_end: self.total,
-            retained_start: first,
-            lost_bytes: first.saturating_sub(requested),
+            end: self.start + end as u64,
+            available_end: self.available_end,
+            retained_start: self.start,
+            lost_bytes: self.start.saturating_sub(requested),
             leading_fragment: index < end && leading_fragment,
             trailing_fragment: end > index && self.bytes[end - 1] != b'\n',
         }

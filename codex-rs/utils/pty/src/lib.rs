@@ -1,6 +1,7 @@
 mod output_tail;
 pub mod pipe;
 mod process;
+pub use output_tail::OutputSegment;
 pub use output_tail::OutputTail;
 pub use output_tail::OutputWindow;
 pub mod process_group;
