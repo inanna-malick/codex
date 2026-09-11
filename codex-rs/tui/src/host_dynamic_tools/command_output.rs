@@ -74,7 +74,13 @@ impl RetainedOutput {
     // The owning Jobs mutex serializes reads and writes, including this file cursor.
     pub(super) fn page(&self, offset: Option<u64>, limit: usize) -> io::Result<OutputWindow> {
         let Some(offset) = offset.filter(|offset| *offset < self.prefix_len as u64) else {
-            return Ok(self.tail.page(offset, limit));
+            let mut page = self.tail.page(offset, limit);
+            if self.prefix_len > 0 {
+                // The tail's start is not the owner's earliest retained byte.
+                // Actual gaps remain explicit in lost_bytes and page positions.
+                page.retained_start = 0;
+            }
+            return Ok(page);
         };
         let base = offset.saturating_sub(1);
         let count = (self.prefix_len as u64 - base).min(limit.saturating_add(5) as u64) as usize;

@@ -13,6 +13,9 @@ fn complete_output_survives_tail_rotation_and_repeated_reads() {
         (0, data.len() as u64, 0)
     );
     assert_eq!(output.page(Some(0), 1024 * 1024).unwrap().bytes, page.bytes);
+    let tail = output.page(None, 65536).unwrap();
+    assert!(tail.start > 0);
+    assert_eq!((tail.retained_start, tail.lost_bytes), (0, 0));
 }
 
 #[test]
@@ -27,6 +30,7 @@ fn prefix_and_tail_expose_the_gap_without_stopping_positions() {
     let gap = output.page(Some(first.end), 64).unwrap();
     assert_eq!(gap.lost_bytes, 50);
     assert_eq!(gap.start, first.end + 50);
+    assert_eq!(gap.retained_start, 0);
     assert!(gap.leading_fragment && gap.trailing_fragment);
     output.push(b"\nlast\n", allowance);
     assert_eq!(output.page(None, 6).unwrap().bytes, b"last\n");
@@ -47,6 +51,7 @@ fn no_allowance_still_drains_and_reports_lost_bytes() {
     let page = output.page(Some(0), 65536).unwrap();
     assert_eq!(page.bytes, b"later");
     assert_eq!(page.lost_bytes, 10);
+    assert_eq!(page.retained_start, 10);
 }
 
 #[test]
