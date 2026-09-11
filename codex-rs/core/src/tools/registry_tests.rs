@@ -309,34 +309,26 @@ fn registry_preserves_external_winners_and_trusted_synthetic_order() {
 }
 
 #[test]
-fn reserved_command_tools_reject_external_runtimes_without_a_builtin() {
-    let handler = |tool_name| Arc::new(TestHandler { tool_name }) as Arc<dyn CoreToolRuntime>;
-    let mut registry = ToolRegistry::default();
-
-    for reserved_name in ["exec_command", "shell_command"] {
-        let tool_name = codex_tools::ToolName::plain(reserved_name);
-        let namespaced_tool_name = codex_tools::ToolName::namespaced("client", reserved_name);
-
-        assert!(!registry.register_external(handler(tool_name.clone())));
-        assert!(
-            !registry
-                .register_external_with_exposure(handler(tool_name.clone()), ToolExposure::Direct)
-        );
-        assert!(
-            !registry.register_external(handler(codex_tools::ToolName::namespaced(
-                DEFAULT_FUNCTION_NAMESPACE,
-                reserved_name,
-            )))
-        );
-        assert!(registry.tool(&tool_name).is_none());
-        assert_eq!(registry.first_collision(), None);
-
-        let namespaced_handler = handler(namespaced_tool_name.clone());
-        assert!(registry.register_external(Arc::clone(&namespaced_handler)));
+fn command_tools_accept_external_runtimes_without_a_builtin() {
+    for name in ["exec_command", "shell_command", "write_stdin"] {
+        let tool_name = codex_tools::ToolName::plain(name);
+        let runtime = Arc::new(TestHandler {
+            tool_name: tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let mut registry = ToolRegistry::default();
+        assert!(registry.register_external(Arc::clone(&runtime)));
         assert!(
             registry
-                .tool(&namespaced_tool_name)
-                .is_some_and(|runtime| Arc::ptr_eq(&runtime, &namespaced_handler))
+                .tool(&tool_name)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &runtime))
+        );
+        assert_eq!(registry.first_collision(), None);
+        assert!(!registry.register_external(Arc::new(TestHandler {
+            tool_name: codex_tools::ToolName::namespaced(DEFAULT_FUNCTION_NAMESPACE, name),
+        })));
+        assert_eq!(
+            registry.first_collision(),
+            Some(&tool_name.with_default_namespace())
         );
     }
 }

@@ -1081,6 +1081,56 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
 }
 
 #[tokio::test]
+async fn hosted_shell_tools_replace_disabled_native_tools() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ShellTool, /*enabled*/ false);
+            update_turn_settings_for_test(turn, |settings| {
+                Arc::make_mut(&mut settings.model_info).apply_patch_tool_type =
+                    Some(ApplyPatchToolType::Freeform);
+            });
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![
+                dynamic_tool(
+                    /*namespace*/ None,
+                    "exec_command",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    /*namespace*/ None,
+                    "write_stdin",
+                    /*defer_loading*/ false,
+                ),
+                custom_dynamic_tool(
+                    /*namespace*/ None, "bash", /*defer_loading*/ false,
+                ),
+                custom_dynamic_tool(
+                    /*namespace*/ None, "haskell", /*defer_loading*/ false,
+                ),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plan.assert_visible_contains(&[
+        "exec_command",
+        "write_stdin",
+        "bash",
+        "haskell",
+        "apply_patch",
+    ]);
+    plan.assert_registered_contains(&[
+        "exec_command",
+        "write_stdin",
+        "bash",
+        "haskell",
+        "apply_patch",
+    ]);
+    plan.assert_registered_lacks(&["shell_command"]);
+}
+
+#[tokio::test]
 async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
     let plan = probe_with(
         duplicate_primary_environment,
