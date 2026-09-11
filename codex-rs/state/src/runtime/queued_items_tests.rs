@@ -6,6 +6,9 @@ use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use sqlx::migrate::Migrator;
 use std::borrow::Cow;
+use std::future::Future;
+use std::time::Duration;
+use tokio::time::timeout;
 
 async fn runtime_with_thread() -> (Arc<StateRuntime>, ThreadId) {
     let home = unique_temp_dir();
@@ -33,6 +36,184 @@ fn host_operation(thread_id: ThreadId, producer_id: &str, sequence: u64) -> Host
         content_digest: "digest-v1".to_string(),
         payload: r#"{"host":true}"#.to_string(),
     }
+}
+
+async fn completes_after_independent_writer<T>(
+    writer_runtime: &Arc<StateRuntime>,
+    operation: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
+    let writer = writer_runtime
+        .thread_queue()
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    let mut operation = tokio::spawn(operation);
+    assert!(
+        timeout(Duration::from_millis(100), &mut operation)
+            .await
+            .is_err(),
+        "operation should wait for the existing writer"
+    );
+    writer.commit().await.unwrap();
+    timeout(Duration::from_secs(5), operation)
+        .await
+        .expect("operation should resume after the writer commits")
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn read_modify_write_operations_wait_for_an_independent_writer() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let other = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string())
+        .await
+        .unwrap();
+
+    let first = runtime
+        .thread_queue()
+        .enqueue(thread_id, r#"{"first":true}"#)
+        .await
+        .unwrap();
+    let second = runtime
+        .thread_queue()
+        .enqueue(thread_id, r#"{"second":true}"#)
+        .await
+        .unwrap();
+    let ordered_ids = vec![second.id.clone(), first.id.clone()];
+    completes_after_independent_writer(&other, {
+        let runtime = Arc::clone(&runtime);
+        let ordered_ids = ordered_ids.clone();
+        async move {
+            runtime
+                .thread_queue()
+                .reorder(thread_id, &ordered_ids)
+                .await
+        }
+    })
+    .await;
+    assert!(
+        runtime
+            .thread_queue()
+            .delete(thread_id, &first.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .thread_queue()
+            .delete(thread_id, &second.id)
+            .await
+            .unwrap()
+    );
+
+    let admitted = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    assert!(matches!(
+        completes_after_independent_writer(&other, {
+            let runtime = Arc::clone(&runtime);
+            let admitted = admitted.clone();
+            async move { runtime.thread_queue().admit_host_input(&admitted).await }
+        })
+        .await,
+        HostInputAdmission::Admitted(_)
+    ));
+    let admitted_item = runtime
+        .thread_queue()
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        HostInputState::Dispatching,
+        completes_after_independent_writer(&other, {
+            let runtime = Arc::clone(&runtime);
+            let item_id = admitted_item.id.clone();
+            async move {
+                runtime
+                    .thread_queue()
+                    .claim_host_queue_item(thread_id, &item_id)
+                    .await
+            }
+        })
+        .await
+        .unwrap()
+        .state
+    );
+
+    let withdrawn = host_operation(thread_id, "run/inbox/actor-2.1", 1);
+    runtime
+        .thread_queue()
+        .admit_host_input(&withdrawn)
+        .await
+        .unwrap();
+    assert!(matches!(
+        completes_after_independent_writer(&other, {
+            let runtime = Arc::clone(&runtime);
+            let withdrawn = withdrawn.clone();
+            async move {
+                runtime
+                    .thread_queue()
+                    .withdraw_host_input(thread_id, &withdrawn.producer_id, withdrawn.sequence)
+                    .await
+            }
+        })
+        .await,
+        Some(HostInputWithdrawal::Withdrawn(_))
+    ));
+
+    let acknowledged = host_operation(thread_id, "run/inbox/actor-3.1", 1);
+    runtime
+        .thread_queue()
+        .admit_host_input(&acknowledged)
+        .await
+        .unwrap();
+    let acknowledged_item = runtime
+        .thread_queue()
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ MAX_QUEUE_ITEMS)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == format!("host:{}:1", acknowledged.producer_id))
+        .unwrap();
+    runtime
+        .thread_queue()
+        .claim_host_queue_item(thread_id, &acknowledged_item.id)
+        .await
+        .unwrap();
+    runtime
+        .thread_queue()
+        .confirm_host_input_presented(
+            thread_id,
+            &acknowledged_item.id,
+            &acknowledged.producer_id,
+            acknowledged.sequence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        HostInputState::Presented,
+        completes_after_independent_writer(&other, {
+            let runtime = Arc::clone(&runtime);
+            let acknowledged = acknowledged.clone();
+            async move {
+                runtime
+                    .thread_queue()
+                    .acknowledge_host_input(
+                        thread_id,
+                        &acknowledged.producer_id,
+                        acknowledged.sequence,
+                    )
+                    .await
+            }
+        })
+        .await
+        .unwrap()
+        .state
+    );
 }
 
 #[tokio::test]

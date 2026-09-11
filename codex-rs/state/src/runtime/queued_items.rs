@@ -11,6 +11,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// SQLite-backed persistence for durable, thread-scoped user messages.
+///
+/// Read-modify-write transactions reserve the SQLite writer before reading so
+/// their snapshot cannot become stale before the first write.
 #[derive(Clone)]
 pub struct SqliteQueueStore {
     pub(super) pool: Arc<SqlitePool>,
@@ -167,7 +170,7 @@ impl SqliteQueueStore {
     }
 
     pub async fn reorder(&self, thread_id: ThreadId, ordered_ids: &[String]) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, queue_order FROM queued_items
              WHERE thread_id = ? ORDER BY queue_order",
@@ -211,7 +214,7 @@ impl SqliteQueueStore {
         &self,
         operation: &HostInputOperation,
     ) -> anyhow::Result<HostInputAdmission> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(record) = read_host_input(
             transaction.as_mut(),
             &operation.producer_id,
@@ -328,7 +331,7 @@ impl SqliteQueueStore {
         thread_id: ThreadId,
         queue_item_id: &str,
     ) -> anyhow::Result<Option<HostInputRecord>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let key: Option<(String, i64)> = sqlx::query_as(
             "SELECT producer_id, sequence FROM host_input_operations
              WHERE thread_id = ? AND queue_item_id = ? AND state = 'ready'",
@@ -424,7 +427,7 @@ impl SqliteQueueStore {
         producer_id: &str,
         through_sequence: u64,
     ) -> anyhow::Result<Option<HostInputRecord>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous: Option<i64> = sqlx::query_scalar(
             "SELECT through_sequence FROM host_input_producer_watermarks
              WHERE producer_id = ?",
@@ -527,7 +530,7 @@ impl SqliteQueueStore {
         producer_id: &str,
         sequence: u64,
     ) -> anyhow::Result<Option<HostInputWithdrawal>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(mut record) = read_host_input(transaction.as_mut(), producer_id, sequence).await?
         else {
             sqlx::query(

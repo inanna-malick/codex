@@ -2,6 +2,8 @@ use super::*;
 use crate::runtime::test_support::unique_temp_dir;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
+use tokio::time::timeout;
 
 async fn runtime(home: &std::path::Path) -> Arc<StateRuntime> {
     StateRuntime::init(
@@ -185,5 +187,99 @@ async fn unresolved_capacity_still_allows_idempotent_existing_registration() {
             .unwrap_err()
             .to_string()
             .contains("too many unresolved")
+    );
+}
+
+#[tokio::test]
+async fn read_modify_write_operations_wait_for_an_independent_writer() {
+    let home = unique_temp_dir();
+    let first = runtime(&home).await;
+    let second = runtime(&home).await;
+    let thread_id = ThreadId::new();
+    let registered = HostToolCompletionKey {
+        thread_id,
+        context_call_id: "registered".to_string(),
+    };
+    first
+        .thread_queue()
+        .register_host_tool_completion(&registered)
+        .await
+        .unwrap();
+    first
+        .thread_queue()
+        .mark_host_tool_completion_ready(&registered)
+        .await
+        .unwrap();
+
+    let writer = second
+        .thread_queue()
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    let mut transition = {
+        let first = Arc::clone(&first);
+        let registered = registered.clone();
+        tokio::spawn(async move {
+            first
+                .thread_queue()
+                .acknowledge_host_tool_completion(&registered)
+                .await
+        })
+    };
+    assert!(
+        timeout(Duration::from_millis(100), &mut transition)
+            .await
+            .is_err(),
+        "transition should wait for the existing writer"
+    );
+    writer.commit().await.unwrap();
+
+    assert_eq!(
+        HostToolCompletionState::Acknowledged,
+        timeout(Duration::from_secs(5), transition)
+            .await
+            .expect("transition should resume after the writer commits")
+            .unwrap()
+            .unwrap()
+            .state
+    );
+
+    let writer = second
+        .thread_queue()
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    let new_key = HostToolCompletionKey {
+        thread_id,
+        context_call_id: "new".to_string(),
+    };
+    let mut registration = {
+        let first = Arc::clone(&first);
+        let new_key = new_key.clone();
+        tokio::spawn(async move {
+            first
+                .thread_queue()
+                .register_host_tool_completion(&new_key)
+                .await
+        })
+    };
+    assert!(
+        timeout(Duration::from_millis(100), &mut registration)
+            .await
+            .is_err(),
+        "registration should wait for the existing writer"
+    );
+    writer.commit().await.unwrap();
+
+    assert_eq!(
+        HostToolCompletionState::Pending,
+        timeout(Duration::from_secs(5), registration)
+            .await
+            .expect("registration should resume after the writer commits")
+            .unwrap()
+            .unwrap()
+            .state
     );
 }

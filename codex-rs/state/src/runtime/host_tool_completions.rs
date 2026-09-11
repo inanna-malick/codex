@@ -12,7 +12,7 @@ impl SqliteQueueStore {
         &self,
         key: &HostToolCompletionKey,
     ) -> anyhow::Result<HostToolCompletionRecord> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(record) = read_host_tool_completion(transaction.as_mut(), key).await? {
             transaction.rollback().await?;
             return Ok(record);
@@ -118,7 +118,7 @@ async fn transition_host_tool_completion(
     from: HostToolCompletionState,
     to: HostToolCompletionState,
 ) -> anyhow::Result<HostToolCompletionRecord> {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let record = read_host_tool_completion(transaction.as_mut(), key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("host tool completion is not registered"))?;
