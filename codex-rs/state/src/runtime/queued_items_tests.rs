@@ -312,6 +312,16 @@ async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
         .await
         .unwrap();
 
+    queue
+        .confirm_host_input_presented(
+            thread_id,
+            &queued[0].id,
+            &operation.producer_id,
+            operation.sequence,
+        )
+        .await
+        .unwrap();
+
     let record = queue
         .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
         .await
@@ -347,6 +357,88 @@ async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn acknowledgement_preserves_nonterminal_evidence_and_terminal_prefix() {
+    for state in [
+        HostInputState::Ready,
+        HostInputState::Dispatching,
+        HostInputState::Unknown,
+    ] {
+        let (runtime, thread_id) = runtime_with_thread().await;
+        let queue = runtime.thread_queue();
+        let first = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+        let second = host_operation(thread_id, &first.producer_id, 2);
+        queue.admit_host_input(&first).await.unwrap();
+        queue
+            .withdraw_host_input(thread_id, &first.producer_id, 1)
+            .await
+            .unwrap();
+        queue.admit_host_input(&second).await.unwrap();
+        let queued = queue
+            .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+            .await
+            .unwrap();
+        if state != HostInputState::Ready {
+            queue
+                .claim_host_queue_item(thread_id, &queued[0].id)
+                .await
+                .unwrap();
+        }
+        if state == HostInputState::Unknown {
+            queue
+                .withdraw_host_input(thread_id, &second.producer_id, 2)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            queue
+                .acknowledge_host_input(thread_id, &second.producer_id, 2)
+                .await
+                .is_err(),
+            "{state:?} cannot be promoted or compacted by host acknowledgement"
+        );
+        assert_eq!(
+            Some(HostInputRecord {
+                operation: first.clone(),
+                state: HostInputState::Withdrawn
+            }),
+            queue
+                .observe_host_input(&first.producer_id, 1)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            Some(HostInputRecord {
+                operation: second,
+                state
+            }),
+            queue
+                .observe_host_input(&first.producer_id, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            queued,
+            queue
+                .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+                .await
+                .unwrap()
+        );
+        // The failed prefix transaction must leave even its terminal row unacknowledged.
+        assert_eq!(
+            Some(HostInputRecord {
+                operation: first.clone(),
+                state: HostInputState::Withdrawn
+            }),
+            queue
+                .acknowledge_host_input(thread_id, &first.producer_id, 1)
+                .await
+                .unwrap()
+        );
+    }
 }
 
 #[tokio::test]

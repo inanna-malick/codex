@@ -459,24 +459,18 @@ impl SqliteQueueStore {
         let expected = usize::try_from(i64::try_from(through_sequence)? - first + 1)?;
         if rows.len() != expected
             || rows.iter().enumerate().any(|(offset, (sequence, state))| {
-                *sequence != first + offset as i64 || state == "ready"
+                *sequence != first + offset as i64
+                    || !matches!(
+                        HostInputState::from_str(state),
+                        Ok(HostInputState::Presented
+                            | HostInputState::Withdrawn
+                            | HostInputState::Rejected)
+                    )
             })
         {
             transaction.rollback().await?;
             anyhow::bail!("host input acknowledgement is not a contiguous terminal prefix");
         }
-        sqlx::query(
-            "UPDATE host_input_operations SET state = 'presented', updated_at_ms = ?
-             WHERE thread_id = ? AND producer_id = ? AND sequence BETWEEN ? AND ?
-               AND state IN ('dispatching', 'unknown')",
-        )
-        .bind(datetime_to_epoch_millis(Utc::now()))
-        .bind(thread_id.to_string())
-        .bind(producer_id)
-        .bind(first)
-        .bind(i64::try_from(through_sequence)?)
-        .execute(transaction.as_mut())
-        .await?;
         let record = read_host_input(transaction.as_mut(), producer_id, through_sequence).await?;
         sqlx::query(
             "DELETE FROM host_input_withdrawal_tombstones
