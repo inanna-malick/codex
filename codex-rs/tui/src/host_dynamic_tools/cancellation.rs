@@ -154,22 +154,49 @@ impl ActiveHostedCall {
 
     #[cfg(unix)]
     async fn cancel_once(&self) -> Result<(), String> {
-        let outcome = async {
-            let response =
-                send_request(self.client.post(endpoint(CANCEL_PATH)).json(&self.request)).await?;
-            require_status(response.status(), reqwest::StatusCode::OK)?;
-            let body = read_bounded(response, MAX_CALL_RESPONSE_BYTES).await?;
-            serde_json::from_slice::<CancellationResponse>(&body).map_err(|error| {
-                color_eyre::eyre::eyre!(
-                    "invalid exact hosted workbench cancellation response: {error}"
-                )
-            })
-        }
-        .await
-        .map_err(|error| format!("exact hosted workbench cancellation is unconfirmed: {error:#}"));
-        match outcome {
-            Ok(outcome) => self.apply_outcome(outcome).await,
-            Err(error) => self.record_uncertain(error).await,
+        loop {
+            let outcome = async {
+                let response =
+                    send_request(self.client.post(endpoint(CANCEL_PATH)).json(&self.request))
+                        .await?;
+                require_status(response.status(), reqwest::StatusCode::OK)?;
+                let body = read_bounded(response, MAX_CALL_RESPONSE_BYTES).await?;
+                serde_json::from_slice::<CancellationResponse>(&body).map_err(|error| {
+                    color_eyre::eyre::eyre!(
+                        "invalid exact hosted workbench cancellation response: {error}"
+                    )
+                })
+            }
+            .await
+            .map_err(|error| {
+                format!("exact hosted workbench cancellation is unconfirmed: {error:#}")
+            });
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => return self.record_uncertain(error).await,
+            };
+            let pending = matches!(
+                &outcome,
+                CancellationResponse::Unconfirmed { .. }
+                    | CancellationResponse::NotSleeping { .. }
+                    | CancellationResponse::UnknownEvaluation { .. }
+            );
+            self.apply_outcome(outcome).await?;
+            if !pending {
+                return Ok(());
+            }
+
+            let notified = self.changed.notified();
+            match &*self.phase.lock().await {
+                SettlementPhase::AwaitingTerminal(_) => {}
+                SettlementPhase::Terminal(_) | SettlementPhase::Resolved => return Ok(()),
+                SettlementPhase::Uncertain(detail) => return Err(detail.clone()),
+                SettlementPhase::Running | SettlementPhase::Cancelling => continue,
+            }
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
         }
     }
 
@@ -197,16 +224,18 @@ impl ActiveHostedCall {
                 Ok(())
             }
             CancellationResponse::NotSleeping { execution } => {
-                self.record_uncertain(format!(
-                    "host could not prove that {execution} reached a terminal sleep outcome"
+                self.await_terminal(format!(
+                    "host observed {execution} before it reached cancellable sleep; terminal settlement is pending"
                 ))
-                .await
+                .await;
+                Ok(())
             }
             CancellationResponse::UnknownEvaluation { execution } => {
-                self.record_uncertain(format!(
-                    "host no longer recognizes exact workbench evaluation {execution}"
+                self.await_terminal(format!(
+                    "host has not yet observed exact workbench evaluation {execution}; terminal settlement is pending"
                 ))
-                .await
+                .await;
+                Ok(())
             }
         }
     }

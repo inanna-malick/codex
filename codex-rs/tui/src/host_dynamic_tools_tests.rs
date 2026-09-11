@@ -155,12 +155,14 @@ pub(crate) fn spawn_cancellable_host(
     let listener = UnixListener::bind(socket_path)?;
     let (request_tx, request_rx) = mpsc::channel();
     let cancelled = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let cancellation_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let task = std::thread::spawn(move || {
         let mut handlers = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             let (stream, _) = listener.accept()?;
             let request_tx = request_tx.clone();
             let cancelled = cancelled.clone();
+            let cancellation_attempts = cancellation_attempts.clone();
             handlers.push(std::thread::spawn(move || {
                 let request = read_request(&stream)?;
                 request_tx
@@ -207,14 +209,27 @@ pub(crate) fn spawn_cancellable_host(
                         write_response(&stream, "200 OK", &serde_json::to_vec(&terminal)?)
                     }
                     CANCEL_PATH => {
-                        write_response(
-                            &stream,
-                            "200 OK",
-                            &serde_json::to_vec(&json!({
+                        let attempt =
+                            cancellation_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let response = match attempt {
+                            0 => json!({
+                                "status": "notSleeping",
+                                "execution": "execution-test"
+                            }),
+                            1 => json!({
                                 "status": "unconfirmed",
                                 "execution": "execution-test"
-                            }))?,
-                        )?;
+                            }),
+                            _ => json!({
+                                "status": "cancelled",
+                                "execution": "execution-test",
+                                "reply": terminal
+                            }),
+                        };
+                        write_response(&stream, "200 OK", &serde_json::to_vec(&response)?)?;
+                        if attempt < 2 {
+                            return Ok(());
+                        }
                         let (lock, changed) = &*cancelled;
                         *lock
                             .lock()

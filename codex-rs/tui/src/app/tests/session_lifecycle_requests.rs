@@ -1843,7 +1843,10 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
     assert_eq!(call.path, "/v1/dynamic-tools/call");
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.chat_widget.set_task_running_for_test(true);
+    assert!(
+        !app.chat_widget.is_user_turn_pending_or_running(),
+        "hosted Haskell dispatch can precede the widget's running-turn state"
+    );
     app.chat_widget
         .restore_user_message_to_composer(UserMessage::from("queued-human"));
     app.chat_widget
@@ -1896,6 +1899,17 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
     };
     assert_eq!(completed_id, request_id);
     assert!(!response.success);
+    for expected_attempt in 2..=3 {
+        let retry = host_requests.recv_timeout(std::time::Duration::from_secs(/*secs*/ 5))?;
+        assert_eq!(
+            retry.path, "/v1/dynamic-tools/cancel",
+            "attempt {expected_attempt} must re-observe the same exact evaluation"
+        );
+        assert_eq!(
+            retry.body, cancel.body,
+            "attempt {expected_attempt} must preserve exact cancellation identity"
+        );
+    }
     assert!(
         events.try_recv().is_err(),
         "terminal proof alone must not release queued input"

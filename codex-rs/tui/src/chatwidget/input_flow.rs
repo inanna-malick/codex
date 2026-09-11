@@ -118,9 +118,7 @@ impl ChatWidget {
             && !self.input_queue.suppress_queue_autosend
             && !self.input_queue.rate_limit_recovery_pending;
         if !should_run_now || action != QueuedInputAction::Plain {
-            if self.is_user_turn_pending_or_running() {
-                self.app_event_tx.send(AppEvent::QueuedFollowUpInput);
-            }
+            self.app_event_tx.send(AppEvent::QueuedFollowUpInput);
             self.input_queue
                 .queued_user_messages
                 .push_back(QueuedUserMessage {
