@@ -146,19 +146,42 @@ impl App {
                 request_id,
                 response,
             } => {
-                self.dynamic_tool_tasks.remove(&request_id);
-                match serde_json::to_value(response) {
+                match serde_json::to_value(&response) {
                     Ok(result) => {
                         if let Err(error) = app_server
                             .resolve_server_request(request_id.clone(), result)
                             .await
                         {
                             tracing::warn!(?request_id, %error, "failed to resolve dynamic tool call");
+                        } else if let Some(mut entry) =
+                            self.dynamic_tool_tasks.remove(&request_id)
+                        {
+                            if let Some(settlement) = &entry.settlement
+                                && let Some(host) = app_server.host_dynamic_tools()
+                            {
+                                host.finish_cancellable_call(settlement).await;
+                            }
+                            if let Some(task) = entry.cancellation_task.take() {
+                                task.abort();
+                            }
+                            for op in entry.pending_input {
+                                self.app_event_tx.send(AppEvent::CodexOp(op));
+                            }
                         }
                     }
                     Err(error) => {
                         tracing::warn!(?request_id, %error, "failed to serialize dynamic tool response");
                     }
+                }
+            }
+            AppEvent::QueuedFollowUpInput => {
+                if let Some(entry) = self.dynamic_tool_tasks.values_mut().find(|entry| {
+                    entry.settlement.is_some()
+                        && self.active_thread_id.is_some_and(|thread_id| {
+                            entry.source_thread_id == thread_id.to_string()
+                        })
+                }) {
+                    entry.ensure_cancellation_requested();
                 }
             }
             AppEvent::TaskToolsAvailable { thread_id } => {
@@ -688,6 +711,18 @@ impl App {
                     }
                     self.chat_widget
                         .apply_reserve_fallback_to_pending_turn(&mut op);
+                }
+                if matches!(&op, AppCommand::UserTurn { .. })
+                    && let Some(entry) = self.dynamic_tool_tasks.values_mut().find(|entry| {
+                        entry.settlement.is_some()
+                            && self.active_thread_id.is_some_and(|thread_id| {
+                                entry.source_thread_id == thread_id.to_string()
+                            })
+                    })
+                {
+                    entry.pending_input.push_back(op);
+                    entry.ensure_cancellation_requested();
+                    return Ok(AppRunControl::Continue);
                 }
                 let is_user_turn = matches!(&op, AppCommand::UserTurn { .. });
                 if is_user_turn {
@@ -3192,8 +3227,18 @@ impl App {
         app_server: &mut AppServerSession,
         mode: ExitMode,
     ) -> AppRunControl {
-        for (request_id, (_, task)) in self.dynamic_tool_tasks.drain() {
-            task.abort();
+        for (request_id, entry) in self.dynamic_tool_tasks.drain() {
+            entry.task.abort();
+            if let Some(task) = entry.cancellation_task {
+                task.abort();
+            }
+            if entry.settlement.is_some() {
+                tracing::warn!(
+                    ?request_id,
+                    "leaving exact hosted workbench request unresolved during TUI exit"
+                );
+                continue;
+            }
             let response = crate::dynamic_tools::failure_response(
                 "TUI disconnected while handling a dynamic tool call",
             );

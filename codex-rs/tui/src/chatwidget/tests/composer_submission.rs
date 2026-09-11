@@ -82,7 +82,7 @@ async fn hidden_shell_paste_recalled_from_history_submits_literal_prompt() {
 #[tokio::test]
 async fn hidden_shell_paste_queued_during_turn_submits_literal_prompt() {
     for key in [KeyCode::Tab, KeyCode::Enter] {
-        let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let (mut chat, _app_rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
         chat.thread_id = Some(ThreadId::new());
         handle_turn_started(&mut chat, "turn-1");
         let payload = paste_hidden_shell_payload(&mut chat);
@@ -98,6 +98,24 @@ async fn hidden_shell_paste_queued_during_turn_submits_literal_prompt() {
 
         assert_hidden_shell_payload_is_literal(op_rx.try_recv(), payload);
     }
+}
+
+#[tokio::test]
+async fn tab_queued_follow_up_notifies_app_settlement_gate() {
+    let (mut chat, mut app_rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane
+        .set_composer_text("queued follow-up".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Tab));
+
+    assert!(
+        std::iter::from_fn(|| app_rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::QueuedFollowUpInput)),
+        "real Tab queue action must notify the app settlement gate"
+    );
+    assert_eq!(chat.queued_user_message_texts(), vec!["queued follow-up"]);
 }
 
 #[tokio::test]

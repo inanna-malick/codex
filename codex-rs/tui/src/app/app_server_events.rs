@@ -1,6 +1,7 @@
 //! App-server event stream handling for the TUI app.
 
 use super::App;
+use super::DynamicToolTask;
 use super::ThreadBufferedEvent;
 use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
@@ -25,6 +26,7 @@ use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SubAgentSource;
+use std::collections::VecDeque;
 
 impl App {
     pub(super) fn refresh_mcp_startup_expected_servers_from_config(&mut self) {
@@ -178,8 +180,21 @@ impl App {
         }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
-                if let Some((_, task)) = self.dynamic_tool_tasks.remove(&notification.request_id) {
-                    task.abort();
+                if self
+                    .dynamic_tool_tasks
+                    .get(&notification.request_id)
+                    .is_some_and(|entry| entry.settlement.is_some())
+                {
+                    tracing::warn!(
+                        request_id = ?notification.request_id,
+                        "ignoring uncorrelated resolution while exact hosted workbench settlement is retained"
+                    );
+                } else if let Some(entry) = self.dynamic_tool_tasks.remove(&notification.request_id)
+                {
+                    entry.task.abort();
+                    if let Some(task) = entry.cancellation_task {
+                        task.abort();
+                    }
                 }
                 let notification_thread_id =
                     codex_protocol::ThreadId::from_string(&notification.thread_id).ok();
@@ -421,7 +436,26 @@ impl App {
                         return;
                     }
                     crate::host_dynamic_tools::HostDynamicToolRouting::Forward => {
-                        if self.dynamic_tool_tasks.contains_key(request_id) {
+                        if let Some(entry) = self.dynamic_tool_tasks.get_mut(request_id) {
+                            if !entry.matches_params(params) {
+                                tracing::warn!(
+                                    ?request_id,
+                                    "refusing mismatched replay of an active dynamic-tool request"
+                                );
+                                return;
+                            }
+                            if !entry.pending_input.is_empty() {
+                                entry.ensure_cancellation_requested();
+                            }
+                            let settlement = entry.settlement.clone();
+                            if let Some(settlement) = settlement
+                                && let Some(response) = settlement.terminal_response().await
+                            {
+                                self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                    request_id: request_id.clone(),
+                                    response,
+                                });
+                            }
                             return;
                         }
                         let app_event_tx = self.app_event_tx.clone();
@@ -429,26 +463,75 @@ impl App {
                         let task_request_id = request_id.clone();
                         let source_thread_id = params.thread_id.clone();
                         let params = params.clone();
+                        let settlement = match host
+                            .begin_cancellable_call(
+                                request_id.clone(),
+                                &params,
+                                app_event_tx.clone(),
+                            )
+                            .await
+                        {
+                            Ok(settlement) => settlement,
+                            Err(error) => {
+                                self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                    request_id,
+                                    response: crate::dynamic_tools::failure_response(&error),
+                                });
+                                return;
+                            }
+                        };
+                        let task_settlement = settlement.clone();
+                        let task_params = params.clone();
                         let task = tokio::spawn(async move {
                             let call = tokio::spawn(async move { host.call(&params).await });
-                            let response = match call.await {
-                                Ok(Ok(response)) => response,
+                            match call.await {
+                                Ok(Ok(response)) => {
+                                    if let Some(settlement) = task_settlement {
+                                        settlement.complete_from_call(response).await;
+                                    } else {
+                                        app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                            request_id,
+                                            response,
+                                        });
+                                    }
+                                }
                                 Ok(Err(error)) => {
                                     tracing::warn!(%error, "host dynamic-tool call failed");
-                                    crate::host_dynamic_tools::infrastructure_failure()
+                                    if let Some(settlement) = task_settlement {
+                                        settlement.transport_uncertain(error.to_string()).await;
+                                    } else {
+                                        app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                            request_id,
+                                            response:
+                                                crate::host_dynamic_tools::infrastructure_failure(),
+                                        });
+                                    }
                                 }
                                 Err(error) => {
                                     tracing::warn!(%error, "host dynamic-tool call task terminated");
-                                    crate::host_dynamic_tools::infrastructure_failure()
+                                    if let Some(settlement) = task_settlement {
+                                        settlement.transport_uncertain(error.to_string()).await;
+                                    } else {
+                                        app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                            request_id,
+                                            response:
+                                                crate::host_dynamic_tools::infrastructure_failure(),
+                                        });
+                                    }
                                 }
-                            };
-                            app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                                request_id,
-                                response,
-                            });
+                            }
                         });
-                        self.dynamic_tool_tasks
-                            .insert(task_request_id, (source_thread_id, task));
+                        self.dynamic_tool_tasks.insert(
+                            task_request_id,
+                            DynamicToolTask {
+                                source_thread_id,
+                                params: task_params,
+                                settlement,
+                                pending_input: VecDeque::new(),
+                                cancellation_task: None,
+                                task,
+                            },
+                        );
                         return;
                     }
                 }
@@ -497,6 +580,7 @@ impl App {
                     .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
                     .is_none_or(|thread_id| app_server_client.task_tools_available(thread_id));
             let params = params.clone();
+            let task_params = params.clone();
             let mut thread_start_params =
                 crate::app_server_session::thread_start_params_from_config(
                     &self.config,
@@ -535,8 +619,17 @@ impl App {
                     response,
                 });
             });
-            self.dynamic_tool_tasks
-                .insert(task_request_id, (source_thread_id, task));
+            self.dynamic_tool_tasks.insert(
+                task_request_id,
+                DynamicToolTask {
+                    source_thread_id,
+                    params: task_params,
+                    settlement: None,
+                    pending_input: VecDeque::new(),
+                    cancellation_task: None,
+                    task,
+                },
+            );
             return;
         }
 

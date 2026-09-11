@@ -1018,9 +1018,11 @@ async fn run_ratatui_app(
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
 
-    let host_dynamic_tools =
-        host_dynamic_tools::HostDynamicTools::connect(cli.host_dynamic_tools_socket.clone())
-            .await?;
+    let host_dynamic_tools = host_dynamic_tools::HostDynamicTools::connect_with_state(
+        cli.host_dynamic_tools_socket.clone(),
+        state_db.clone(),
+    )
+    .await?;
 
     tooltips::announcement::prewarm(initial_config.http_client_factory());
 

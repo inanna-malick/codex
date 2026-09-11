@@ -1,6 +1,9 @@
 //! Hosted input reaches this TUI's existing app-server connection. The host owns
 //! the private socket directory; this listener never resumes or creates a thread.
 
+#[allow(dead_code)]
+#[path = "input_control_protocol.rs"]
+pub(super) mod protocol;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
@@ -22,11 +25,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) struct InputControl {
+    thread: ThreadId,
     pub(super) socket: AbsolutePathBuf,
     #[cfg(target_os = "linux")]
     pub(super) commands: super::commands::Jobs,
     shutdown: CancellationToken,
     handle: watch::Sender<AppServerRequestHandle>,
+    binding: std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>>,
 }
 
 impl std::fmt::Debug for InputControl {
@@ -50,6 +55,8 @@ pub(super) struct InputTarget {
     pub(super) commands: super::commands::Jobs,
     pub(super) thread: ThreadId,
     pub(super) handle: watch::Receiver<AppServerRequestHandle>,
+    binding: std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>>,
+    settlement: super::cancellation::InputSettlementGate,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +108,11 @@ async fn present(
             "invalid hosted input identity or payload".to_string(),
         )
     })?;
+    target
+        .settlement
+        .before_input()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
     let handle = target.handle.borrow().clone();
     match tokio::time::timeout(Duration::from_secs(/*secs*/ 60), handle.request(request)).await {
         Ok(Ok(Ok(_))) => Ok(StatusCode::ACCEPTED),
@@ -113,22 +125,195 @@ async fn present(
     }
 }
 
+fn protocol_outcome(
+    outcome: codex_app_server_client::InProcessHostInputOutcome,
+) -> protocol::Outcome {
+    use codex_app_server_client::InProcessHostInputOutcome as Native;
+    match outcome {
+        Native::Admitted => protocol::Outcome::Admitted,
+        Native::Dispatching => protocol::Outcome::Dispatching,
+        Native::Presented => protocol::Outcome::Presented,
+        Native::Withdrawn => protocol::Outcome::Withdrawn,
+        Native::Rejected | Native::Conflict | Native::ProducerSealed | Native::AtCapacity => {
+            protocol::Outcome::Rejected
+        }
+        Native::Unknown => protocol::Outcome::Unknown,
+        Native::Compacted => protocol::Outcome::Compacted,
+        Native::EvidenceUnavailable => protocol::Outcome::EvidenceUnavailable,
+    }
+}
+
+async fn control(
+    State(target): State<InputTarget>,
+    body: Bytes,
+) -> Result<axum::Json<protocol::Response>, (StatusCode, String)> {
+    let request: protocol::Request = serde_json::from_slice(&body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid hosted input control payload".to_string(),
+        )
+    })?;
+    let binding = match &request {
+        protocol::Request::Bind { binding }
+        | protocol::Request::Submit { binding, .. }
+        | protocol::Request::Query { binding, .. }
+        | protocol::Request::Withdraw { binding, .. }
+        | protocol::Request::Seal { binding, .. }
+        | protocol::Request::Acknowledge { binding, .. } => binding.clone(),
+    };
+    target
+        .binding
+        .lock()
+        .await
+        .validate(&binding)
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "stale or foreign native binding".to_string(),
+            )
+        })?;
+    if matches!(&request, protocol::Request::Bind { .. }) {
+        return Ok(axum::Json(protocol::Response {
+            binding,
+            outcome: protocol::Outcome::Admitted,
+        }));
+    }
+    let handle = target.handle.borrow().clone();
+    let native = match handle {
+        AppServerRequestHandle::InProcess(handle) => handle.host_input_control(),
+        AppServerRequestHandle::Remote(_) => None,
+    };
+    let Some(native) = native else {
+        return Ok(axum::Json(protocol::Response {
+            binding,
+            outcome: protocol::Outcome::EvidenceUnavailable,
+        }));
+    };
+    let outcome = match request {
+        protocol::Request::Bind { .. } => unreachable!("bind returned after validation"),
+        protocol::Request::Submit { envelope, .. } => {
+            let envelope = envelope.validate(target.thread).map_err(|_| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "noncanonical hosted input envelope".to_string(),
+                )
+            })?;
+            let target_json = serde_json::to_string(&envelope.target)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            let message = String::from_utf8(envelope.payload).map_err(|_| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "hosted input payload is not utf-8".to_string(),
+                )
+            })?;
+            let payload =
+                serde_json::to_string(&codex_protocol::turn_input::TurnInput::UserInput {
+                    content: vec![codex_protocol::user_input::UserInput::Text {
+                        text: message,
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                })
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            let purpose = envelope.purpose.as_str().to_string();
+            let mode = envelope.mode.as_str().to_string();
+            target
+                .settlement
+                .before_input()
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+            protocol_outcome(
+                native
+                    .submit(codex_app_server_client::InProcessHostInputSubmission {
+                        thread_id: target.thread,
+                        producer_id: envelope.producer_id,
+                        sequence: envelope.sequence,
+                        purpose,
+                        mode,
+                        target_json,
+                        content_digest: envelope.content_digest,
+                        payload,
+                    })
+                    .await
+                    .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?,
+            )
+        }
+        protocol::Request::Query {
+            producer_id,
+            sequence,
+            ..
+        } => protocol_outcome(
+            native
+                .query(&producer_id, sequence)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?,
+        ),
+        protocol::Request::Withdraw {
+            producer_id,
+            sequence,
+            ..
+        } => protocol_outcome(
+            native
+                .withdraw(target.thread, &producer_id, sequence)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?,
+        ),
+        protocol::Request::Seal { producer_id, .. } => {
+            native
+                .seal(target.thread, &producer_id)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+            protocol::Outcome::Withdrawn
+        }
+        protocol::Request::Acknowledge {
+            producer_id,
+            through_sequence,
+            ..
+        } => protocol_outcome(
+            native
+                .acknowledge(target.thread, &producer_id, through_sequence)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?,
+        ),
+    };
+    Ok(axum::Json(protocol::Response { binding, outcome }))
+}
+
 impl InputControl {
-    pub(super) fn update_handle(&self, handle: AppServerRequestHandle) {
+    pub(super) fn update_handle(
+        &self,
+        thread: ThreadId,
+        handle: AppServerRequestHandle,
+    ) -> color_eyre::Result<()> {
+        if thread != self.thread {
+            color_eyre::eyre::bail!("hosted input listener belongs to a different thread");
+        }
         self.handle.send_replace(handle);
+        Ok(())
+    }
+
+    pub(super) fn binding_state(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>> {
+        self.binding.clone()
     }
 
     pub(super) fn start(
         socket: AbsolutePathBuf,
         thread: ThreadId,
         handle: AppServerRequestHandle,
+        binding: protocol::ExpectedBinding,
+        settlement: super::cancellation::InputSettlementGate,
     ) -> std::io::Result<Self> {
         // Bind only a fresh, host-selected path. Never unlink a competing owner.
         let listener = UnixListener::bind(socket.as_path())?;
         let (handle, receiver) = watch::channel(handle);
         #[cfg(target_os = "linux")]
         let commands = super::commands::Jobs::default();
-        let router = Router::new().route("/v1/input", post(present));
+        let binding = std::sync::Arc::new(tokio::sync::Mutex::new(binding));
+        let router = Router::new()
+            .route("/v1/input", post(present))
+            .route("/v1/input/control", post(control));
         #[cfg(target_os = "linux")]
         let router = router.route(
             "/v1/workspace/publication",
@@ -143,6 +328,8 @@ impl InputControl {
                 commands: commands.clone(),
                 thread,
                 handle: receiver,
+                binding: binding.clone(),
+                settlement,
             });
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();
@@ -155,11 +342,13 @@ impl InputControl {
             }
         });
         Ok(Self {
+            thread,
             #[cfg(target_os = "linux")]
             commands,
             socket,
             shutdown,
             handle,
+            binding,
         })
     }
 }

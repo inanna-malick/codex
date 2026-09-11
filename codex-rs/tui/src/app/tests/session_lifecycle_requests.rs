@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
+use crate::chatwidget::UserMessage;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -1638,7 +1639,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
 
     app.dynamic_tool_tasks.insert(
         AppServerRequestId::Integer(105),
-        (thread_id, tokio::spawn(std::future::pending::<()>())),
+        DynamicToolTask::test(thread_id, tokio::spawn(std::future::pending::<()>())),
     );
     assert_matches!(
         app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst)
@@ -1760,6 +1761,187 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
             "arguments": source,
         })
     );
+    host_task.join().expect("host thread panicked")?;
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resolution() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    let socket_dir = tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = socket_dir.path().join("host-cancel.sock");
+    let (host_requests, host_task) =
+        crate::host_dynamic_tools::spawn_cancellable_host(&socket_path)?;
+    let host = crate::host_dynamic_tools::HostDynamicTools::connect(Some(
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&socket_path)?,
+    ))
+    .await?
+    .expect("configured host");
+    let thread_id = ThreadId::new();
+    host.attach_primary(thread_id).await?;
+    assert_eq!(
+        host_requests
+            .recv_timeout(std::time::Duration::from_secs(/*secs*/ 5))?
+            .path,
+        "/v1/dynamic-tools/registration"
+    );
+    assert_eq!(
+        host_requests
+            .recv_timeout(std::time::Duration::from_secs(/*secs*/ 5))?
+            .path,
+        "/v1/dynamic-tools/session"
+    );
+
+    let (app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut app_server = app_server.with_host_dynamic_tools(Some(host));
+    app.active_thread_id = Some(thread_id);
+    let request_id = AppServerRequestId::Integer(702);
+    let params = codex_app_server_protocol::DynamicToolCallParams {
+        context_call_id: Some("context-call".to_string()),
+        thread_id: thread_id.to_string(),
+        turn_id: "turn-host".to_string(),
+        call_id: "call-host".to_string(),
+        namespace: None,
+        tool: "haskell".to_string(),
+        arguments: serde_json::Value::String("watch".to_string()),
+    };
+    assert_matches!(
+        app_server
+            .host_dynamic_tools()
+            .expect("host")
+            .routing(&params),
+        crate::host_dynamic_tools::HostDynamicToolRouting::Forward
+    );
+    app.handle_app_server_event(
+        &app_server,
+        AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
+            request_id: request_id.clone(),
+            params,
+        })),
+    )
+    .await;
+    let call = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if let Ok(request) = host_requests.try_recv() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(call.path, "/v1/dynamic-tools/call");
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    assert!(
+        !app.chat_widget.is_user_turn_pending_or_running(),
+        "hosted Haskell dispatch can precede the widget's running-turn state"
+    );
+    app.chat_widget
+        .restore_user_message_to_composer(UserMessage::from("queued-human"));
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let queued_event =
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv())
+            .await?
+            .expect("real Tab queue action must notify the settlement gate");
+    assert_matches!(queued_event, AppEvent::QueuedFollowUpInput);
+    app.handle_event(&mut tui, &mut app_server, queued_event)
+        .await?;
+
+    let cancel = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if let Ok(request) = host_requests.try_recv() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(cancel.path, "/v1/dynamic-tools/cancel");
+    let application_instance_id = cancel.body["applicationInstanceId"].clone();
+    assert_eq!(
+        cancel.body,
+        serde_json::json!({
+            "protocolVersion": 3,
+            "threadId": thread_id,
+            "turnId": "turn-host",
+            "callId": "call-host",
+            "contextCallId": "context-call",
+            "namespace": null,
+            "launchId": "launch-test",
+            "applicationInstanceId": application_instance_id,
+            "sessionGeneration": 0,
+            "inputControlNonce": "nonce-test"
+        })
+    );
+
+    let completion =
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv())
+            .await?
+            .expect("exact cancellation completion");
+    let AppEvent::DynamicToolCallCompleted {
+        request_id: completed_id,
+        response,
+    } = completion
+    else {
+        panic!("expected original dynamic-tool completion")
+    };
+    assert_eq!(completed_id, request_id);
+    assert!(!response.success);
+    for expected_attempt in 2..=3 {
+        let retry = host_requests.recv_timeout(std::time::Duration::from_secs(/*secs*/ 5))?;
+        assert_eq!(
+            retry.path, "/v1/dynamic-tools/cancel",
+            "attempt {expected_attempt} must re-observe the same exact evaluation"
+        );
+        assert_eq!(
+            retry.body, cancel.body,
+            "attempt {expected_attempt} must preserve exact cancellation identity"
+        );
+    }
+    assert!(
+        events.try_recv().is_err(),
+        "terminal proof alone must not release queued input"
+    );
+
+    app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::DynamicToolCallCompleted {
+            request_id,
+            response,
+        },
+    )
+    .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if recorded_params(&requests, "server/request/response")
+                .last()
+                .is_some_and(|response| response["success"] == false)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        app.chat_widget.queued_user_message_texts(),
+        vec!["queued-human"],
+        "tool settlement must not bypass normal turn completion before inference"
+    );
+
     host_task.join().expect("host thread panicked")?;
     app_server.shutdown().await?;
     proxy.await??;
