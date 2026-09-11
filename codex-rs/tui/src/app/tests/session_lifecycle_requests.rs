@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
+use crate::chatwidget::UserMessage;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -1841,27 +1842,19 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
     .await?;
     assert_eq!(call.path, "/v1/dynamic-tools/call");
 
-    let queued = AppCommand::user_turn(
-        "queued-human".to_string(),
-        Vec::new(),
-        std::env::current_dir()?,
-        AskForApproval::Never,
-        None,
-        "test-model".to_string(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.handle_event(&mut tui, &mut app_server, AppEvent::CodexOp(queued))
+    app.chat_widget.set_task_running_for_test(true);
+    app.chat_widget
+        .restore_user_message_to_composer(UserMessage::from("queued-human"));
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let queued_event =
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv())
+            .await?
+            .expect("real Tab queue action must notify the settlement gate");
+    assert_matches!(queued_event, AppEvent::QueuedFollowUpInput);
+    app.handle_event(&mut tui, &mut app_server, queued_event)
         .await?;
-    assert!(
-        events.try_recv().is_err(),
-        "queued input must not reach inference before cancellation"
-    );
 
     let cancel = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
         loop {
@@ -1929,12 +1922,10 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
         }
     })
     .await?;
-    assert_matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv()).await?,
-        Some(AppEvent::CodexOp(AppCommand::UserTurn {
-            client_user_message_id,
-            ..
-        })) if client_user_message_id == "queued-human"
+    assert_eq!(
+        app.chat_widget.queued_user_message_texts(),
+        vec!["queued-human"],
+        "tool settlement must not bypass normal turn completion before inference"
     );
 
     host_task.join().expect("host thread panicked")?;

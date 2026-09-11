@@ -63,6 +63,7 @@ enum CancellationResponse {
 enum SettlementPhase {
     Running,
     Cancelling,
+    AwaitingTerminal(String),
     Uncertain(String),
     Terminal(DynamicToolCallResponse),
     Resolved,
@@ -130,7 +131,7 @@ impl ActiveHostedCall {
                         *phase = SettlementPhase::Cancelling;
                         true
                     }
-                    SettlementPhase::Cancelling => false,
+                    SettlementPhase::Cancelling | SettlementPhase::AwaitingTerminal(_) => false,
                     SettlementPhase::Terminal(_) => false,
                     SettlementPhase::Resolved => return Ok(()),
                 }
@@ -144,6 +145,7 @@ impl ActiveHostedCall {
                 SettlementPhase::Uncertain(detail) => return Err(detail.clone()),
                 SettlementPhase::Running
                 | SettlementPhase::Cancelling
+                | SettlementPhase::AwaitingTerminal(_)
                 | SettlementPhase::Terminal(_) => {}
             }
             notified.await;
@@ -188,10 +190,11 @@ impl ActiveHostedCall {
                 Ok(())
             }
             CancellationResponse::Unconfirmed { execution } => {
-                self.record_uncertain(format!(
-                    "host reported unconfirmed cancellation for {execution}"
+                self.await_terminal(format!(
+                    "host reported cancellation for {execution} as unconfirmed; terminal settlement is pending"
                 ))
-                .await
+                .await;
+                Ok(())
             }
             CancellationResponse::NotSleeping { execution } => {
                 self.record_uncertain(format!(
@@ -216,6 +219,9 @@ impl ActiveHostedCall {
         ) {
             return;
         }
+        if let SettlementPhase::AwaitingTerminal(detail) = &*phase {
+            tracing::debug!(%detail, "hosted workbench uncertainty reached terminal settlement");
+        }
         *phase = SettlementPhase::Terminal(response.clone());
         self.events.send(AppEvent::DynamicToolCallCompleted {
             request_id: self.request_id.clone(),
@@ -234,6 +240,18 @@ impl ActiveHostedCall {
         Err(detail)
     }
 
+    async fn await_terminal(&self, detail: String) {
+        let mut phase = self.phase.lock().await;
+        if matches!(
+            &*phase,
+            SettlementPhase::Terminal(_) | SettlementPhase::Resolved
+        ) {
+            return;
+        }
+        *phase = SettlementPhase::AwaitingTerminal(detail);
+        self.changed.notify_waiters();
+    }
+
     pub(crate) async fn mark_original_resolved(&self) {
         let mut phase = self.phase.lock().await;
         if matches!(&*phase, SettlementPhase::Terminal(_)) {
@@ -247,6 +265,7 @@ impl ActiveHostedCall {
             SettlementPhase::Terminal(response) => Some(response.clone()),
             SettlementPhase::Running
             | SettlementPhase::Cancelling
+            | SettlementPhase::AwaitingTerminal(_)
             | SettlementPhase::Uncertain(_)
             | SettlementPhase::Resolved => None,
         }
@@ -374,16 +393,20 @@ mod tests {
     #[tokio::test]
     async fn uncertainty_fences_until_retained_terminal_is_resolved() {
         let (call, mut events) = call();
+        call.apply_outcome(CancellationResponse::Unconfirmed {
+            execution: "execution".to_string(),
+        })
+        .await
+        .expect("unconfirmed cancellation keeps waiting for terminal settlement");
+        assert!(call.terminal_response().await.is_none());
+        let waiting_call = call.clone();
+        let mut waiter = tokio::spawn(async move { waiting_call.cancel_before_input().await });
         assert!(
-            call.apply_outcome(CancellationResponse::Unconfirmed {
-                execution: "execution".to_string(),
-            })
-            .await
-            .is_err()
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "unconfirmed cancellation must keep input fenced instead of returning 503"
         );
-        assert!(call.terminal_response().await.is_none());
-        call.transport_uncertain("socket closed".to_string()).await;
-        assert!(call.terminal_response().await.is_none());
 
         let terminal = response("cancelled");
         call.apply_outcome(CancellationResponse::Cancelled {
@@ -409,8 +432,9 @@ mod tests {
         assert_eq!(call.terminal_response().await, Some(terminal));
 
         call.mark_original_resolved().await;
-        call.cancel_before_input()
+        waiter
             .await
+            .expect("input waiter task")
             .expect("input releases only after original resolution");
     }
 

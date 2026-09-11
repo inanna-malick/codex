@@ -412,6 +412,9 @@ pub(crate) enum AppEvent {
         response: DynamicToolCallResponse,
     },
 
+    /// A human follow-up entered the widget queue while the current turn is still active.
+    QueuedFollowUpInput,
+
     /// Register task tools inherited by a dynamically created thread.
     TaskToolsAvailable {
         thread_id: ThreadId,

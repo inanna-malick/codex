@@ -174,6 +174,16 @@ impl App {
                     }
                 }
             }
+            AppEvent::QueuedFollowUpInput => {
+                if let Some(entry) = self.dynamic_tool_tasks.values_mut().find(|entry| {
+                    entry.settlement.is_some()
+                        && self.active_thread_id.is_some_and(|thread_id| {
+                            entry.source_thread_id == thread_id.to_string()
+                        })
+                }) {
+                    entry.ensure_cancellation_requested();
+                }
+            }
             AppEvent::TaskToolsAvailable { thread_id } => {
                 app_server.remember_task_tool_thread(thread_id);
             }

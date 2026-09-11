@@ -211,9 +211,8 @@ pub(crate) fn spawn_cancellable_host(
                             &stream,
                             "200 OK",
                             &serde_json::to_vec(&json!({
-                                "status": "cancelled",
-                                "execution": "execution-test",
-                                "reply": terminal
+                                "status": "unconfirmed",
+                                "execution": "execution-test"
                             }))?,
                         )?;
                         let (lock, changed) = &*cancelled;
