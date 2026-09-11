@@ -55,6 +55,7 @@ pub(super) struct InputTarget {
     pub(super) thread: ThreadId,
     pub(super) handle: watch::Receiver<AppServerRequestHandle>,
     binding: std::sync::Arc<tokio::sync::Mutex<protocol::ExpectedBinding>>,
+    settlement: super::cancellation::InputSettlementGate,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +107,11 @@ async fn present(
             "invalid hosted input identity or payload".to_string(),
         )
     })?;
+    target
+        .settlement
+        .before_input()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
     let handle = target.handle.borrow().clone();
     match tokio::time::timeout(Duration::from_secs(/*secs*/ 60), handle.request(request)).await {
         Ok(Ok(Ok(_))) => Ok(StatusCode::ACCEPTED),
@@ -210,6 +216,11 @@ async fn control(
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
             let purpose = envelope.purpose.as_str().to_string();
             let mode = envelope.mode.as_str().to_string();
+            target
+                .settlement
+                .before_input()
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
             protocol_outcome(
                 native
                     .submit(codex_app_server_client::InProcessHostInputSubmission {
@@ -283,6 +294,7 @@ impl InputControl {
         thread: ThreadId,
         handle: AppServerRequestHandle,
         binding: protocol::ExpectedBinding,
+        settlement: super::cancellation::InputSettlementGate,
     ) -> std::io::Result<Self> {
         // Bind only a fresh, host-selected path. Never unlink a competing owner.
         let listener = UnixListener::bind(socket.as_path())?;
@@ -308,6 +320,7 @@ impl InputControl {
                 thread,
                 handle: receiver,
                 binding: binding.clone(),
+                settlement,
             });
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();

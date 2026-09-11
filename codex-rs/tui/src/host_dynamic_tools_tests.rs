@@ -39,7 +39,7 @@ async fn register_host_tool_completion(
     Ok(())
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecordedRequest {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -144,6 +144,97 @@ pub(crate) fn spawn_host_with_input(
         Duration::ZERO,
         Some(input_control_socket),
     )
+}
+
+pub(crate) fn spawn_cancellable_host(
+    socket_path: &std::path::Path,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = UnixListener::bind(socket_path)?;
+    let (request_tx, request_rx) = mpsc::channel();
+    let cancelled = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let task = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..4 {
+            let (stream, _) = listener.accept()?;
+            let request_tx = request_tx.clone();
+            let cancelled = cancelled.clone();
+            handlers.push(std::thread::spawn(move || {
+                let request = read_request(&stream)?;
+                request_tx
+                    .send(request.clone())
+                    .map_err(std::io::Error::other)?;
+                let terminal = json!({
+                    "contentItems": [{"type": "inputText", "text": "cancelled"}],
+                    "success": false
+                });
+                match request.path.as_str() {
+                    REGISTRATION_PATH => write_response(
+                        &stream,
+                        "200 OK",
+                        &serde_json::to_vec(&json!({
+                            "protocolVersion": 3,
+                            "dynamicTools": [{
+                                "type": "namespace",
+                                "name": "tidepool_actor",
+                                "description": "Tidepool actor workbench",
+                                "modelOnly": true,
+                                "tools": [{
+                                    "type": "custom",
+                                    "name": "haskell",
+                                    "description": "Evaluate Haskell",
+                                    "deferLoading": false
+                                }]
+                            }],
+                            "scope": "primaryThread",
+                            "launchId": "launch-test",
+                            "inputControlNonce": "nonce-test",
+                        }))?,
+                    ),
+                    SESSION_PATH => write_response(&stream, "204 No Content", &[]),
+                    CALL_PATH => {
+                        let (lock, changed) = &*cancelled;
+                        let mut ready = lock
+                            .lock()
+                            .map_err(|_| std::io::Error::other("cancel state poisoned"))?;
+                        while !*ready {
+                            ready = changed
+                                .wait(ready)
+                                .map_err(|_| std::io::Error::other("cancel state poisoned"))?;
+                        }
+                        write_response(&stream, "200 OK", &serde_json::to_vec(&terminal)?)
+                    }
+                    CANCEL_PATH => {
+                        write_response(
+                            &stream,
+                            "200 OK",
+                            &serde_json::to_vec(&json!({
+                                "status": "cancelled",
+                                "execution": "execution-test",
+                                "reply": terminal
+                            }))?,
+                        )?;
+                        let (lock, changed) = &*cancelled;
+                        *lock
+                            .lock()
+                            .map_err(|_| std::io::Error::other("cancel state poisoned"))? = true;
+                        changed.notify_all();
+                        Ok(())
+                    }
+                    _ => write_response(&stream, "404 Not Found", &[]),
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().map_err(|_| {
+                std::io::Error::other("cancellable host request handler panicked")
+            })??;
+        }
+        Ok(())
+    });
+    Ok((request_rx, task))
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+mod cancellation;
 #[cfg(target_os = "linux")]
 mod command_output;
 mod commands;
@@ -6,6 +7,8 @@ mod completions;
 mod input_control;
 #[cfg(target_os = "linux")]
 mod workspace_control;
+
+pub(crate) use cancellation::ActiveHostedCall;
 
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
@@ -31,6 +34,7 @@ const PROTOCOL_VERSION: u32 = 3;
 const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 const SESSION_PATH: &str = "/v1/dynamic-tools/session";
 const CALL_PATH: &str = "/v1/dynamic-tools/call";
+const CANCEL_PATH: &str = "/v1/dynamic-tools/cancel";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // Settlement can wait for the host actor and its shared machine checkout.
@@ -83,6 +87,7 @@ pub(crate) struct HostDynamicTools {
     state_db: StateDbHandle,
     completions: Mutex<completions::HostToolCompletions>,
     settlement_sender: Mutex<Option<tokio::sync::mpsc::Sender<completions::SettlementWork>>>,
+    input_settlement: cancellation::InputSettlementGate,
     disabled: AtomicBool,
     application_instance_id: String,
     session_generation: AtomicU64,
@@ -225,6 +230,7 @@ impl HostDynamicTools {
                 state_db,
                 completions: Mutex::new(completions::HostToolCompletions::default()),
                 settlement_sender: Mutex::new(None),
+                input_settlement: cancellation::InputSettlementGate::default(),
                 disabled: AtomicBool::new(false),
                 application_instance_id: uuid::Uuid::new_v4().to_string(),
                 session_generation: AtomicU64::new(0),
@@ -298,6 +304,7 @@ impl HostDynamicTools {
                         thread_id,
                         handle,
                         binding.clone(),
+                        self.input_settlement.clone(),
                     ) {
                         Ok(listener) => *control = Some(listener),
                         Err(error) => {
@@ -419,6 +426,42 @@ impl HostDynamicTools {
         return send_call(&self.client, params).await;
         #[cfg(not(unix))]
         color_eyre::eyre::bail!("host dynamic tools are unavailable on this platform")
+    }
+
+    pub(crate) async fn begin_cancellable_call(
+        &self,
+        request_id: codex_app_server_protocol::RequestId,
+        params: &DynamicToolCallParams,
+        events: crate::app_event_sender::AppEventSender,
+    ) -> Result<Option<Arc<ActiveHostedCall>>, String> {
+        if params.namespace.as_deref() != Some("tidepool_actor") || params.tool != "haskell" {
+            return Ok(None);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (request_id, events);
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            let call = ActiveHostedCall::new(
+                self.client.clone(),
+                params,
+                request_id,
+                events,
+                self.registration.launch_id.clone(),
+                self.application_instance_id.clone(),
+                self.session_generation.load(Ordering::Acquire),
+                self.registration.input_control_nonce.clone(),
+            );
+            self.input_settlement.activate(&call).await?;
+            Ok(Some(call))
+        }
+    }
+
+    pub(crate) async fn finish_cancellable_call(&self, call: &Arc<ActiveHostedCall>) {
+        call.mark_original_resolved().await;
+        self.input_settlement.clear(call).await;
     }
 
     fn primary_thread_id(&self) -> Option<ThreadId> {
@@ -641,6 +684,8 @@ pub(crate) fn infrastructure_failure() -> DynamicToolCallResponse {
 #[path = "host_dynamic_tools_tests.rs"]
 mod tests;
 
+#[cfg(all(test, unix))]
+pub(crate) use tests::spawn_cancellable_host;
 #[cfg(test)]
 pub(crate) use tests::spawn_host;
 #[cfg(all(test, unix))]

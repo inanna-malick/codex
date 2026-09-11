@@ -100,6 +100,7 @@ use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::FeedbackUploadResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
@@ -632,7 +633,7 @@ pub(crate) struct App {
     pending_app_server_requests: PendingAppServerRequests,
     dynamic_tool_status_updates:
         tokio::sync::broadcast::Sender<codex_app_server_protocol::ThreadStatusChangedNotification>,
-    dynamic_tool_tasks: HashMap<codex_app_server_protocol::RequestId, (String, JoinHandle<()>)>,
+    dynamic_tool_tasks: HashMap<codex_app_server_protocol::RequestId, DynamicToolTask>,
     pending_startup_thread_start: bool,
     /// Keeps protected screens quarantined until initialized chat receives genuine user input.
     startup_protected_input_boundary: bool,
@@ -1050,3 +1051,61 @@ impl Drop for App {
 pub(super) mod test_support;
 #[cfg(test)]
 mod tests;
+struct DynamicToolTask {
+    source_thread_id: String,
+    params: DynamicToolCallParams,
+    settlement: Option<Arc<crate::host_dynamic_tools::ActiveHostedCall>>,
+    pending_input: VecDeque<AppCommand>,
+    cancellation_task: Option<JoinHandle<()>>,
+    task: JoinHandle<()>,
+}
+
+impl DynamicToolTask {
+    fn matches_params(&self, params: &DynamicToolCallParams) -> bool {
+        self.params.thread_id == params.thread_id
+            && self.params.turn_id == params.turn_id
+            && self.params.call_id == params.call_id
+            && self.params.context_call_id == params.context_call_id
+            && self.params.namespace == params.namespace
+            && self.params.tool == params.tool
+            && self.params.arguments == params.arguments
+    }
+
+    fn ensure_cancellation_requested(&mut self) {
+        if self
+            .cancellation_task
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+            && let Some(settlement) = self.settlement.clone()
+        {
+            self.cancellation_task = Some(tokio::spawn(async move {
+                if let Err(error) = settlement.cancel_before_input().await {
+                    tracing::warn!(
+                        %error,
+                        "hosted workbench cancellation remains uncertain; input stays queued"
+                    );
+                }
+            }));
+        }
+    }
+
+    #[cfg(test)]
+    fn test(source_thread_id: String, task: JoinHandle<()>) -> Self {
+        Self {
+            params: DynamicToolCallParams {
+                context_call_id: None,
+                thread_id: source_thread_id.clone(),
+                turn_id: "test-turn".to_string(),
+                call_id: "test-call".to_string(),
+                namespace: None,
+                tool: "test".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+            source_thread_id,
+            settlement: None,
+            pending_input: VecDeque::new(),
+            cancellation_task: None,
+            task,
+        }
+    }
+}

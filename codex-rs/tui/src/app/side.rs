@@ -498,21 +498,27 @@ impl App {
 
     pub(super) async fn discard_thread_local_state(&mut self, thread_id: ThreadId) {
         let app_event_tx = self.app_event_tx.clone();
-        self.dynamic_tool_tasks
-            .retain(|request_id, (source, task)| {
-                if source == &thread_id.to_string() {
-                    app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                        request_id: request_id.clone(),
-                        response: crate::dynamic_tools::failure_response(
-                            "Source task was closed while handling a dynamic tool call",
-                        ),
-                    });
-                    task.abort();
-                    false
-                } else {
-                    true
+        self.dynamic_tool_tasks.retain(|request_id, entry| {
+            if entry.source_thread_id == thread_id.to_string() {
+                if entry.settlement.is_some() {
+                    entry.ensure_cancellation_requested();
+                    return true;
                 }
-            });
+                app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                    request_id: request_id.clone(),
+                    response: crate::dynamic_tools::failure_response(
+                        "Source task was closed while handling a dynamic tool call",
+                    ),
+                });
+                entry.task.abort();
+                if let Some(task) = entry.cancellation_task.take() {
+                    task.abort();
+                }
+                false
+            } else {
+                true
+            }
+        });
         self.abort_thread_event_listener(thread_id);
         self.thread_event_channels.remove(&thread_id);
         self.agents_overview.activity.remove(&thread_id);

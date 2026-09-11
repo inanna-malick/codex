@@ -219,9 +219,17 @@ impl App {
             self.chat_widget.pause_for_disconnect();
             self.startup_pending_protected_request = false;
             self.abort_all_thread_event_listeners();
-            for (_, (_, task)) in self.dynamic_tool_tasks.drain() {
-                task.abort();
-            }
+            self.dynamic_tool_tasks.retain(|_, entry| {
+                if entry.settlement.is_some() {
+                    true
+                } else {
+                    entry.task.abort();
+                    if let Some(task) = entry.cancellation_task.take() {
+                        task.abort();
+                    }
+                    false
+                }
+            });
         }
         true
     }
