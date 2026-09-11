@@ -96,6 +96,7 @@ enum Position {
     OutputBeginning,
     OutputTail,
     OutputOffset(i64),
+    OutputSlice(i64, i64),
 }
 #[derive(Serialize)]
 pub(super) struct Page {
@@ -117,10 +118,17 @@ impl Page {
         bytes: usize,
         finished: bool,
     ) -> Result<Self, (StatusCode, String)> {
+        let bytes = match &position {
+            Position::OutputSlice(_, requested) => usize::try_from(*requested)
+                .ok()
+                .filter(|bytes| (1..=65536).contains(bytes))
+                .ok_or_else(|| failure("output slice size must be 1..65536 bytes"))?,
+            _ => bytes,
+        };
         let offset = match position {
             Position::OutputBeginning => Some(0),
             Position::OutputTail => None,
-            Position::OutputOffset(n) => {
+            Position::OutputOffset(n) | Position::OutputSlice(n, _) => {
                 Some(u64::try_from(n).map_err(|_| failure("negative output position"))?)
             }
         };
@@ -696,6 +704,47 @@ mod tests {
             state.jobs["test"].stdout.page(Some(0), 64).unwrap().bytes,
             b"live"
         );
+    }
+
+    #[test]
+    fn bounded_read_preserves_byte_positions_for_unicode_and_invalid_utf8() {
+        let mut output = RetainedOutput::default();
+        output.push("αβγ".as_bytes(), RETAINED_BYTES);
+        let position: Position = serde_json::from_str(r#"{"OutputSlice":[0,3]}"#).unwrap();
+        let first = Page::read(&output, position, 65536, false).unwrap();
+        assert_eq!(
+            (
+                first.text.as_str(),
+                first.start,
+                first.end,
+                first.available_end,
+                first.finished
+            ),
+            ("α", 0, 2, 6, false)
+        );
+        let next = Page::read(&output, Position::OutputSlice(first.end, 4), 65536, true).unwrap();
+        assert_eq!(
+            (next.text.as_str(), next.start, next.end, next.lossy),
+            ("βγ", 2, 6, false)
+        );
+        output.push(&[0xff, 0xff, 0xff], RETAINED_BYTES);
+        let invalid = Page::read(&output, Position::OutputSlice(6, 2), 65536, true).unwrap();
+        assert_eq!(
+            (
+                invalid.text.as_str(),
+                invalid.start,
+                invalid.end,
+                invalid.lossy
+            ),
+            ("��", 6, 8, true)
+        );
+        for position in [
+            Position::OutputSlice(-1, 8),
+            Position::OutputSlice(0, 0),
+            Position::OutputSlice(0, 65537),
+        ] {
+            assert!(Page::read(&output, position, 65536, true).is_err());
+        }
     }
 
     #[test]
