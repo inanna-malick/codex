@@ -21,6 +21,309 @@ async fn runtime_with_thread() -> (Arc<StateRuntime>, ThreadId) {
     (runtime, thread_id)
 }
 
+fn host_operation(thread_id: ThreadId, producer_id: &str, sequence: u64) -> HostInputOperation {
+    HostInputOperation {
+        thread_id,
+        producer_id: producer_id.to_string(),
+        sequence,
+        purpose: "assignment".to_string(),
+        mode: "queueOnly".to_string(),
+        target_json: "{\"actor\":\"actor-1\",\"conversation\":\"thread\",\"correlation\":null}"
+            .to_string(),
+        content_digest: "digest-v1".to_string(),
+        payload: r#"{"host":true}"#.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn host_input_admission_is_idempotent_and_rejects_changed_content() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let operation = host_operation(thread_id, "run-a/inbox/actor-1.1", 7);
+    assert!(matches!(
+        queue.admit_host_input(&operation).await.unwrap(),
+        HostInputAdmission::Admitted(_)
+    ));
+    assert!(matches!(
+        queue.admit_host_input(&operation).await.unwrap(),
+        HostInputAdmission::Existing(_)
+    ));
+    let mut changed = operation.clone();
+    changed.payload = r#"{"host":"changed"}"#.to_string();
+    assert_eq!(
+        HostInputAdmission::Conflict,
+        queue.admit_host_input(&changed).await.unwrap()
+    );
+    let mut changed_purpose = operation.clone();
+    changed_purpose.purpose = "notification".to_string();
+    assert_eq!(
+        HostInputAdmission::Conflict,
+        queue.admit_host_input(&changed_purpose).await.unwrap()
+    );
+    assert_eq!(
+        Some(HostInputRecord {
+            operation,
+            state: HostInputState::Ready,
+        }),
+        queue
+            .observe_host_input("run-a/inbox/actor-1.1", 7)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn distinct_run_scopes_do_not_alias_and_seal_quarantines_ready_input() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let first = host_operation(thread_id, "run-a/inbox/actor-1.1", 1);
+    let second = host_operation(thread_id, "run-b/inbox/actor-1.1", 1);
+    assert!(matches!(
+        queue.admit_host_input(&first).await.unwrap(),
+        HostInputAdmission::Admitted(_)
+    ));
+    assert!(matches!(
+        queue.admit_host_input(&second).await.unwrap(),
+        HostInputAdmission::Admitted(_)
+    ));
+    queue
+        .seal_host_input_producer(thread_id, &first.producer_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        HostInputState::Rejected,
+        queue
+            .observe_host_input(&first.producer_id, first.sequence)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    );
+    assert_eq!(
+        HostInputState::Ready,
+        queue
+            .observe_host_input(&second.producer_id, second.sequence)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    );
+    assert_eq!(
+        HostInputAdmission::Existing(HostInputRecord {
+            operation: first.clone(),
+            state: HostInputState::Rejected,
+        }),
+        queue.admit_host_input(&first).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_is_a_durable_negative_fence() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 2);
+    queue.admit_host_input(&operation).await.unwrap();
+    assert!(matches!(
+        queue
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap(),
+        Some(HostInputWithdrawal::Withdrawn(_))
+    ));
+    assert!(matches!(
+        queue.admit_host_input(&operation).await.unwrap(),
+        HostInputAdmission::Existing(HostInputRecord {
+            state: HostInputState::Withdrawn,
+            ..
+        })
+    ));
+    assert!(
+        queue
+            .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_before_delayed_submit_persists_a_negative_tombstone() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    assert_eq!(
+        Some(HostInputWithdrawal::Tombstoned),
+        runtime
+            .thread_queue()
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Withdrawn,
+        runtime
+            .thread_queue()
+            .admit_host_input(&operation)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        None,
+        runtime
+            .thread_queue()
+            .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Compacted,
+        runtime
+            .thread_queue()
+            .admit_host_input(&operation)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn dispatch_claim_survives_queue_consumption_and_restart() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 3);
+    let queue = runtime.thread_queue();
+    queue.admit_host_input(&operation).await.unwrap();
+    let queued = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        queue
+            .claim_host_queue_item(thread_id, &queued[0].id)
+            .await
+            .unwrap(),
+        Some(HostInputRecord {
+            state: HostInputState::Dispatching,
+            ..
+        })
+    ));
+    assert!(queue.delete(thread_id, &queued[0].id).await.unwrap());
+
+    let reopened = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        HostInputState::Dispatching,
+        reopened
+            .thread_queue()
+            .observe_host_input(&operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    );
+    assert!(matches!(
+        reopened
+            .thread_queue()
+            .withdraw_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap(),
+        Some(HostInputWithdrawal::Unknown(HostInputRecord {
+            state: HostInputState::Unknown,
+            ..
+        }))
+    ));
+}
+
+#[tokio::test]
+async fn presentation_acknowledgement_is_idempotent_after_lost_response() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let operation = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    let queue = runtime.thread_queue();
+    queue.admit_host_input(&operation).await.unwrap();
+    let queued = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+        .await
+        .unwrap();
+    queue
+        .claim_host_queue_item(thread_id, &queued[0].id)
+        .await
+        .unwrap();
+
+    let record = queue
+        .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+        .await
+        .unwrap()
+        .expect("acknowledged operation");
+    assert_eq!(HostInputState::Presented, record.state);
+    assert_eq!(
+        None,
+        queue
+            .acknowledge_host_input(thread_id, &operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    let reopened = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string())
+        .await
+        .unwrap();
+    let queue = reopened.thread_queue();
+    assert_eq!(
+        None,
+        queue
+            .observe_host_input(&operation.producer_id, operation.sequence)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        HostInputAdmission::Compacted,
+        queue.admit_host_input(&operation).await.unwrap()
+    );
+    assert!(
+        queue
+            .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn prefix_acknowledgement_rejects_ready_and_noncontiguous_rows() {
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let first = host_operation(thread_id, "run/inbox/actor-1.1", 1);
+    let third = host_operation(thread_id, "run/inbox/actor-1.1", 3);
+    queue.admit_host_input(&first).await.unwrap();
+    queue.admit_host_input(&third).await.unwrap();
+    assert!(
+        queue
+            .acknowledge_host_input(thread_id, &first.producer_id, 1)
+            .await
+            .is_err()
+    );
+    let queued = queue
+        .list_page(thread_id, /*offset*/ 0, /*limit*/ 2)
+        .await
+        .unwrap();
+    queue
+        .claim_host_queue_item(thread_id, &queued[0].id)
+        .await
+        .unwrap();
+    assert!(
+        queue
+            .acknowledge_host_input(thread_id, &first.producer_id, 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Some(HostInputRecord {
+            operation: first,
+            state: HostInputState::Dispatching,
+        }),
+        queue
+            .observe_host_input("run/inbox/actor-1.1", 1)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn competing_runtimes_preserve_fifo_queue_order() {
     let (runtime, thread_id) = runtime_with_thread().await;

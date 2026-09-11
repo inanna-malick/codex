@@ -19,6 +19,9 @@
 mod path;
 mod remote;
 
+pub use codex_app_server::in_process::InProcessHostInputOutcome;
+pub use codex_app_server::in_process::InProcessHostInputSubmission;
+
 use std::error::Error;
 use std::fmt;
 use std::io::Error as IoError;
@@ -301,11 +304,13 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
+    host_input_control: Option<codex_app_server::in_process::InProcessHostInputControl>,
 }
 
 #[derive(Clone)]
 pub struct InProcessAppServerRequestHandle {
     command_tx: mpsc::Sender<ClientCommand>,
+    host_input_control: Option<codex_app_server::in_process::InProcessHostInputControl>,
 }
 
 #[derive(Clone)]
@@ -329,6 +334,7 @@ impl InProcessAppServerClient {
         let mut handle =
             codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
         let request_sender = handle.sender();
+        let host_input_control = handle.host_input_control();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
         // deadlock a foreground request whose response is behind unread notifications.
@@ -423,12 +429,14 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            host_input_control,
         })
     }
 
     pub fn request_handle(&self) -> InProcessAppServerRequestHandle {
         InProcessAppServerRequestHandle {
             command_tx: self.command_tx.clone(),
+            host_input_control: self.host_input_control.clone(),
         }
     }
 
@@ -584,6 +592,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            host_input_control: _,
         } = self;
         let mut worker_handle = worker_handle;
         // Stop forwarding caller-facing events before asking the worker to shut down.
@@ -612,6 +621,12 @@ impl InProcessAppServerClient {
 }
 
 impl InProcessAppServerRequestHandle {
+    pub fn host_input_control(
+        &self,
+    ) -> Option<codex_app_server::in_process::InProcessHostInputControl> {
+        self.host_input_control.clone()
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -2005,6 +2020,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            host_input_control: None,
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -2111,6 +2127,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            host_input_control: None,
         };
 
         client.shutdown().await.expect("shutdown should complete");

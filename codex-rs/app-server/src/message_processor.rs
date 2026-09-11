@@ -159,6 +159,7 @@ pub(crate) struct MessageProcessor {
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
+    host_input_queue: Option<Arc<QueuedItemService>>,
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
@@ -482,7 +483,7 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             Arc::clone(&thread_store),
             outgoing.clone(),
-            queue_service,
+            queue_service.clone(),
         );
         let project_processor = ProjectRequestProcessor::new(
             Arc::clone(&thread_store),
@@ -596,11 +597,16 @@ impl MessageProcessor {
             search_processor,
             thread_goal_processor,
             thread_queue_processor,
+            host_input_queue: queue_service,
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues,
         }
+    }
+
+    pub(crate) fn host_input_queue(&self) -> Option<Arc<QueuedItemService>> {
+        self.host_input_queue.clone()
     }
 
     pub(crate) fn clear_runtime_references(&self) {
@@ -1100,7 +1106,7 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ConfigRequirementsRead { params: _, .. } => self
+            ClientRequest::ConfigRequirementsRead { .. } => self
                 .config_processor
                 .config_requirements_read()
                 .await
@@ -1159,7 +1165,7 @@ impl MessageProcessor {
                 .unwatch(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ModelProviderCapabilitiesRead { params: _, .. } => self
+            ClientRequest::ModelProviderCapabilitiesRead { .. } => self
                 .config_processor
                 .model_provider_capabilities_read()
                 .await
@@ -1556,7 +1562,7 @@ impl MessageProcessor {
             ClientRequest::ThreadTimelineList { params, .. } => {
                 self.thread_processor.thread_timeline_list(params).await
             }
-            ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
+            ClientRequest::ThreadRealtimeListVoices { .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
             ClientRequest::ReviewStart { params, .. } => {

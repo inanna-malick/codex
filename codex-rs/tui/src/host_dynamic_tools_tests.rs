@@ -1,7 +1,14 @@
 #![cfg(unix)]
 
 use super::*;
+use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::RemoteAppServerClient;
+use codex_app_server_client::RemoteAppServerConnectArgs;
+use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::JSONRPCMessage;
+use futures::SinkExt;
+use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::io::Read;
@@ -10,6 +17,27 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+async fn register_host_tool_completion(
+    host: &HostDynamicTools,
+    thread_id: ThreadId,
+    context_call_id: &str,
+) -> color_eyre::Result<()> {
+    host.state_db
+        .thread_queue()
+        .register_host_tool_completion(&codex_state::HostToolCompletionKey {
+            thread_id,
+            context_call_id: context_call_id.to_owned(),
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+    host.completions
+        .lock()
+        .unwrap()
+        .register(context_call_id.to_owned())?;
+    Ok(())
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct RecordedRequest {
@@ -118,6 +146,158 @@ pub(crate) fn spawn_host_with_input(
     )
 }
 
+#[tokio::test]
+async fn reattach_rejects_stale_generation_and_remote_reports_unavailable() -> color_eyre::Result<()>
+{
+    let websocket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let websocket_url = format!("ws://{}", websocket_listener.local_addr()?);
+    let websocket_task = tokio::spawn(async move {
+        let (stream, _) = websocket_listener.accept().await?;
+        let mut socket = tokio_tungstenite::accept_async(stream).await?;
+        while let Some(message) = socket.next().await {
+            let Message::Text(text) = message? else {
+                continue;
+            };
+            let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
+                continue;
+            };
+            let result = match request.method.as_str() {
+                "initialize" => json!({"userAgent": "host-input-test"}),
+                "shutdown" => Value::Null,
+                method => panic!("unexpected remote request: {method}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": request.id, "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+        }
+        color_eyre::Result::<()>::Ok(())
+    });
+    let remote = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url,
+            auth_token: None,
+        },
+        client_name: "host-input-test".to_string(),
+        client_version: "0.0.0".to_string(),
+        experimental_api: false,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await?;
+
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let host_socket = directory.path().join("host.sock");
+    let input_socket = directory.path().join("input.sock");
+    let (callbacks, host_task) =
+        spawn_host_with_input(&host_socket, /*request_count*/ 3, input_socket.clone())?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(host_socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    let handle = AppServerRequestHandle::Remote(remote.request_handle());
+    host.attach_primary_with_input(thread, handle.clone())
+        .await?;
+    let _registration = callbacks.recv()?;
+    let first_attachment = callbacks.recv()?;
+    host.attach_primary_with_input(thread, handle).await?;
+    let second_attachment = callbacks.recv()?;
+    assert_eq!(first_attachment.body["sessionGeneration"], json!(1));
+    assert_eq!(second_attachment.body["sessionGeneration"], json!(2));
+    assert_eq!(
+        first_attachment.body["applicationInstanceId"],
+        second_attachment.body["applicationInstanceId"]
+    );
+
+    let binding = |attachment: &RecordedRequest| {
+        json!({
+            "protocolVersion": 4,
+            "launchId": attachment.body["launchId"],
+            "instanceId": attachment.body["applicationInstanceId"],
+            "generation": attachment.body["sessionGeneration"],
+            "nonce": attachment.body["inputControlNonce"],
+        })
+    };
+    let bind = |attachment: &RecordedRequest| {
+        json!({
+            "operation": "bind",
+            "binding": binding(attachment),
+        })
+    };
+    let query = |attachment: &RecordedRequest| {
+        json!({
+            "operation": "query",
+            "binding": binding(attachment),
+            "producer_id": "run/inbox/actor-1.1",
+            "sequence": 1,
+        })
+    };
+    let client = reqwest::Client::builder()
+        .unix_socket(input_socket)
+        .no_proxy()
+        .build()?;
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&bind(&first_attachment))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&bind(&second_attachment))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["outcome"],
+        json!("admitted")
+    );
+    let mut foreign_bind = bind(&second_attachment);
+    foreign_bind["binding"]["nonce"] = json!("foreign");
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&foreign_bind)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&query(&first_attachment))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&query(&second_attachment))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["outcome"],
+        json!("evidenceUnavailable")
+    );
+
+    drop(host);
+    remote.shutdown().await?;
+    websocket_task.await??;
+    host_task.join().expect("host task")?;
+    Ok(())
+}
+
 fn spawn_host_configured(
     socket_path: &std::path::Path,
     request_count: usize,
@@ -149,6 +329,8 @@ fn spawn_host_configured(
                         }],
                         "scope": "primaryThread",
                         "inputControlSocket": input_control_socket,
+                        "launchId": "launch-test",
+                        "inputControlNonce": "nonce-test",
                     }))?,
                 )),
                 SESSION_PATH | "/v1/dynamic-tools/completed" => {
@@ -265,6 +447,8 @@ fn registration_rejects_duplicates_and_tui_namespace() {
     };
     let registration = HostDynamicToolRegistration {
         input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![custom("same"), custom("same")],
         scope: HostDynamicToolScope::PrimaryThread,
@@ -273,6 +457,8 @@ fn registration_rejects_duplicates_and_tui_namespace() {
 
     let registration = HostDynamicToolRegistration {
         input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
         protocol_version: PROTOCOL_VERSION,
         dynamic_tools: vec![
             serde_json::from_value(json!({
@@ -301,7 +487,7 @@ async fn completion_waits_for_sibling_result_and_acknowledges_once() -> color_ey
     host.attach_primary(thread).await?;
     requests.recv()?;
     requests.recv()?;
-    host.completions.lock().unwrap().register("outer".into())?;
+    register_host_tool_completion(&host, thread, "outer").await?;
     let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
         thread_id: thread.to_string(),
         turn_id: "turn".into(),
@@ -346,10 +532,7 @@ async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
     host.attach_primary(thread).await?;
     requests.recv()?;
     requests.recv()?;
-    host.completions
-        .lock()
-        .unwrap()
-        .register("interrupted".into())?;
+    register_host_tool_completion(&host, thread, "interrupted").await?;
     host.settle_turn(&thread.to_string()).await?;
     assert_eq!(
         requests.recv()?,
@@ -379,7 +562,7 @@ async fn completion_accepts_acknowledgement_after_five_seconds() -> color_eyre::
         .expect("configured host");
     let thread = ThreadId::new();
     host.attach_primary(thread).await?;
-    host.completions.lock().unwrap().register("outer".into())?;
+    register_host_tool_completion(&host, thread, "outer").await?;
     for item in [
         json!({"type":"function_call", "call_id":"outer", "name":"exec", "arguments":"{}"}),
         json!({"type":"function_call_output", "call_id":"outer", "output":"done"}),
