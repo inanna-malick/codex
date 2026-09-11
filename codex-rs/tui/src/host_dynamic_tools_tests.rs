@@ -720,6 +720,64 @@ async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
 }
 
 #[tokio::test]
+async fn stale_interrupted_turn_does_not_reattach_an_acknowledged_completion()
+-> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    register_host_tool_completion(&host, thread, "interrupted").await?;
+
+    let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
+        thread_id: thread.to_string(),
+        turn_id: "turn".into(),
+        item: serde_json::from_value(item).unwrap(),
+    };
+    host.observe_completion(&notify(json!({
+        "type":"function_call",
+        "call_id":"interrupted",
+        "name":"exec",
+        "arguments":"{}"
+    })))
+    .await?;
+    let turn_prepared_reattach = host
+        .acknowledge_then_execute_stale_reattach(
+            &notify(json!({
+            "type":"function_call_output",
+            "call_id":"interrupted",
+            "output":"done"
+            })),
+            "interrupted",
+        )
+        .await?;
+    assert!(!turn_prepared_reattach);
+
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: "/v1/dynamic-tools/completed".into(),
+            body: json!({
+                "protocolVersion":3,
+                "threadId":thread,
+                "contextCallId":"interrupted"
+            }),
+        }
+    );
+    assert!(requests.try_recv().is_err());
+    assert!(!host.is_disabled());
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completion_accepts_acknowledgement_after_five_seconds() -> color_eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;

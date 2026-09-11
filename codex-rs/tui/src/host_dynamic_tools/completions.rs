@@ -126,11 +126,7 @@ impl HostDynamicTools {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.batch = None;
         state.batch_calls.clear();
-        let calls = state
-            .pending
-            .union(&state.ready)
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let calls = state.pending.clone();
         (!calls.is_empty()).then(|| SettlementWork::Reattach {
             thread_id: thread_id.to_owned(),
             calls,
@@ -154,6 +150,25 @@ impl HostDynamicTools {
             self.execute_settlement(work).await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acknowledge_then_execute_stale_reattach(
+        &self,
+        notification: &RawResponseItemCompletedNotification,
+        call_id: &str,
+    ) -> color_eyre::Result<bool> {
+        let work = self
+            .prepare_completion(notification)?
+            .ok_or_else(|| color_eyre::eyre::eyre!("completion did not close its call boundary"))?;
+        let turn_prepared_reattach = self.prepare_turn(&notification.thread_id).is_some();
+        self.execute_settlement(work).await?;
+        self.execute_settlement(SettlementWork::Reattach {
+            thread_id: notification.thread_id.clone(),
+            calls: BTreeSet::from([call_id.to_owned()]),
+        })
+        .await?;
+        Ok(turn_prepared_reattach)
     }
 
     fn prepare_completion(
@@ -322,6 +337,35 @@ impl HostDynamicTools {
             return Ok(());
         }
         let primary = codex_protocol::ThreadId::from_string(thread_id)?;
+        let durable_pending = self
+            .state_db
+            .thread_queue()
+            .list_unresolved_host_tool_completions(primary)
+            .await
+            .map_err(store_error)?
+            .into_iter()
+            .filter_map(|record| {
+                (record.state == codex_state::HostToolCompletionState::Pending)
+                    .then_some(record.key.context_call_id)
+            })
+            .collect::<BTreeSet<_>>();
+        // Settlement work is queued after classification. Reconcile it before
+        // the host-side effect so a completion now owned by acknowledgment is
+        // never abandoned by a stale reattach.
+        let calls = {
+            let state = self
+                .completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            calls
+                .intersection(&state.pending)
+                .filter(|call| durable_pending.contains(*call))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        if calls.is_empty() {
+            return Ok(());
+        }
         let (input_socket, binding_state) = {
             let control = self.input_control.lock().await;
             match control.as_ref() {
@@ -340,7 +384,7 @@ impl HostDynamicTools {
             binding.as_ref(),
         )
         .await?;
-        self.settle_reattached_pending(thread_id, calls).await
+        self.settle_reattached_pending(thread_id, &calls).await
     }
 
     pub(super) async fn settle_reattached_pending(
