@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use codex_app_server_protocol::ServerNotification;
 
@@ -19,18 +18,27 @@ pub(super) struct HostToolCompletions {
     batch_calls: BTreeSet<String>,
     pending: BTreeSet<String>,
     ready: BTreeSet<String>,
+    reconcile: BTreeSet<String>,
+    pub(super) not_submitted: BTreeSet<String>,
 }
 
 impl HostToolCompletions {
-    pub(super) fn register(&mut self, call_id: String) -> color_eyre::Result<()> {
-        if self.pending.len() + self.ready.len() >= 256 {
-            color_eyre::eyre::bail!("too many unacknowledged hosted tool completions");
-        }
+    pub(super) fn forget(&mut self, call_id: &str) {
+        self.pending.remove(call_id);
+        self.ready.remove(call_id);
+        self.reconcile.remove(call_id);
+        self.not_submitted.remove(call_id);
+    }
+    pub(super) fn register(&mut self, call_id: String) {
         self.pending.insert(call_id.clone());
         if self.batch.is_some() {
             self.batch_calls.insert(call_id);
         }
-        Ok(())
+    }
+
+    pub(super) fn reconcile_call(&mut self, call_id: String) {
+        self.pending.insert(call_id.clone());
+        self.reconcile.insert(call_id);
     }
 }
 
@@ -43,6 +51,200 @@ struct CompletionRequest<'a> {
 }
 
 impl HostDynamicTools {
+    pub(super) async fn reconcile_completions(&self) -> color_eyre::Result<()> {
+        if let Some(reason) = self
+            .recovery
+            .classification_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(super::recovery::Intervention(reason).into());
+        }
+        let Some(thread) = self.primary_thread_id() else {
+            return Ok(());
+        };
+        let thread_id = thread.to_string();
+        if self
+            .recovery
+            .history_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let pending = self.recover_completions_before_reattach(thread).await?;
+            let mut state = self
+                .completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pending.extend(pending.iter().cloned());
+            state.reconcile.extend(pending);
+            self.recovery
+                .history_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        let (ready, reconcile, not_submitted) = {
+            let state = self
+                .completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.ready.clone(),
+                state.reconcile.clone(),
+                state.not_submitted.clone(),
+            )
+        };
+        for call_id in not_submitted {
+            self.state_db
+                .thread_queue()
+                .mark_host_tool_completion_not_submitted(&completion_key(&thread_id, &call_id)?)
+                .await
+                .map_err(store_error)?;
+            self.completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget(&call_id);
+        }
+        // Classification is synchronous with native history events. Flush its
+        // intent before transport; restart can also reconstruct it from rollout.
+        for call_id in ready {
+            let record = self
+                .state_db
+                .thread_queue()
+                .mark_host_tool_completion_ready(&completion_key(&thread_id, &call_id)?)
+                .await
+                .map_err(store_error)?;
+            if matches!(
+                record.state,
+                codex_state::HostToolCompletionState::Acknowledged
+                    | codex_state::HostToolCompletionState::ReattachedWithoutCompletion
+                    | codex_state::HostToolCompletionState::NotSubmitted
+            ) {
+                self.completions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .forget(&call_id);
+            }
+        }
+        for call_id in reconcile {
+            let record = self
+                .state_db
+                .thread_queue()
+                .mark_host_tool_completion_reconcile(&completion_key(&thread_id, &call_id)?)
+                .await
+                .map_err(store_error)?;
+            if matches!(
+                record.state,
+                codex_state::HostToolCompletionState::Acknowledged
+                    | codex_state::HostToolCompletionState::ReattachedWithoutCompletion
+                    | codex_state::HostToolCompletionState::NotSubmitted
+            ) {
+                self.completions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .forget(&call_id);
+            }
+        }
+        let records = self
+            .state_db
+            .thread_queue()
+            .list_unresolved_host_tool_completions(thread)
+            .await
+            .map_err(store_error)?;
+        let mut deferred: Option<color_eyre::Report> = None;
+        for record in records {
+            let result = match record.state {
+                codex_state::HostToolCompletionState::Ready => {
+                    self.execute_settlement(SettlementWork::Acknowledge {
+                        thread_id: thread_id.clone(),
+                        calls: vec![record.key.context_call_id],
+                    })
+                    .await
+                }
+                codex_state::HostToolCompletionState::ReconcilePending => {
+                    self.reconcile_interrupted(&thread_id, &record.key.context_call_id)
+                        .await
+                }
+                codex_state::HostToolCompletionState::Pending
+                | codex_state::HostToolCompletionState::Acknowledged
+                | codex_state::HostToolCompletionState::NotSubmitted
+                | codex_state::HostToolCompletionState::ReattachedWithoutCompletion => Ok(()),
+            };
+            if let Err(error) = result {
+                let new_is_intervention = error
+                    .downcast_ref::<super::recovery::Intervention>()
+                    .is_some();
+                let existing_is_intervention = deferred.as_ref().is_some_and(|error| {
+                    error
+                        .downcast_ref::<super::recovery::Intervention>()
+                        .is_some()
+                });
+                if new_is_intervention || !existing_is_intervention {
+                    deferred = Some(error);
+                }
+            }
+        }
+        match deferred {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn reconcile_interrupted(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+    ) -> color_eyre::Result<()> {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "status", rename_all = "camelCase")]
+        enum Receipt {
+            Settled,
+            Pending,
+            Recovered {
+                reply: codex_app_server_protocol::DynamicToolCallResponse,
+            },
+        }
+        #[cfg(unix)]
+        {
+            let response = self
+                .client
+                .post("http://localhost/v1/dynamic-tools/interrupted")
+                .timeout(super::SETTLEMENT_REQUEST_TIMEOUT)
+                .json(&CompletionRequest {
+                    protocol_version: super::PROTOCOL_VERSION,
+                    thread_id,
+                    context_call_id: call_id,
+                })
+                .send()
+                .await
+                .map_err(transport_error)?;
+            let response = response.error_for_status().map_err(transport_error)?;
+            let bytes = super::read_bounded(response, super::MAX_CALL_RESPONSE_BYTES).await?;
+            match serde_json::from_slice::<Receipt>(&bytes).map_err(|error| {
+                super::recovery::Intervention(format!("invalid exact settlement receipt: {error}"))
+            })? {
+                Receipt::Settled => {
+                    self.settle_reattached_pending(thread_id, &BTreeSet::from([call_id.to_owned()]))
+                        .await
+                }
+                Receipt::Recovered { reply } => {
+                    self.restore_completion(thread_id, call_id, reply).await?;
+                    Box::pin(self.execute_settlement(SettlementWork::Acknowledge {
+                        thread_id: thread_id.to_owned(),
+                        calls: vec![call_id.to_owned()],
+                    }))
+                    .await
+                }
+                Receipt::Pending => color_eyre::eyre::bail!(
+                    "call {call_id} is still reconciling; retained work was not replayed"
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        Err(super::recovery::Intervention(
+            "host reconciliation is unavailable on this platform".into(),
+        )
+        .into())
+    }
+
     // Classify boundaries in event order, before a subsequent hosted call can
     // register. Only network settlement runs off the UI loop.
     pub(crate) fn enqueue_settlement(
@@ -50,73 +252,31 @@ impl HostDynamicTools {
         notification: &ServerNotification,
         events: &AppEventSender,
     ) {
-        if self.is_disabled() {
-            return;
-        }
         let work = match notification {
             ServerNotification::RawResponseItemCompleted(item) => self.prepare_completion(item),
             ServerNotification::TurnCompleted(turn) => Ok(self.prepare_turn(&turn.thread_id)),
             _ => return,
         };
-        let work = match work {
-            Ok(Some(work)) => work,
-            Ok(None) => return,
-            Err(error) => {
-                self.settlement_failed(error, events);
-                return;
-            }
-        };
-        let mut sender = self
-            .settlement_sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sender = sender.get_or_insert_with(|| {
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<SettlementWork>(256);
-            let host = Arc::downgrade(self);
-            let events = events.clone();
-            tokio::spawn(async move {
-                while let Some(work) = receiver.recv().await {
-                    let Some(host) = host.upgrade() else { break };
-                    if host.is_disabled() {
-                        break;
-                    }
-                    if let Err(error) = host.execute_settlement(work).await {
-                        host.settlement_failed(error, &events);
-                        break;
-                    }
-                }
-            });
-            sender
-        });
-        if let Err(error) = sender.try_send(work) {
-            self.settlement_failed(
-                color_eyre::eyre::eyre!("host settlement queue unavailable: {error}"),
-                events,
-            );
+        if work.as_ref().is_ok_and(Option::is_some) {
+            self.recovery.start_recovering();
         }
-    }
-
-    fn settlement_failed(&self, error: color_eyre::Report, events: &AppEventSender) {
-        if self
-            .disabled
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
+        if let Err(error) = work {
+            let reason = format!("native completion boundary could not be classified: {error}");
+            *self
+                .recovery
+                .classification_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.clone());
+            self.recovery
+                .failed(&super::recovery::Intervention(reason).into());
         }
-        tracing::warn!(error = ?error, "host dynamic tools disabled after settlement failure");
-        events.send(AppEvent::InsertHistoryCell(Box::new(
-            crate::history_cell::new_error_event(format!(
-                "{} Completion error: {error:#}",
-                super::DISABLED_MESSAGE
-            )),
-        )));
+        self.wake_recovery(Some(events));
     }
 
     fn prepare_turn(&self, thread_id: &str) -> Option<SettlementWork> {
-        if self.is_disabled()
-            || self
-                .primary_thread_id()
-                .is_none_or(|id| id.to_string() != thread_id)
+        if self
+            .primary_thread_id()
+            .is_none_or(|id| id.to_string() != thread_id)
         {
             return None;
         }
@@ -127,6 +287,7 @@ impl HostDynamicTools {
         state.batch = None;
         state.batch_calls.clear();
         let calls = state.pending.clone();
+        state.reconcile.extend(calls.iter().cloned());
         (!calls.is_empty()).then(|| SettlementWork::Reattach {
             thread_id: thread_id.to_owned(),
             calls,
@@ -175,10 +336,9 @@ impl HostDynamicTools {
         &self,
         notification: &RawResponseItemCompletedNotification,
     ) -> color_eyre::Result<Option<SettlementWork>> {
-        if self.is_disabled()
-            || self
-                .primary_thread_id()
-                .is_none_or(|id| id.to_string() != notification.thread_id)
+        if self
+            .primary_thread_id()
+            .is_none_or(|id| id.to_string() != notification.thread_id)
         {
             return Ok(None);
         }
@@ -231,11 +391,27 @@ impl HostDynamicTools {
         };
         for call_id in ready {
             let key = completion_key(&thread_id, &call_id)?;
-            self.state_db
+            let record = self
+                .state_db
                 .thread_queue()
                 .mark_host_tool_completion_ready(&key)
                 .await
                 .map_err(store_error)?;
+            if matches!(
+                record.state,
+                codex_state::HostToolCompletionState::Acknowledged
+                    | codex_state::HostToolCompletionState::NotSubmitted
+                    | codex_state::HostToolCompletionState::ReattachedWithoutCompletion
+            ) {
+                let mut state = self
+                    .completions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.ready.remove(&call_id);
+                state.reconcile.remove(&call_id);
+                state.pending.remove(&call_id);
+                continue;
+            }
             #[cfg(unix)]
             for attempt in 0..3 {
                 let result = self
@@ -252,7 +428,7 @@ impl HostDynamicTools {
                     .and_then(reqwest::Response::error_for_status);
                 match result {
                     Ok(_) => break,
-                    Err(error) if attempt == 2 => return Err(error.into()),
+                    Err(error) if attempt == 2 => return Err(transport_error(error)),
                     Err(error) => {
                         tracing::warn!(error = ?error, attempt, "retrying hosted tool completion acknowledgement");
                         tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
@@ -268,6 +444,11 @@ impl HostDynamicTools {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ready
+                .remove(&call_id);
+            self.completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reconcile
                 .remove(&call_id);
         }
         Ok(())
@@ -291,13 +472,16 @@ impl HostDynamicTools {
             .get_thread(thread_id)
             .await
             .map_err(store_error)?
-            .ok_or_else(|| color_eyre::eyre::eyre!("hosted completion thread is not persisted"))?;
+            .ok_or_else(|| {
+                super::recovery::Intervention("hosted completion thread is not persisted".into())
+            })?;
         let (items, history_thread, parse_errors) =
             RolloutRecorder::load_rollout_items(&metadata.rollout_path).await?;
         if history_thread != Some(thread_id) || parse_errors != 0 {
-            color_eyre::eyre::bail!(
-                "hosted completion history identity or integrity is unconfirmed"
-            );
+            return Err(super::recovery::Intervention(
+                "hosted completion history identity or integrity is unconfirmed".into(),
+            )
+            .into());
         }
         let thread = thread_id.to_string();
         let mut pending = BTreeSet::new();
@@ -307,7 +491,8 @@ impl HostDynamicTools {
                 codex_state::HostToolCompletionState::Ready => {
                     ready.push(record.key.context_call_id);
                 }
-                codex_state::HostToolCompletionState::Pending => {
+                codex_state::HostToolCompletionState::Pending
+                | codex_state::HostToolCompletionState::ReconcilePending => {
                     if completion_is_closed(&items, &record.key.context_call_id)? {
                         ready.push(record.key.context_call_id);
                     } else {
@@ -315,6 +500,7 @@ impl HostDynamicTools {
                     }
                 }
                 codex_state::HostToolCompletionState::Acknowledged
+                | codex_state::HostToolCompletionState::NotSubmitted
                 | codex_state::HostToolCompletionState::ReattachedWithoutCompletion => {}
             }
         }
@@ -366,25 +552,15 @@ impl HostDynamicTools {
         if calls.is_empty() {
             return Ok(());
         }
-        let (input_socket, binding_state) = {
-            let control = self.input_control.lock().await;
-            match control.as_ref() {
-                Some(control) => (Some(control.socket.clone()), Some(control.binding_state())),
-                None => (None, None),
-            }
-        };
-        let binding = match binding_state {
-            Some(binding) => Some(binding.lock().await.clone()),
-            None => None,
-        };
-        super::send_session(
-            &self.client,
-            primary,
-            input_socket.as_ref(),
-            binding.as_ref(),
-        )
-        .await?;
-        self.settle_reattached_pending(thread_id, &calls).await
+        for call_id in &calls {
+            self.state_db
+                .thread_queue()
+                .mark_host_tool_completion_reconcile(&completion_key(thread_id, call_id)?)
+                .await
+                .map_err(store_error)?;
+            self.reconcile_interrupted(thread_id, call_id).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn settle_reattached_pending(
@@ -405,6 +581,7 @@ impl HostDynamicTools {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.pending.retain(|id| !calls.contains(id));
         state.ready.retain(|id| !calls.contains(id));
+        state.reconcile.retain(|id| !calls.contains(id));
         Ok(())
     }
 }
@@ -419,7 +596,10 @@ fn completion_key(
     })
 }
 
-fn completion_is_closed(items: &[RolloutItem], call_id: &str) -> color_eyre::Result<bool> {
+pub(super) fn completion_is_closed(
+    items: &[RolloutItem],
+    call_id: &str,
+) -> color_eyre::Result<bool> {
     let mut boundary = CompletedCallBoundary::new(call_id);
     let mut closed = false;
     for item in items {
@@ -432,8 +612,27 @@ fn completion_is_closed(items: &[RolloutItem], call_id: &str) -> color_eyre::Res
     Ok(closed)
 }
 
-fn store_error(error: anyhow::Error) -> color_eyre::Report {
-    color_eyre::eyre::eyre!("{error:#}")
+pub(super) fn store_error(error: anyhow::Error) -> color_eyre::Report {
+    if error
+        .downcast_ref::<codex_state::HostToolCompletionError>()
+        .is_some_and(|error| !error.retryable())
+    {
+        super::recovery::Intervention(format!("{error:#}")).into()
+    } else {
+        color_eyre::eyre::eyre!("{error:#}")
+    }
+}
+
+fn transport_error(error: reqwest::Error) -> color_eyre::Report {
+    if error.status().is_some_and(|status| {
+        status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    }) {
+        super::recovery::Intervention(format!("host rejected settlement: {error}")).into()
+    } else {
+        error.into()
+    }
 }
 
 #[derive(Debug)]

@@ -96,6 +96,21 @@ impl Session {
             .await;
     }
 
+    /// Records trusted response items directly in history, without routing
+    /// them into an active turn's pending-input queue.
+    pub(crate) async fn inject_client_response_items_history_only(
+        &self,
+        items: Vec<ResponseItem>,
+        turn_context: &TurnContext,
+    ) {
+        let items = items
+            .into_iter()
+            .map(|item| self.annotate_client_response_item(item))
+            .collect::<Vec<_>>();
+        self.record_annotated_conversation_items(turn_context, items)
+            .await;
+    }
+
     pub(crate) fn annotate_client_response_item(&self, item: ResponseItem) -> ResponseItemEnvelope {
         let metadata = (self.enabled(Feature::RetainClientDeveloperMessages)
             && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))

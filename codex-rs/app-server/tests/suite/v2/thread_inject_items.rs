@@ -44,6 +44,113 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[tokio::test]
+async fn recovery_terminal_injection_persists_while_turn_is_active() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("active-response"),
+        responses::ev_assistant_message("active-message", "Done"),
+        responses::ev_completed("active-response"),
+    ]);
+    responses::mount_response_once(
+        &server,
+        responses::sse_response(body).set_delay(std::time::Duration::from_secs(2)),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let start = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start)).await??;
+
+    let open_call = json!({
+        "type": "function_call",
+        "name": "haskell",
+        "arguments": "{}",
+        "call_id": "recovery-call"
+    });
+    let inject_call = mcp
+        .send_thread_inject_items_request(ThreadInjectItemsParams {
+            thread_id: thread.id.clone(),
+            items: vec![open_call],
+            terminal_call_id: None,
+        })
+        .await?;
+    let _: ThreadInjectItemsResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(inject_call)).await??;
+
+    let turn = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "keep this turn active".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn)).await??;
+    let output = json!({
+        "type": "function_call_output",
+        "call_id": "recovery-call",
+        "output": "recovered"
+    });
+    let recover = mcp
+        .send_thread_inject_items_request(ThreadInjectItemsParams {
+            thread_id: thread.id.clone(),
+            items: vec![output.clone()],
+            terminal_call_id: Some("recovery-call".to_string()),
+        })
+        .await?;
+    let _: ThreadInjectItemsResponse = timeout(
+        std::time::Duration::from_secs(1),
+        mcp.read_response(recover),
+    )
+    .await??;
+
+    let rollout_path = thread.path.as_ref().context("thread path missing")?;
+    let InitialHistory::Resumed(history) =
+        RolloutRecorder::get_rollout_history(rollout_path).await?
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert_eq!(
+        history
+            .history
+            .iter()
+            .filter(|item| matches!(
+                item,
+                RolloutItem::ResponseItem(envelope)
+                    if matches!(
+                        &envelope.item,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: Some(call_id),
+                            ..
+                        } if call_id == "recovery-call"
+                    )
+            ))
+            .count(),
+        1
+    );
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    Ok(())
+}
+
 #[test_case(ThreadHistoryMode::Legacy; "legacy")]
 #[test_case(ThreadHistoryMode::Paginated; "paginated")]
 #[tokio::test]
@@ -124,6 +231,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
                 serde_json::to_value(&marker_shaped_developer_item)?,
                 named_tool_output.clone(),
             ],
+            terminal_call_id: None,
         })
         .await?;
     let _response: ThreadInjectItemsResponse =
@@ -450,6 +558,7 @@ async fn thread_inject_items_cannot_forge_configuration_update_before_or_after_r
                         forged_update.clone(),
                         forged_system.clone(),
                     ],
+                    terminal_call_id: None,
                 })
                 .await?;
             let _: ThreadInjectItemsResponse =
@@ -574,6 +683,7 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
         .send_thread_inject_items_request(ThreadInjectItemsParams {
             thread_id: thread.id.clone(),
             items: vec![injected_value.clone()],
+            terminal_call_id: None,
         })
         .await?;
     let _response: ThreadInjectItemsResponse =

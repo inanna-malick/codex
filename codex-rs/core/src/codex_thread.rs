@@ -612,6 +612,35 @@ impl CodexThread {
         Ok(())
     }
 
+    /// Records raw response items directly in durable history. This is used
+    /// for recovery of a terminal tool output that must not join active input.
+    pub async fn inject_response_items_history_only(
+        &self,
+        items: Vec<ResponseItem>,
+    ) -> CodexResult<()> {
+        if items.is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "items must not be empty".to_string(),
+            ));
+        }
+
+        let turn_context = self.session.new_default_turn().await;
+        if self.session.reference_context_item().await.is_none() {
+            let step_context = self
+                .session
+                .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+                .await?;
+            self.session
+                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .await?;
+        }
+        self.session
+            .inject_client_response_items_history_only(items, turn_context.as_ref())
+            .await;
+        self.session.flush_rollout().await?;
+        Ok(())
+    }
+
     /// Record raw Responses API items immediately before admitting a user turn.
     ///
     /// The caller must submit the associated user input while retaining its

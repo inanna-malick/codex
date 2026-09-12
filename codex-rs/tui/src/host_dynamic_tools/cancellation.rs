@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
@@ -21,6 +23,121 @@ use super::read_bounded;
 use super::require_status;
 #[cfg(unix)]
 use super::send_request;
+
+pub(crate) const NOT_SUBMITTED_MESSAGE: &str =
+    "Hosted tool call was cancelled before it was submitted.";
+
+const ADMISSION_PENDING: u8 = 0;
+const ADMISSION_DISPATCHED: u8 = 1;
+const ADMISSION_CANCELLED: u8 = 2;
+
+/// Arbitrates the single transition from local admission work to host submission.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HostedCallAdmission {
+    inner: Arc<HostedCallAdmissionInner>,
+}
+
+#[derive(Debug, Default)]
+struct HostedCallAdmissionInner {
+    state: AtomicU8,
+    cancelled: Notify,
+    not_submitted: std::sync::Mutex<Option<Result<(), String>>>,
+    finalized: Notify,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedCallCancellation {
+    NotSubmitted,
+    Dispatched,
+}
+
+impl HostedCallAdmission {
+    /// Claims permission to submit the call to the host.
+    ///
+    /// The caller must invoke this immediately before starting the `/call` request.
+    pub(crate) fn try_dispatch(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(
+                ADMISSION_PENDING,
+                ADMISSION_DISPATCHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn cancel(&self) -> HostedCallCancellation {
+        match self.inner.state.compare_exchange(
+            ADMISSION_PENDING,
+            ADMISSION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.inner.cancelled.notify_waiters();
+                HostedCallCancellation::NotSubmitted
+            }
+            Err(ADMISSION_CANCELLED) => HostedCallCancellation::NotSubmitted,
+            Err(ADMISSION_DISPATCHED) => HostedCallCancellation::Dispatched,
+            Err(state) => unreachable!("invalid hosted-call admission state {state}"),
+        }
+    }
+
+    pub(crate) fn cancel_on_drop(&self) -> HostedCallAdmissionGuard {
+        HostedCallAdmissionGuard(self.clone())
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.cancelled.notified();
+            if self.inner.state.load(Ordering::Acquire) == ADMISSION_CANCELLED {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Records that the detached call owner has durably settled a cancelled
+    /// admission. Input may resume only after this acknowledgement.
+    pub(crate) fn finalize_not_submitted(&self, result: Result<(), String>) {
+        let mut finalized = self
+            .inner
+            .not_submitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if finalized.is_none() {
+            *finalized = Some(result);
+            self.inner.finalized.notify_waiters();
+        }
+    }
+
+    async fn await_not_submitted(&self) -> Result<(), String> {
+        loop {
+            let notified = self.inner.finalized.notified();
+            if let Some(result) = self
+                .inner
+                .not_submitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Cancels admission when the app-owned call task is aborted before submission.
+#[must_use = "the guard must be held for the lifetime of the app-owned call task"]
+pub(crate) struct HostedCallAdmissionGuard(HostedCallAdmission);
+
+impl Drop for HostedCallAdmissionGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,7 +178,7 @@ enum CancellationResponse {
 
 #[derive(Debug)]
 enum SettlementPhase {
-    Running,
+    Unsettled,
     Cancelling,
     AwaitingTerminal(String),
     Uncertain(String),
@@ -74,11 +191,16 @@ pub(crate) struct ActiveHostedCall {
     request: CancellationRequest,
     request_id: codex_app_server_protocol::RequestId,
     events: AppEventSender,
+    admission: HostedCallAdmission,
     phase: tokio::sync::Mutex<SettlementPhase>,
     changed: Notify,
 }
 
 impl ActiveHostedCall {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the cancellation owner captures the exact host execution identity"
+    )]
     pub(super) fn new(
         client: reqwest::Client,
         params: &DynamicToolCallParams,
@@ -88,6 +210,7 @@ impl ActiveHostedCall {
         application_instance_id: String,
         session_generation: u64,
         input_control_nonce: String,
+        admission: HostedCallAdmission,
     ) -> Arc<Self> {
         Arc::new(Self {
             client,
@@ -105,7 +228,8 @@ impl ActiveHostedCall {
             },
             request_id,
             events,
-            phase: tokio::sync::Mutex::new(SettlementPhase::Running),
+            admission,
+            phase: tokio::sync::Mutex::new(SettlementPhase::Unsettled),
             changed: Notify::new(),
         })
     }
@@ -123,11 +247,19 @@ impl ActiveHostedCall {
     }
 
     pub(crate) async fn cancel_before_input(&self) -> Result<(), String> {
+        if self.admission.cancel() == HostedCallCancellation::NotSubmitted {
+            self.admission.await_not_submitted().await?;
+            self.record_terminal(crate::dynamic_tools::failure_response(
+                NOT_SUBMITTED_MESSAGE,
+            ))
+            .await;
+            return Ok(());
+        }
         loop {
             let should_cancel = {
                 let mut phase = self.phase.lock().await;
                 match &*phase {
-                    SettlementPhase::Running | SettlementPhase::Uncertain(_) => {
+                    SettlementPhase::Unsettled | SettlementPhase::Uncertain(_) => {
                         *phase = SettlementPhase::Cancelling;
                         true
                     }
@@ -143,7 +275,7 @@ impl ActiveHostedCall {
             match &*self.phase.lock().await {
                 SettlementPhase::Resolved => return Ok(()),
                 SettlementPhase::Uncertain(detail) => return Err(detail.clone()),
-                SettlementPhase::Running
+                SettlementPhase::Unsettled
                 | SettlementPhase::Cancelling
                 | SettlementPhase::AwaitingTerminal(_)
                 | SettlementPhase::Terminal(_) => {}
@@ -191,7 +323,7 @@ impl ActiveHostedCall {
                 SettlementPhase::AwaitingTerminal(_) => {}
                 SettlementPhase::Terminal(_) | SettlementPhase::Resolved => return Ok(()),
                 SettlementPhase::Uncertain(detail) => return Err(detail.clone()),
-                SettlementPhase::Running | SettlementPhase::Cancelling => continue,
+                SettlementPhase::Unsettled | SettlementPhase::Cancelling => continue,
             }
             tokio::select! {
                 () = notified => {}
@@ -292,7 +424,7 @@ impl ActiveHostedCall {
     pub(crate) async fn terminal_response(&self) -> Option<DynamicToolCallResponse> {
         match &*self.phase.lock().await {
             SettlementPhase::Terminal(response) => Some(response.clone()),
-            SettlementPhase::Running
+            SettlementPhase::Unsettled
             | SettlementPhase::Cancelling
             | SettlementPhase::AwaitingTerminal(_)
             | SettlementPhase::Uncertain(_)
@@ -361,6 +493,17 @@ mod tests {
         Arc<ActiveHostedCall>,
         tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     ) {
+        let admission = HostedCallAdmission::default();
+        assert!(admission.try_dispatch());
+        call_with_admission(admission)
+    }
+
+    fn call_with_admission(
+        admission: HostedCallAdmission,
+    ) -> (
+        Arc<ActiveHostedCall>,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
         let params = DynamicToolCallParams {
             context_call_id: Some("context-call".to_string()),
             thread_id: "thread".to_string(),
@@ -381,9 +524,80 @@ mod tests {
                 "application".to_string(),
                 7,
                 "nonce".to_string(),
+                admission,
             ),
             receiver,
         )
+    }
+
+    #[test]
+    fn admission_cancellation_wins_before_dispatch() {
+        let admission = HostedCallAdmission::default();
+
+        assert_eq!(admission.cancel(), HostedCallCancellation::NotSubmitted);
+        assert!(!admission.try_dispatch());
+        assert_eq!(admission.cancel(), HostedCallCancellation::NotSubmitted);
+    }
+
+    #[test]
+    fn dispatch_wins_before_cancellation() {
+        let admission = HostedCallAdmission::default();
+
+        assert!(admission.try_dispatch());
+        assert_eq!(admission.cancel(), HostedCallCancellation::Dispatched);
+        assert!(!admission.try_dispatch());
+    }
+
+    #[test]
+    fn dropping_guard_cancels_pending_admission() {
+        let admission = HostedCallAdmission::default();
+        drop(admission.cancel_on_drop());
+
+        assert!(!admission.try_dispatch());
+    }
+
+    #[tokio::test]
+    async fn cancellation_notifies_recovery_waiter() {
+        let admission = HostedCallAdmission::default();
+        let waiting = admission.clone();
+        let waiter = tokio::spawn(async move { waiting.cancelled().await });
+
+        assert_eq!(admission.cancel(), HostedCallCancellation::NotSubmitted);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation wakes waiter")
+            .expect("waiter task");
+    }
+
+    #[tokio::test]
+    async fn exact_cancellation_before_dispatch_settles_without_host_request() {
+        let admission = HostedCallAdmission::default();
+        let (call, mut events) = call_with_admission(admission.clone());
+        let waiting_call = Arc::clone(&call);
+        let mut cancellation =
+            tokio::spawn(async move { waiting_call.cancel_before_input().await });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut cancellation)
+                .await
+                .is_err(),
+            "input remains fenced until the detached owner settles its ledger obligation"
+        );
+        admission.finalize_not_submitted(Ok(()));
+
+        cancellation
+            .await
+            .expect("cancellation task")
+            .expect("pending admission has an exact local outcome");
+
+        let expected = crate::dynamic_tools::failure_response(NOT_SUBMITTED_MESSAGE);
+        assert_eq!(call.terminal_response().await, Some(expected.clone()));
+        match events.recv().await.expect("known-not-submitted completion") {
+            AppEvent::DynamicToolCallCompleted { response, .. } => {
+                assert_eq!(response, expected);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
     }
 
     #[test]
@@ -392,7 +606,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&call.request).expect("serialize exact cancel request"),
             serde_json::json!({
-                "protocolVersion": 3,
+                "protocolVersion": 4,
                 "threadId": "thread",
                 "turnId": "turn",
                 "callId": "call",

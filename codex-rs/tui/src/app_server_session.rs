@@ -1333,6 +1333,7 @@ impl AppServerSession {
                 params: ThreadInjectItemsParams {
                     thread_id: thread_id.to_string(),
                     items,
+                    terminal_call_id: None,
                 },
             })
             .await

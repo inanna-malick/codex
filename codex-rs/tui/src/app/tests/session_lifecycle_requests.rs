@@ -1,6 +1,5 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
-use crate::chatwidget::UserMessage;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -1751,7 +1750,7 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
     assert_eq!(
         call.body,
         serde_json::json!({
-            "protocolVersion": 3,
+            "protocolVersion": 4,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",
@@ -1769,7 +1768,7 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resolution() -> Result<()> {
+async fn hosted_haskell_interrupt_requests_exact_cancel_and_native_interrupt() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
@@ -1847,17 +1846,22 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
         !app.chat_widget.is_user_turn_pending_or_running(),
         "hosted Haskell dispatch can precede the widget's running-turn state"
     );
-    app.chat_widget
-        .restore_user_message_to_composer(UserMessage::from("queued-human"));
-    app.chat_widget
-        .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let queued_event =
-        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), events.recv())
-            .await?
-            .expect("real Tab queue action must notify the settlement gate");
-    assert_matches!(queued_event, AppEvent::QueuedFollowUpInput);
-    app.handle_event(&mut tui, &mut app_server, queued_event)
-        .await?;
+    app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::CodexOp(AppCommand::Interrupt),
+    )
+    .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if !recorded_params(&requests, "turn/interrupt").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native interrupt must be forwarded while exact host cancellation proceeds");
 
     let cancel = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
         loop {
@@ -1873,7 +1877,7 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
     assert_eq!(
         cancel.body,
         serde_json::json!({
-            "protocolVersion": 3,
+            "protocolVersion": 4,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",
@@ -1936,12 +1940,6 @@ async fn hosted_haskell_human_input_waits_for_exact_cancel_and_original_resoluti
         }
     })
     .await?;
-    assert_eq!(
-        app.chat_widget.queued_user_message_texts(),
-        vec!["queued-human"],
-        "tool settlement must not bypass normal turn completion before inference"
-    );
-
     host_task.join().expect("host thread panicked")?;
     app_server.shutdown().await?;
     proxy.await??;
@@ -3888,7 +3886,8 @@ enum HostSettlementCase {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn failed_host_completion_keeps_session_alive_and_disables_host_calls() -> Result<()> {
+async fn failed_host_completion_keeps_session_alive_and_routes_calls_through_recovery() -> Result<()>
+{
     use crate::host_dynamic_tools::HostDynamicToolRouting;
     use crate::host_dynamic_tools::HostDynamicTools;
     use std::os::unix::fs::PermissionsExt;
@@ -3979,46 +3978,45 @@ async fn failed_host_completion_keeps_session_alive_and_disables_host_calls() ->
         })
         .await
         .expect("settlement failure must be reported");
-        assert_eq!(host.routing(&params), HostDynamicToolRouting::Disabled);
-        // Reconnect and turn settlement must not contact or silently re-enable the host.
-        host.settle_turn(&thread.to_string()).await?;
+        assert_eq!(host.routing(&params), HostDynamicToolRouting::Forward);
+        let admission = crate::host_dynamic_tools::HostedCallAdmission::default();
+        admission.cancel();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            host.call_with_admission(&params, &admission),
+        )
+        .await
+        .expect("cancelled admission must not wait for host recovery")?;
+        assert_eq!(
+            response,
+            crate::dynamic_tools::failure_response(
+                "Hosted tool call was cancelled before it was submitted."
+            )
+        );
+        // Recovery owns the retained call. Once the same host identity returns,
+        // a fresh call waits for that reconciliation and is submitted normally.
+        std::fs::remove_file(&socket)?;
+        let (_restored_requests, restored_host_task) =
+            crate::host_dynamic_tools::spawn_host(&socket, 3)?;
         host.revalidate_registration().await?;
-        host.attach_primary(thread).await?;
+        let mut next_call = params.clone();
+        next_call.call_id = "next-call".into();
+        next_call.context_call_id = Some("next-call".into());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), host.call(&next_call))
+                .await
+                .expect("fresh call must resume after retained settlement")?
+                .success
+        );
         let mut other_tool = params.clone();
         other_tool.tool = "unrelated_tool".into();
         assert_eq!(
             host.routing(&other_tool),
             HostDynamicToolRouting::Unregistered
         );
-        let expected =
-            crate::dynamic_tools::failure_response(crate::host_dynamic_tools::DISABLED_MESSAGE);
-        assert_eq!(host.call(&params).await?, expected);
-        app.handle_app_server_event(
-            &app_server,
-            AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
-                request_id: AppServerRequestId::Integer(702),
-                params,
-            })),
-        )
-        .await;
-        let mut saw_unavailable_response = false;
-        while let Ok(event) = events.try_recv() {
-            match event {
-                AppEvent::FatalExitRequest(message) => panic!("session exited: {message}"),
-                AppEvent::DynamicToolCallCompleted {
-                    request_id,
-                    response,
-                } => {
-                    assert_eq!(request_id, AppServerRequestId::Integer(702));
-                    assert_eq!(response, expected);
-                    saw_unavailable_response = true;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_unavailable_response);
         app_server.shutdown().await?;
         proxy.await??;
+        restored_host_task.join().expect("restored host panicked")?;
     }
     Ok(())
 }

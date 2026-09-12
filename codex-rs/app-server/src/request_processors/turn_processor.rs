@@ -974,13 +974,37 @@ impl TurnRequestProcessor {
             .map_err(invalid_request)?;
         validate_response_item_image_urls(&items)?;
 
-        thread
-            .inject_response_items(items)
-            .await
-            .map_err(|err| match err.details() {
-                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
-                _ => internal_error(format!("failed to inject response items: {err}")),
-            })?;
+        let terminal_call_id = params.terminal_call_id;
+        if let Some(expected_call_id) = terminal_call_id.as_deref() {
+            let actual_call_id = match items.as_slice() {
+                [
+                    ResponseItem::FunctionCallOutput {
+                        call_id: Some(call_id),
+                        ..
+                    },
+                ]
+                | [ResponseItem::CustomToolCallOutput { call_id, .. }] => Some(call_id.as_str()),
+                _ => None,
+            };
+            if actual_call_id != Some(expected_call_id) {
+                return Err(invalid_request(format!(
+                    "terminalCallId requires exactly one matching terminal tool output for {expected_call_id}"
+                )));
+            }
+        }
+
+        let injection = if terminal_call_id.is_some() {
+            let thread = Arc::clone(&thread);
+            tokio::spawn(async move { thread.inject_response_items_history_only(items).await })
+                .await
+                .map_err(|err| internal_error(format!("history injection owner stopped: {err}")))?
+        } else {
+            thread.inject_response_items(items).await
+        };
+        injection.map_err(|err| match err.details() {
+            CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+            _ => internal_error(format!("failed to inject response items: {err}")),
+        })?;
         Ok(ThreadInjectItemsResponse {})
     }
 

@@ -426,15 +426,6 @@ impl App {
                         });
                         return;
                     }
-                    crate::host_dynamic_tools::HostDynamicToolRouting::Disabled => {
-                        self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                            request_id: request_id.clone(),
-                            response: crate::dynamic_tools::failure_response(
-                                crate::host_dynamic_tools::DISABLED_MESSAGE,
-                            ),
-                        });
-                        return;
-                    }
                     crate::host_dynamic_tools::HostDynamicToolRouting::Forward => {
                         if let Some(entry) = self.dynamic_tool_tasks.get_mut(request_id) {
                             if !entry.matches_params(params) {
@@ -463,11 +454,13 @@ impl App {
                         let task_request_id = request_id.clone();
                         let source_thread_id = params.thread_id.clone();
                         let params = params.clone();
+                        let admission = crate::host_dynamic_tools::HostedCallAdmission::default();
                         let settlement = match host
                             .begin_cancellable_call(
                                 request_id.clone(),
                                 &params,
                                 app_event_tx.clone(),
+                                admission.clone(),
                             )
                             .await
                         {
@@ -482,10 +475,12 @@ impl App {
                         };
                         let task_settlement = settlement.clone();
                         let task_params = params.clone();
+                        let cancel_pending_admission = admission.cancel_on_drop();
+                        let owned_call = host.call_with_admission(&params, &admission);
                         let task = tokio::spawn(async move {
-                            let call = tokio::spawn(async move { host.call(&params).await });
-                            match call.await {
-                                Ok(Ok(response)) => {
+                            let _cancel_pending_admission = cancel_pending_admission;
+                            match owned_call.await {
+                                Ok(response) => {
                                     if let Some(settlement) = task_settlement {
                                         settlement.complete_from_call(response).await;
                                     } else {
@@ -495,20 +490,8 @@ impl App {
                                         });
                                     }
                                 }
-                                Ok(Err(error)) => {
-                                    tracing::warn!(%error, "host dynamic-tool call failed");
-                                    if let Some(settlement) = task_settlement {
-                                        settlement.transport_uncertain(error.to_string()).await;
-                                    } else {
-                                        app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                                            request_id,
-                                            response:
-                                                crate::host_dynamic_tools::infrastructure_failure(),
-                                        });
-                                    }
-                                }
                                 Err(error) => {
-                                    tracing::warn!(%error, "host dynamic-tool call task terminated");
+                                    tracing::warn!(%error, "host dynamic-tool call failed");
                                     if let Some(settlement) = task_settlement {
                                         settlement.transport_uncertain(error.to_string()).await;
                                     } else {

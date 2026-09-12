@@ -487,6 +487,17 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+fn terminal_tool_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
+
 impl Session {
     /// Spawn and initialize a new session.
     /// Hide the concrete startup future from callers while keeping initialization lazy.
@@ -3363,25 +3374,64 @@ impl Session {
             .await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the history lock reserves a terminal call id through its durable rollout append"
+    )]
     async fn record_prepared_conversation_items(
         &self,
         turn_context: &TurnContext,
-        items: Vec<ResponseItemEnvelope>,
+        mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
-        let response_items = items
-            .iter()
-            .map(|envelope| envelope.item.clone())
-            .collect::<Vec<_>>();
-        {
+        let (response_items, terminal_items_prequeued) = {
             let mut state = self.state.lock().await;
+            // A tool call has one terminal protocol output. Enforce that at the shared history
+            // owner so recovery injection and a late ordinary result cannot both append it.
+            let mut terminal_call_ids = state
+                .history
+                .raw_items()
+                .filter_map(terminal_tool_call_id)
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>();
+            items.retain(|envelope| {
+                terminal_tool_call_id(&envelope.item)
+                    .is_none_or(|call_id| terminal_call_ids.insert(call_id.to_owned()))
+            });
+            if items.is_empty() {
+                return;
+            }
+            let response_items = items
+                .iter()
+                .map(|envelope| envelope.item.clone())
+                .collect::<Vec<_>>();
+            let terminal_items_prequeued = response_items
+                .iter()
+                .any(|item| terminal_tool_call_id(item).is_some())
+                && if let Some(live_thread) = self.live_thread() {
+                    let rollout_items = items
+                        .iter()
+                        .cloned()
+                        .map(RolloutItem::ResponseItem)
+                        .collect::<Vec<_>>();
+                    if let Err(error) = live_thread.append_items(&rollout_items).await {
+                        error!(
+                            "failed to queue terminal rollout item before recording history: {error:#}"
+                        );
+                        return;
+                    }
+                    true
+                } else {
+                    false
+                };
             state
                 .current_time_reminder
                 .note_recorded_items(&response_items);
             state
                 .history
                 .record_annotated_items(&items, turn_context.model_info().truncation_policy.into());
-        }
+            (response_items, terminal_items_prequeued)
+        };
         for image in image_preparations {
             self.services
                 .analytics_events_client
@@ -3392,7 +3442,9 @@ impl Session {
         }
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
-        self.persist_rollout_items(&rollout_items).await;
+        if !terminal_items_prequeued {
+            self.persist_rollout_items(&rollout_items).await;
+        }
         if turn_context.config.memories.disable_on_external_context
             && let Some(item) = response_items
                 .iter()

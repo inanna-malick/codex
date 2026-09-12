@@ -5,10 +5,13 @@ mod commands;
 mod completions;
 #[cfg(unix)]
 mod input_control;
+mod recovered;
+mod recovery;
 #[cfg(target_os = "linux")]
 mod workspace_control;
 
 pub(crate) use cancellation::ActiveHostedCall;
+pub(crate) use cancellation::HostedCallAdmission;
 
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
@@ -25,12 +28,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 const SESSION_PATH: &str = "/v1/dynamic-tools/session";
 const CALL_PATH: &str = "/v1/dynamic-tools/call";
@@ -39,7 +41,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // Settlement can wait for the host actor and its shared machine checkout.
 const SETTLEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const DISABLED_MESSAGE: &str = "Host dynamic tools are disabled for this session because completion could not be confirmed. Previous host operations may have taken effect; do not repeat them without checking. Other Codex tools remain available.";
 const MAX_REGISTRATION_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CALL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -86,9 +87,8 @@ pub(crate) struct HostDynamicTools {
     primary_thread_id: Mutex<Option<ThreadId>>,
     state_db: StateDbHandle,
     completions: Mutex<completions::HostToolCompletions>,
-    settlement_sender: Mutex<Option<tokio::sync::mpsc::Sender<completions::SettlementWork>>>,
+    recovery: recovery::Recovery,
     input_settlement: cancellation::InputSettlementGate,
-    disabled: AtomicBool,
     application_instance_id: String,
     session_generation: AtomicU64,
     #[cfg(unix)]
@@ -101,7 +101,7 @@ impl std::fmt::Debug for HostDynamicTools {
             .debug_struct("HostDynamicTools")
             .field("registration", &self.registration)
             .field("primary_thread_id", &self.primary_thread_id())
-            .field("disabled", &self.is_disabled())
+            .field("recovery", &*self.recovery.health.borrow())
             .finish_non_exhaustive()
     }
 }
@@ -111,7 +111,6 @@ pub(crate) enum HostDynamicToolRouting {
     Unregistered,
     Forward,
     Reject,
-    Disabled,
 }
 
 #[derive(Serialize)]
@@ -152,10 +151,6 @@ impl HostDynamicTools {
             return control.commands.output(output);
         }
         false
-    }
-
-    fn is_disabled(&self) -> bool {
-        self.disabled.load(Ordering::Acquire)
     }
 
     pub(crate) fn configure_fork(&self, params: &mut codex_app_server_protocol::ThreadForkParams) {
@@ -229,9 +224,8 @@ impl HostDynamicTools {
                 primary_thread_id: Mutex::new(None),
                 state_db,
                 completions: Mutex::new(completions::HostToolCompletions::default()),
-                settlement_sender: Mutex::new(None),
+                recovery: recovery::Recovery::default(),
                 input_settlement: cancellation::InputSettlementGate::default(),
-                disabled: AtomicBool::new(false),
                 application_instance_id: uuid::Uuid::new_v4().to_string(),
                 session_generation: AtomicU64::new(0),
                 client,
@@ -258,9 +252,6 @@ impl HostDynamicTools {
         let Some(kind) = self.identities.get(&key).copied() else {
             return HostDynamicToolRouting::Unregistered;
         };
-        if self.is_disabled() {
-            return HostDynamicToolRouting::Disabled;
-        }
         let authorized = ThreadId::from_string(&params.thread_id)
             .ok()
             .is_some_and(|thread_id| self.primary_thread_id() == Some(thread_id));
@@ -277,13 +268,18 @@ impl HostDynamicTools {
     }
 
     pub(crate) async fn attach_primary_with_input(
-        &self,
+        self: &Arc<Self>,
         thread_id: ThreadId,
         handle: codex_app_server_client::AppServerRequestHandle,
     ) -> color_eyre::Result<()> {
+        *self
+            .recovery
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle.clone());
         #[cfg(not(unix))]
         let _ = handle;
-        if self.is_disabled() || !self.should_attach(thread_id) {
+        if !self.should_attach(thread_id) {
             return Ok(());
         }
         #[cfg(unix)]
@@ -317,11 +313,14 @@ impl HostDynamicTools {
         self.attach_primary(thread_id).await
     }
 
-    pub(crate) async fn attach_primary(&self, thread_id: ThreadId) -> color_eyre::Result<()> {
-        if self.is_disabled() || !self.should_attach(thread_id) {
+    pub(crate) async fn attach_primary(
+        self: &Arc<Self>,
+        thread_id: ThreadId,
+    ) -> color_eyre::Result<()> {
+        if !self.should_attach(thread_id) {
             return Ok(());
         }
-        let pending = self.recover_completions_before_reattach(thread_id).await?;
+
         #[cfg(unix)]
         let (input_socket, binding_state) = {
             let control = self.input_control.lock().await;
@@ -349,19 +348,28 @@ impl HostDynamicTools {
         .map_err(|_| {
             color_eyre::eyre::eyre!("host dynamic-tools session attachment timed out")
         })??;
-        self.settle_reattached_pending(&thread_id.to_string(), &pending)
-            .await?;
         *self
             .primary_thread_id
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread_id);
+        let recovering = self
+            .state_db
+            .thread_queue()
+            .list_unresolved_host_tool_completions(thread_id)
+            .await
+            .map(|records| !records.is_empty())
+            .unwrap_or(true);
+        self.recovery
+            .history_pending
+            .store(recovering, Ordering::Release);
+        if recovering {
+            self.recovery.start_recovering();
+        }
+        self.wake_recovery(None);
         Ok(())
     }
 
     pub(crate) async fn revalidate_registration(&self) -> color_eyre::Result<()> {
-        if self.is_disabled() {
-            return Ok(());
-        }
         #[cfg(unix)]
         let registration =
             tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, fetch_registration(&self.client))
@@ -376,29 +384,162 @@ impl HostDynamicTools {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn call(
-        &self,
+        self: &Arc<Self>,
         params: &DynamicToolCallParams,
     ) -> color_eyre::Result<DynamicToolCallResponse> {
-        if self.is_disabled() {
-            return Ok(crate::dynamic_tools::failure_response(DISABLED_MESSAGE));
-        }
-        if let Some(call_id) = &params.context_call_id {
-            self.state_db
-                .thread_queue()
-                .register_host_tool_completion(&codex_state::HostToolCompletionKey {
-                    thread_id: ThreadId::from_string(&params.thread_id)?,
-                    context_call_id: call_id.clone(),
-                })
+        self.call_with_admission(params, &HostedCallAdmission::default())
+            .await
+    }
+
+    pub(crate) fn call_with_admission(
+        self: &Arc<Self>,
+        params: &DynamicToolCallParams,
+        admission: &HostedCallAdmission,
+    ) -> impl std::future::Future<Output = color_eyre::Result<DynamicToolCallResponse>> + Send + 'static
+    {
+        let host = Arc::clone(self);
+        let params = params.clone();
+        let admission = admission.clone();
+        // The caller's drop guard cancels admission. This owner still finishes
+        // an in-flight ledger write and retains already-submitted execution.
+        let owner = tokio::spawn(async move { host.call_owned(&params, &admission).await });
+        async move {
+            owner
                 .await
-                .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+                .map_err(|error| color_eyre::eyre::eyre!("hosted call owner stopped: {error}"))?
+        }
+    }
+
+    async fn call_owned(
+        self: &Arc<Self>,
+        params: &DynamicToolCallParams,
+        admission: &HostedCallAdmission,
+    ) -> color_eyre::Result<DynamicToolCallResponse> {
+        let deadline = tokio::time::Instant::now() + recovery::ADMISSION_GRACE;
+        let admitted = tokio::select! {
+            result = self.recovery.admit_until(deadline) => result,
+            () = admission.cancelled() => Err(cancellation::NOT_SUBMITTED_MESSAGE.to_owned()),
+        };
+        if let Err(reason) = admitted {
+            admission.finalize_not_submitted(Ok(()));
+            return Ok(crate::dynamic_tools::failure_response(&reason));
+        }
+        let Some(call_id) = params.context_call_id.as_ref().filter(|id| !id.is_empty()) else {
+            admission.finalize_not_submitted(Ok(()));
+            return Ok(crate::dynamic_tools::failure_response(
+                "Not submitted: hosted execution requires an exact context call ID.",
+            ));
+        };
+        let thread_id = match ThreadId::from_string(&params.thread_id) {
+            Ok(thread) => thread,
+            Err(_) => {
+                admission.finalize_not_submitted(Ok(()));
+                return Ok(crate::dynamic_tools::failure_response(
+                    "Not submitted: hosted execution requires a valid thread ID.",
+                ));
+            }
+        };
+        let key = codex_state::HostToolCompletionKey {
+            thread_id,
+            context_call_id: call_id.clone(),
+        };
+        match self
+            .state_db
+            .thread_queue()
+            .register_host_tool_call(&key)
+            .await
+        {
+            Ok(codex_state::HostToolCompletionRegistration::New(_)) => {}
+            Ok(codex_state::HostToolCompletionRegistration::Existing(record)) => {
+                admission.finalize_not_submitted(Ok(()));
+                return Ok(crate::dynamic_tools::failure_response(format!(
+                    "Not resubmitted: hosted call {} is already retained ({:?}). Reconcile that call rather than repeating its body.",
+                    record.key.context_call_id, record.state
+                )));
+            }
+            Err(error) => {
+                admission.finalize_not_submitted(Ok(()));
+                return Ok(crate::dynamic_tools::failure_response(format!(
+                    "Not submitted: could not register hosted call: {error:#}"
+                )));
+            }
+        }
+        self.completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(key.context_call_id.clone());
+        let not_submitted = loop {
+            match self.recovery.try_dispatch(admission) {
+                recovery::DispatchOutcome::Dispatched => break None,
+                recovery::DispatchOutcome::Cancelled => {
+                    break Some(cancellation::NOT_SUBMITTED_MESSAGE.to_owned());
+                }
+                recovery::DispatchOutcome::Recovering => {
+                    let admitted = tokio::select! {
+                        result = self.recovery.admit_until(deadline) => result,
+                        () = admission.cancelled() => Err(cancellation::NOT_SUBMITTED_MESSAGE.to_owned()),
+                    };
+                    if let Err(reason) = admitted {
+                        break Some(reason);
+                    }
+                }
+            }
+        };
+        if let Some(reason) = not_submitted {
             self.completions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .register(call_id.clone())?;
+                .not_submitted
+                .insert(key.context_call_id.clone());
+            self.wake_recovery(None);
+            let mut delay = Duration::from_millis(100);
+            loop {
+                match self
+                    .state_db
+                    .thread_queue()
+                    .mark_host_tool_completion_not_submitted(&key)
+                    .await
+                {
+                    Ok(_) => {
+                        self.completions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .forget(&key.context_call_id);
+                        break;
+                    }
+                    Err(error) => {
+                        let retryable = error
+                            .downcast_ref::<codex_state::HostToolCompletionError>()
+                            .is_some_and(codex_state::HostToolCompletionError::retryable);
+                        let error = completions::store_error(error);
+                        self.recovery.failed(&error);
+                        if !retryable {
+                            admission.finalize_not_submitted(Err(format!("execution was not submitted; its ledger disposition could not be persisted: {error}")));
+                            return Err(error);
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+            admission.finalize_not_submitted(Ok(()));
+            return Ok(crate::dynamic_tools::failure_response(&reason));
         }
         #[cfg(unix)]
-        return send_call(&self.client, params).await;
+        {
+            let result = send_call(&self.client, params).await;
+            if let Err(error) = &result {
+                self.completions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .reconcile_call(call_id.clone());
+                self.recovery.failed(error);
+                self.wake_recovery(None);
+            }
+            result
+        }
         #[cfg(not(unix))]
         color_eyre::eyre::bail!("host dynamic tools are unavailable on this platform")
     }
@@ -408,6 +549,7 @@ impl HostDynamicTools {
         request_id: codex_app_server_protocol::RequestId,
         params: &DynamicToolCallParams,
         events: crate::app_event_sender::AppEventSender,
+        admission: HostedCallAdmission,
     ) -> Result<Option<Arc<ActiveHostedCall>>, String> {
         if params.namespace.is_some() || params.tool != "haskell" {
             return Ok(None);
@@ -428,6 +570,7 @@ impl HostDynamicTools {
                 self.application_instance_id.clone(),
                 self.session_generation.load(Ordering::Acquire),
                 self.registration.input_control_nonce.clone(),
+                admission,
             );
             self.input_settlement.activate(&call).await?;
             Ok(Some(call))

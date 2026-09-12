@@ -712,6 +712,16 @@ impl App {
                     self.chat_widget
                         .apply_reserve_fallback_to_pending_turn(&mut op);
                 }
+                if matches!(&op, AppCommand::Interrupt) {
+                    for entry in self.dynamic_tool_tasks.values_mut().filter(|entry| {
+                        entry.settlement.is_some()
+                            && self.active_thread_id.is_some_and(|thread_id| {
+                                entry.source_thread_id == thread_id.to_string()
+                            })
+                    }) {
+                        entry.ensure_cancellation_requested();
+                    }
+                }
                 if matches!(&op, AppCommand::UserTurn { .. })
                     && let Some(entry) = self.dynamic_tool_tasks.values_mut().find(|entry| {
                         entry.settlement.is_some()

@@ -1738,6 +1738,11 @@ pub struct ThreadInjectItemsParams {
     pub thread_id: String,
     /// Raw Responses API items to append to the thread's model-visible history.
     pub items: Vec<JsonValue>,
+    /// Append exactly one matching terminal tool output directly to durable
+    /// history, even while a turn is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub terminal_call_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
