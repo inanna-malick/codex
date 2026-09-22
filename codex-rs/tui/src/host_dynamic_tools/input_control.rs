@@ -153,14 +153,7 @@ async fn control(
             "invalid hosted input control payload".to_string(),
         )
     })?;
-    let binding = match &request {
-        protocol::Request::Bind { binding }
-        | protocol::Request::Submit { binding, .. }
-        | protocol::Request::Query { binding, .. }
-        | protocol::Request::Withdraw { binding, .. }
-        | protocol::Request::Seal { binding, .. }
-        | protocol::Request::Acknowledge { binding, .. } => binding.clone(),
-    };
+    let binding = request.binding().clone();
     target
         .binding
         .lock()
@@ -192,7 +185,7 @@ async fn control(
     let outcome = match request {
         protocol::Request::Bind { .. } => unreachable!("bind returned after validation"),
         protocol::Request::Submit { envelope, .. } => {
-            let envelope = envelope.validate(target.thread).map_err(|_| {
+            envelope.validate(&target.thread.to_string()).map_err(|_| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "noncanonical hosted input envelope".to_string(),

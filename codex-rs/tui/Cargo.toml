@@ -55,6 +55,7 @@ codex-protocol = { workspace = true }
 codex-rollout = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-shell-command = { workspace = true }
+codex-shoal-protocol = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-utils-approval-presets = { workspace = true }

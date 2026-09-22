@@ -21,6 +21,13 @@ use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_rollout::StateDbHandle;
+use codex_shoal_protocol::CALL_PATH;
+use codex_shoal_protocol::CANCEL_PATH;
+use codex_shoal_protocol::HOST_PROTOCOL_VERSION as PROTOCOL_VERSION;
+use codex_shoal_protocol::MAX_CALL_RESPONSE_BYTES;
+use codex_shoal_protocol::MAX_REGISTRATION_RESPONSE_BYTES;
+use codex_shoal_protocol::REGISTRATION_PATH;
+use codex_shoal_protocol::SESSION_PATH;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -32,17 +39,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-const PROTOCOL_VERSION: u32 = 4;
-const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
-const SESSION_PATH: &str = "/v1/dynamic-tools/session";
-const CALL_PATH: &str = "/v1/dynamic-tools/call";
-const CANCEL_PATH: &str = "/v1/dynamic-tools/cancel";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 // Settlement can wait for the host actor and its shared machine checkout.
 const SETTLEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_REGISTRATION_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_CALL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DynamicToolKind {
