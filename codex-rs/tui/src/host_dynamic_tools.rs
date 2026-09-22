@@ -29,7 +29,6 @@ use codex_shoal_protocol::MAX_REGISTRATION_RESPONSE_BYTES;
 use codex_shoal_protocol::REGISTRATION_PATH;
 use codex_shoal_protocol::SESSION_PATH;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -59,25 +58,10 @@ impl DynamicToolKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum HostDynamicToolScope {
-    PrimaryThread,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HostDynamicToolRegistration {
-    protocol_version: u32,
-    dynamic_tools: Vec<DynamicToolSpec>,
-    scope: HostDynamicToolScope,
-    #[serde(default)]
-    input_control_socket: Option<AbsolutePathBuf>,
-    #[serde(default)]
-    launch_id: String,
-    #[serde(default)]
-    input_control_nonce: String,
-}
+type HostDynamicToolRegistration =
+    codex_shoal_protocol::HostedRegistration<DynamicToolSpec, AbsolutePathBuf>;
+#[cfg(test)]
+type HostDynamicToolScope = codex_shoal_protocol::HostedRegistrationScope;
 
 pub(crate) struct HostDynamicTools {
     registration: HostDynamicToolRegistration,

@@ -45,6 +45,30 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostedRegistrationScope {
+    PrimaryThread,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedRegistration<Tool, Path> {
+    pub protocol_version: u32,
+    pub dynamic_tools: Vec<Tool>,
+    pub scope: HostedRegistrationScope,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub input_control_socket: Option<Path>,
+    #[serde(default)]
+    pub launch_id: String,
+    #[serde(default)]
+    pub input_control_nonce: String,
+}
+
+fn option_none<T>() -> Option<T> {
+    None
+}
+
 impl Default for Manifest {
     fn default() -> Self {
         Self {
