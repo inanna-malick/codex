@@ -44,6 +44,8 @@ pub struct Manifest {
     pub max_workspace_reply_bytes: usize,
     pub max_input_control_reply_bytes: usize,
     pub max_input_bytes: usize,
+    pub max_correlation_bytes: usize,
+    pub max_producer_bytes: usize,
     pub capabilities: Vec<String>,
 }
 
@@ -139,6 +141,8 @@ impl Default for Manifest {
             max_workspace_reply_bytes: MAX_WORKSPACE_REPLY_BYTES,
             max_input_control_reply_bytes: MAX_INPUT_CONTROL_REPLY_BYTES,
             max_input_bytes: MAX_INPUT_BYTES,
+            max_correlation_bytes: MAX_CORRELATION_BYTES,
+            max_producer_bytes: MAX_PRODUCER_BYTES,
             capabilities: vec![
                 "hostedRegistration".into(),
                 "boundInputControl".into(),

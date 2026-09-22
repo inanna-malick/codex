@@ -81,6 +81,8 @@ fn manifest_is_stable_machine_readable_compatibility_evidence() {
         encoded["inputControlProtocolVersion"],
         INPUT_CONTROL_PROTOCOL_VERSION
     );
+    assert_eq!(encoded["maxCorrelationBytes"], MAX_CORRELATION_BYTES);
+    assert_eq!(encoded["maxProducerBytes"], MAX_PRODUCER_BYTES);
     assert_eq!(encoded["capabilities"].as_array().unwrap().len(), 4);
 }
 
