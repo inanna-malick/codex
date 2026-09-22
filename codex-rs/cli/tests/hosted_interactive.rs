@@ -111,7 +111,7 @@ fn spawn_host(
                     (
                         "200 OK",
                         serde_json::to_vec(&json!({
-                        "protocolVersion": 3,
+                        "protocolVersion": codex_shoal_protocol::HOST_PROTOCOL_VERSION,
                         "dynamicTools": [{
                             "type": "custom",
                             "name": "evaluate",
@@ -313,7 +313,10 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
     let thread_id = attachment.body["threadId"]
         .as_str()
         .context("attached thread id")?;
-    assert_eq!(attachment.body["protocolVersion"], json!(3));
+    assert_eq!(
+        attachment.body["protocolVersion"],
+        json!(codex_shoal_protocol::HOST_PROTOCOL_VERSION)
+    );
     assert_eq!(attachment.body["threadId"], json!(thread_id));
     assert_eq!(
         attachment.body["inputControlSocket"],
@@ -360,7 +363,10 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
     let resumed_attachment = host_requests.recv_timeout(Duration::from_secs(/*secs*/ 10))?;
     assert_eq!(resumed_attachment.method, "POST");
     assert_eq!(resumed_attachment.path, "/v1/dynamic-tools/session");
-    assert_eq!(resumed_attachment.body["protocolVersion"], json!(3));
+    assert_eq!(
+        resumed_attachment.body["protocolVersion"],
+        json!(codex_shoal_protocol::HOST_PROTOCOL_VERSION)
+    );
     assert_eq!(resumed_attachment.body["threadId"], json!(thread_id));
     assert_eq!(
         resumed_attachment.body["inputControlSocket"],
@@ -379,7 +385,7 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
 
     let binding = |instance: &str| {
         json!({
-            "protocolVersion": 5,
+            "protocolVersion": codex_shoal_protocol::INPUT_CONTROL_PROTOCOL_VERSION,
             "launchId": "launch-test",
             "instanceId": instance,
             "generation": 1,
