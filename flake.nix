@@ -50,6 +50,7 @@
         {
           codex-rs = codex-rs;
           default = codex-rs;
+          codex-rs-release = codex-rs.override { buildType = "release"; };
         }
       );
 

@@ -9,6 +9,7 @@
   lib,
   stdenv,
   version ? "0.0.0",
+  buildType ? "local",
   ...
 }:
 let
@@ -59,7 +60,7 @@ rustPlatform.buildRustPackage (_: {
     RUSTY_V8_SRC_BINDING_PATH = rustyV8Binding;
   };
   pname = "codex-rs";
-  inherit version;
+  inherit version buildType;
   cargoLock.lockFile = ./Cargo.lock;
   cargoBuildFlags = [
     "-p"
