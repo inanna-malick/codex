@@ -6,10 +6,16 @@ pub use child_command::Command;
 pub use child_command::DescriptorPolicy;
 pub use child_command::ProcessMode;
 pub use child_command::SpawnFallback;
+mod output_tail;
+pub use output_tail::OutputSegment;
+pub use output_tail::OutputTail;
+pub use output_tail::OutputWindow;
 pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
+#[cfg(target_os = "linux")]
+pub mod workspace_admission;
 #[cfg(test)]
 mod tests;
 #[cfg(unix)]
@@ -47,6 +53,21 @@ pub type SpawnedPty = SpawnedProcess;
 pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
+
+#[cfg(target_os = "linux")]
+mod command_resources;
+#[cfg(target_os = "linux")]
+mod command_child;
+#[cfg(target_os = "linux")]
+pub use command_child::CommandChild;
+#[cfg(target_os = "linux")]
+pub use command_resources::managed_commands;
+#[cfg(target_os = "linux")]
+pub use command_resources::with_hosted_job;
+#[cfg(target_os = "linux")]
+mod deferred;
+#[cfg(target_os = "linux")]
+pub use deferred::defer_process;
 #[cfg(windows)]
 pub use win::JobObject;
 #[cfg(windows)]

@@ -5,6 +5,7 @@
 use super::*;
 use crate::app_server_session::ResumeModelSettings;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
+use crate::host_dynamic_tools::HostDynamicTools;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum ReconnectPresentation {
@@ -27,15 +28,24 @@ pub(super) struct Reconnected {
     thread: Option<AppServerStartedThread>,
 }
 
+pub(super) struct ReconnectTooling {
+    pub(super) task_tools: ThreadToolTransport,
+    pub(super) host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+}
+
 pub(super) async fn reconnect(
     target: AppServerTarget,
     config: Config,
     local_settings: crate::local_settings::LocalSettings,
     thread_id: Option<ThreadId>,
     remote_cwd: Option<PathBuf>,
-    task_tools: ThreadToolTransport,
+    tooling: ReconnectTooling,
     presentation: ReconnectPresentation,
 ) -> Result<Reconnected> {
+    let ReconnectTooling {
+        task_tools,
+        host_dynamic_tools,
+    } = tooling;
     let mode = target.thread_params_mode();
     if matches!(target, AppServerTarget::Embedded) {
         color_eyre::eyre::bail!("in-process sessions have no connection to restore");
@@ -58,8 +68,12 @@ pub(super) async fn reconnect(
             let mut session = AppServerSession::new(client, mode)
                 .with_local_codex_home(&config.codex_home)
                 .with_remote_cwd_override(remote_cwd.clone())
-                .with_thread_tool_transport(task_tools.clone());
+                .with_thread_tool_transport(task_tools.clone())
+                .with_host_dynamic_tools(host_dynamic_tools.clone());
             let bootstrap = session.bootstrap(&config).await?;
+            if let Some(host) = &host_dynamic_tools {
+                host.revalidate_registration().await?;
+            }
             let thread = if let Some(thread_id) = thread_id {
                 match session
                     .resume_thread(
@@ -234,9 +248,17 @@ impl App {
             self.chat_widget.pause_for_disconnect();
             self.startup_pending_protected_request = false;
             self.abort_all_thread_event_listeners();
-            for (_, (_, task)) in self.dynamic_tool_tasks.drain() {
-                task.abort();
-            }
+            self.dynamic_tool_tasks.retain(|_, entry| {
+                if entry.settlement.is_some() {
+                    true
+                } else {
+                    entry.task.abort();
+                    if let Some(task) = entry.cancellation_task.take() {
+                        task.abort();
+                    }
+                    false
+                }
+            });
         }
         true
     }

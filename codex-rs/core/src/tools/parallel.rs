@@ -313,13 +313,11 @@ impl ToolCallRuntime {
         }
     }
 
-    fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
+    fn aborted_response(call: &ToolCall, message: String) -> AnyToolResult {
         AnyToolResult {
             call_id: call.call_id.clone(),
             payload: call.payload.clone(),
-            result: Box::new(AbortedToolOutput {
-                message: Self::abort_message(call, secs),
-            }),
+            result: Box::new(AbortedToolOutput { message }),
             post_tool_use_payload: None,
         }
     }

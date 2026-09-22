@@ -510,6 +510,8 @@ pub(crate) async fn run_turn(
                 .await;
 
             // Construct the input that we will send to the model.
+            sess.ensure_client_ready()?;
+            super::reasoning_configuration::record_for_step(&sess, &step_context).await?;
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await

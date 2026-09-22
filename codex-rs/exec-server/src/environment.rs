@@ -204,6 +204,8 @@ impl EnvironmentManager {
     }
 
     /// Discovers environment-variable environments without starting connections.
+    ///
+    /// Call `prepare_local` when execution must stay in the launching namespace.
     pub async fn prepare_from_env() -> Result<PreparedEnvironmentManager, ExecServerError> {
         let source = if let Some(config) = noise_environment_config_from_env()? {
             PreparedEnvironmentSource::Noise(config)
@@ -212,6 +214,15 @@ impl EnvironmentManager {
             PreparedEnvironmentSource::Snapshot(provider.snapshot().await?)
         };
         Ok(PreparedEnvironmentManager { source })
+    }
+
+    /// Selects only the launching process's local executor, ignoring shared and environment
+    /// configuration that could redirect native tools to another execution environment.
+    pub async fn prepare_local() -> Result<PreparedEnvironmentManager, ExecServerError> {
+        let provider = DefaultEnvironmentProvider::new(/*exec_server_url*/ None);
+        Ok(PreparedEnvironmentManager {
+            source: PreparedEnvironmentSource::Snapshot(provider.snapshot().await?),
+        })
     }
 
     /// Builds a manager from environment variables with an explicit outbound HTTP policy.

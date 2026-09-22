@@ -16,7 +16,11 @@ use super::output::CodeModeToolOutput;
 use super::telemetry::CodeModeToolCallGuard;
 use super::telemetry::trace_id;
 
-type CodeModeNestedTool = (Arc<ToolSpec>, Option<Arc<dyn CoreToolRuntime>>);
+type CodeModeNestedTool = (
+    Arc<ToolSpec>,
+    Option<Arc<dyn CoreToolRuntime>>,
+    Option<serde_json::Value>,
+);
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
@@ -47,7 +51,7 @@ impl CodeModeExecuteHandler {
             turn: Arc::clone(&step_context.turn),
         };
         let mut enabled_tools = Vec::with_capacity(self.nested_tool_specs.len());
-        for (spec, cached_runtime) in &self.nested_tool_specs {
+        for (spec, cached_runtime, output_schema) in &self.nested_tool_specs {
             if let Some(cached_definitions) = cached_runtime
                 .as_ref()
                 .and_then(|runtime| runtime.cached_code_mode_definitions())
@@ -60,7 +64,7 @@ impl CodeModeExecuteHandler {
                 codex_tools::collect_code_mode_tool_definitions(std::iter::once(spec.as_ref()));
             enabled_tools.extend(definitions.into_iter().map(|mut definition| {
                 definition.input_schema = None;
-                definition.output_schema = None;
+                definition.output_schema = output_schema.clone();
                 definition
             }));
         }

@@ -123,6 +123,10 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Print the private matched-host protocol manifest as JSON.
+    #[arg(long, hide = true)]
+    shoal_protocol_manifest: bool,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -1025,12 +1029,20 @@ async fn cli_main(
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
+        shoal_protocol_manifest,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+    if shoal_protocol_manifest {
+        println!(
+            "{}",
+            serde_json::to_string(&codex_shoal_protocol::Manifest::default())?
+        );
+        return Ok(());
+    }
     // Retain the launch target through TUI exit, even if a launcher changes selection.
     let daemon_cli_executable = arg0_paths
         .codex_self_exe

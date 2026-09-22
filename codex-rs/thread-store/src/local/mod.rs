@@ -1,4 +1,5 @@
 mod archive_thread;
+mod call_boundary;
 mod create_thread;
 mod delete_thread;
 mod helpers;
@@ -2074,6 +2075,7 @@ mod tests {
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

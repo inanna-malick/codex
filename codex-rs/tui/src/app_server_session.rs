@@ -3,6 +3,7 @@
 //! This module owns the typed JSON-RPC calls needed by the TUI and keeps
 //! request/response plumbing out of `App` and `ChatWidget`.
 
+mod cli_fork;
 mod external_agent_config;
 mod fs;
 mod history;
@@ -26,6 +27,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::FeedbackAudience;
 use crate::dynamic_tools_mcp::DynamicToolMcpServer;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
+use crate::host_dynamic_tools::HostDynamicTools;
 use crate::legacy_core::config::Config;
 use crate::local_settings::LocalSettings;
 use crate::service_tier_resolution;
@@ -325,6 +327,8 @@ pub(crate) struct AppServerSession {
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_id: Mutex<Option<String>>,
     dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
+    host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+    cli_fork: cli_fork::CliFork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,7 +439,34 @@ impl AppServerSession {
             managed_new_thread_defaults: None,
             external_agent_config_import_id: Mutex::default(),
             dynamic_tool_mcp: None,
+            host_dynamic_tools: None,
+            cli_fork: cli_fork::CliFork::default(),
         }
+    }
+
+    pub(crate) fn with_host_dynamic_tools(
+        mut self,
+        host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+    ) -> Self {
+        self.host_dynamic_tools = host_dynamic_tools;
+        self
+    }
+
+    pub(crate) fn host_dynamic_tools(&self) -> Option<Arc<HostDynamicTools>> {
+        self.host_dynamic_tools.clone()
+    }
+
+    pub(crate) async fn attach_host_primary_if_applicable(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<()> {
+        if let Some(host) = &self.host_dynamic_tools
+            && host.should_attach(thread_id)
+        {
+            host.attach_primary_with_input(thread_id, self.request_handle())
+                .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn start_dynamic_tool_mcp(
@@ -778,6 +809,10 @@ impl AppServerSession {
         if self.history_support == ThreadHistorySupport::LegacyOnly {
             params.history_mode = None;
         }
+        let host_tools_required = self
+            .host_dynamic_tools
+            .as_ref()
+            .is_some_and(|host| host.configure_primary_start(&mut params));
         self.thread_tool_transport().configure(&mut params);
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
@@ -799,6 +834,10 @@ impl AppServerSession {
         started.task_tools_available = task_tools_available;
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
+        }
+        if host_tools_required && let Some(host) = &self.host_dynamic_tools {
+            host.attach_primary_with_input(started.session.thread_id, self.request_handle())
+                .await?;
         }
         Ok(started)
     }
@@ -962,6 +1001,16 @@ impl AppServerSession {
         }
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
+        let cli_fork = std::mem::take(&mut self.cli_fork);
+        cli_fork.configure(&mut params);
+        if cli_fork.destination_local {
+            let host = self.host_dynamic_tools.as_ref().ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "destination-local fork requires a registered hosted tool endpoint"
+                )
+            })?;
+            host.configure_fork(&mut params);
+        }
         let response: ThreadForkResponse = match self
             .client
             .request_typed(ClientRequest::ThreadFork {
@@ -1676,6 +1725,27 @@ pub(crate) async fn start_thread_with_request_handle(
     remote_cwd_override: Option<PathBuf>,
     thread_tool_transport: ThreadToolTransport,
 ) -> Result<AppServerStartedThread> {
+    start_thread_with_request_handle_and_host(
+        request_handle,
+        local_settings,
+        config,
+        thread_params_mode,
+        remote_cwd_override,
+        thread_tool_transport,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn start_thread_with_request_handle_and_host(
+    request_handle: AppServerRequestHandle,
+    local_settings: &LocalSettings,
+    config: Config,
+    thread_params_mode: ThreadParamsMode,
+    remote_cwd_override: Option<PathBuf>,
+    thread_tool_transport: ThreadToolTransport,
+    host_dynamic_tools: Option<Arc<HostDynamicTools>>,
+) -> Result<AppServerStartedThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_from_config(
         &config,
@@ -1683,6 +1753,9 @@ pub(crate) async fn start_thread_with_request_handle(
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
     );
+    let host_tools_required = host_dynamic_tools
+        .as_ref()
+        .is_some_and(|host| host.configure_primary_start(&mut params));
     thread_tool_transport.configure(&mut params);
     let (response, _history_support, task_tools_available) =
         request_thread_start_with_history_fallback(&request_handle, request_id, params)
@@ -1694,6 +1767,10 @@ pub(crate) async fn start_thread_with_request_handle(
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;
     started.task_tools_available = task_tools_available;
+    if host_tools_required && let Some(host) = host_dynamic_tools {
+        host.attach_primary_with_input(started.session.thread_id, request_handle)
+            .await?;
+    }
     Ok(started)
 }
 

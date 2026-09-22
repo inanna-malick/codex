@@ -509,21 +509,27 @@ impl App {
         self.pending_app_server_requests
             .cancel_thread_verification(&thread_id.to_string());
         let app_event_tx = self.app_event_tx.clone();
-        self.dynamic_tool_tasks
-            .retain(|request_id, (source, task)| {
-                if source == &thread_id.to_string() {
-                    app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                        request_id: request_id.clone(),
-                        response: crate::dynamic_tools::failure_response(
-                            "Source task was closed while handling a dynamic tool call",
-                        ),
-                    });
-                    task.abort();
-                    false
-                } else {
-                    true
+        self.dynamic_tool_tasks.retain(|request_id, entry| {
+            if entry.source_thread_id == thread_id.to_string() {
+                if entry.settlement.is_some() {
+                    entry.ensure_cancellation_requested();
+                    return true;
                 }
-            });
+                app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                    request_id: request_id.clone(),
+                    response: crate::dynamic_tools::failure_response(
+                        "Source task was closed while handling a dynamic tool call",
+                    ),
+                });
+                entry.task.abort();
+                if let Some(task) = entry.cancellation_task.take() {
+                    task.abort();
+                }
+                false
+            } else {
+                true
+            }
+        });
         self.abort_thread_event_listener(thread_id);
         self.thread_event_channels.remove(&thread_id);
         self.pending_server_profiles.remove(&thread_id);

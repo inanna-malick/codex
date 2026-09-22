@@ -1145,6 +1145,8 @@ const DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
+    /// Preserve an explicit operator selection, including disabling model defaults.
+    pub enabled: Option<bool>,
     pub default_exec_yield_time_ms: u64,
     /// Show handler duration, code-mode host duration, and harness overhead
     /// in each code-mode cell response.
@@ -1159,6 +1161,7 @@ pub struct CodeModeConfig {
 impl Default for CodeModeConfig {
     fn default() -> Self {
         Self {
+            enabled: None,
             default_exec_yield_time_ms: DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS,
             experimental_show_cell_overhead: false,
             excluded_tool_namespaces: Vec::new(),
@@ -2710,6 +2713,11 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
         });
 
     CodeModeConfig {
+        enabled: config_toml
+            .features
+            .as_ref()
+            .and_then(|features| features.code_mode.as_ref())
+            .and_then(FeatureToml::enabled),
         default_exec_yield_time_ms: base
             .and_then(|config| config.default_exec_yield_time_ms)
             .unwrap_or(DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS),

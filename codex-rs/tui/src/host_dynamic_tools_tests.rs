@@ -1,0 +1,1220 @@
+#![cfg(unix)]
+
+use super::*;
+use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::RemoteAppServerClient;
+use codex_app_server_client::RemoteAppServerConnectArgs;
+use codex_app_server_client::RemoteAppServerEndpoint;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::JSONRPCMessage;
+use futures::SinkExt;
+use futures::StreamExt;
+use pretty_assertions::assert_eq;
+use serde_json::json;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+async fn register_host_tool_completion(
+    host: &HostDynamicTools,
+    thread_id: ThreadId,
+    context_call_id: &str,
+) -> color_eyre::Result<()> {
+    host.state_db
+        .thread_queue()
+        .register_host_tool_completion(&codex_state::HostToolCompletionKey {
+            thread_id,
+            context_call_id: context_call_id.to_owned(),
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+    host.completions
+        .lock()
+        .unwrap()
+        .register(context_call_id.to_owned());
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RecordedRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) body: Value,
+}
+
+fn read_request(mut stream: &UnixStream) -> std::io::Result<RecordedRequest> {
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request ended before its headers",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let mut request_line = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = request_line.next().unwrap_or_default().to_string();
+    let path = request_line.next().unwrap_or_default().to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    while bytes.len() < header_end + content_length {
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    let body = if content_length == 0 {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes[header_end..header_end + content_length])?
+    };
+    Ok(RecordedRequest { method, path, body })
+}
+
+fn write_response(mut stream: &UnixStream, status: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)
+}
+
+pub(crate) fn spawn_host(
+    socket_path: &std::path::Path,
+    request_count: usize,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_host_with_completion_delay(socket_path, request_count, Duration::ZERO)
+}
+
+fn spawn_host_with_completion_delay(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    completion_delay: Duration,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_host_configured(
+        socket_path,
+        request_count,
+        completion_delay,
+        /*input_control_socket*/ None,
+    )
+}
+
+fn spawn_host_with_completion_statuses(
+    socket_path: &std::path::Path,
+    completion_statuses: Vec<&'static str>,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = UnixListener::bind(socket_path)?;
+    let (request_tx, request_rx) = mpsc::channel();
+    let task = std::thread::spawn(move || {
+        let request_count = 2 + completion_statuses.len();
+        let mut completion_statuses = completion_statuses.into_iter();
+        for _ in 0..request_count {
+            let (stream, _) = listener.accept()?;
+            let request = read_request(&stream)?;
+            let response = match request.path.as_str() {
+                REGISTRATION_PATH => (
+                    "200 OK",
+                    serde_json::to_vec(&json!({
+                        "protocolVersion": 5,
+                        "dynamicTools": [{
+                            "type": "custom",
+                            "name": "evaluate",
+                            "description": "Evaluate source",
+                            "deferLoading": false
+                        }],
+                        "scope": "primaryThread",
+                        "launchId": "launch-test",
+                        "inputControlNonce": "nonce-test"
+                    }))?,
+                ),
+                SESSION_PATH => ("204 No Content", Vec::new()),
+                "/v1/dynamic-tools/completed" => (
+                    completion_statuses.next().ok_or_else(|| {
+                        std::io::Error::other("unexpected completion acknowledgement")
+                    })?,
+                    Vec::new(),
+                ),
+                path => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected host request: {path}"
+                    )));
+                }
+            };
+            request_tx.send(request).map_err(std::io::Error::other)?;
+            write_response(&stream, response.0, &response.1)?;
+        }
+        Ok(())
+    });
+    Ok((request_rx, task))
+}
+
+fn call_params(
+    thread_id: ThreadId,
+    context_call_id: Option<&str>,
+    call_id: &str,
+) -> DynamicToolCallParams {
+    DynamicToolCallParams {
+        context_call_id: context_call_id.map(str::to_owned),
+        thread_id: thread_id.to_string(),
+        turn_id: "turn".to_string(),
+        call_id: call_id.to_string(),
+        namespace: None,
+        tool: "evaluate".to_string(),
+        arguments: Value::String("main = pure ()".to_string()),
+    }
+}
+
+async fn wait_for_recovery_intervention(host: &HostDynamicTools) -> color_eyre::Result<String> {
+    let mut health = host.recovery.health.subscribe();
+    let reason = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let recovery::Health::NeedsIntervention(reason) = health.borrow_and_update().clone()
+            {
+                return color_eyre::Result::<String>::Ok(reason);
+            }
+            health.changed().await.map_err(|_| {
+                color_eyre::eyre::eyre!("host recovery worker stopped before reporting health")
+            })?;
+        }
+    })
+    .await??;
+    Ok(reason)
+}
+
+pub(crate) fn spawn_host_with_input(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    input_control_socket: std::path::PathBuf,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_host_configured(
+        socket_path,
+        request_count,
+        Duration::ZERO,
+        Some(input_control_socket),
+    )
+}
+
+pub(crate) fn spawn_cancellable_host(
+    socket_path: &std::path::Path,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_cancellable_host_configured(socket_path, None)
+}
+
+pub(crate) fn spawn_cancellable_host_with_input(
+    socket_path: &std::path::Path,
+    input_control_socket: std::path::PathBuf,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    spawn_cancellable_host_configured(socket_path, Some(input_control_socket))
+}
+
+fn spawn_cancellable_host_configured(
+    socket_path: &std::path::Path,
+    input_control_socket: Option<std::path::PathBuf>,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = UnixListener::bind(socket_path)?;
+    let (request_tx, request_rx) = mpsc::channel();
+    let cancelled = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let cancellation_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..6 {
+            let (stream, _) = listener.accept()?;
+            let request_tx = request_tx.clone();
+            let cancelled = cancelled.clone();
+            let cancellation_attempts = cancellation_attempts.clone();
+            let input_control_socket = input_control_socket.clone();
+            handlers.push(std::thread::spawn(move || {
+                let request = read_request(&stream)?;
+                request_tx
+                    .send(request.clone())
+                    .map_err(std::io::Error::other)?;
+                let terminal = json!({
+                    "contentItems": [{"type": "inputText", "text": "cancelled"}],
+                    "success": false
+                });
+                match request.path.as_str() {
+                    REGISTRATION_PATH => write_response(
+                        &stream,
+                        "200 OK",
+                        &serde_json::to_vec(&json!({
+                            "protocolVersion": 5,
+                            "dynamicTools": [{
+                                "type": "custom",
+                                "name": "haskell",
+                                "description": "Evaluate Haskell",
+                                "deferLoading": false
+                            }],
+                            "scope": "primaryThread",
+                            "inputControlSocket": input_control_socket,
+                            "launchId": "launch-test",
+                            "inputControlNonce": "nonce-test",
+                        }))?,
+                    ),
+                    SESSION_PATH => write_response(&stream, "204 No Content", &[]),
+                    CALL_PATH => {
+                        let (lock, changed) = &*cancelled;
+                        let mut ready = lock
+                            .lock()
+                            .map_err(|_| std::io::Error::other("cancel state poisoned"))?;
+                        while !*ready {
+                            ready = changed
+                                .wait(ready)
+                                .map_err(|_| std::io::Error::other("cancel state poisoned"))?;
+                        }
+                        write_response(&stream, "200 OK", &serde_json::to_vec(&terminal)?)
+                    }
+                    CANCEL_PATH => {
+                        let attempt =
+                            cancellation_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let response = match attempt {
+                            0 => json!({
+                                "status": "notSleeping",
+                                "execution": "execution-test"
+                            }),
+                            1 => json!({
+                                "status": "unconfirmed",
+                                "execution": "execution-test"
+                            }),
+                            _ => json!({
+                                "status": "cancelled",
+                                "execution": "execution-test",
+                                "reply": terminal
+                            }),
+                        };
+                        write_response(&stream, "200 OK", &serde_json::to_vec(&response)?)?;
+                        if attempt < 2 {
+                            return Ok(());
+                        }
+                        let (lock, changed) = &*cancelled;
+                        *lock
+                            .lock()
+                            .map_err(|_| std::io::Error::other("cancel state poisoned"))? = true;
+                        changed.notify_all();
+                        Ok(())
+                    }
+                    _ => write_response(&stream, "404 Not Found", &[]),
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().map_err(|_| {
+                std::io::Error::other("cancellable host request handler panicked")
+            })??;
+        }
+        Ok(())
+    });
+    Ok((request_rx, task))
+}
+
+#[tokio::test]
+async fn transport_reattach_preserves_binding_and_checks_pending_completions()
+-> color_eyre::Result<()> {
+    let websocket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let websocket_url = format!("ws://{}", websocket_listener.local_addr()?);
+    let websocket_task = tokio::spawn(async move {
+        let (stream, _) = websocket_listener.accept().await?;
+        let mut socket = tokio_tungstenite::accept_async(stream).await?;
+        while let Some(message) = socket.next().await {
+            let Message::Text(text) = message? else {
+                continue;
+            };
+            let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
+                continue;
+            };
+            let result = match request.method.as_str() {
+                "initialize" => json!({"userAgent": "host-input-test"}),
+                "shutdown" => Value::Null,
+                method => panic!("unexpected remote request: {method}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": request.id, "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+        }
+        color_eyre::Result::<()>::Ok(())
+    });
+    let remote = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url,
+            auth_token: None,
+        },
+        client_name: "host-input-test".to_string(),
+        client_version: "0.0.0".to_string(),
+        experimental_api: false,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 8,
+    })
+    .await?;
+
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let host_socket = directory.path().join("host.sock");
+    let input_socket = directory.path().join("input.sock");
+    let (callbacks, host_task) =
+        spawn_host_with_input(&host_socket, /*request_count*/ 3, input_socket.clone())?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(host_socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    let handle = AppServerRequestHandle::Remote(remote.request_handle());
+    // Recovery runs after attachment so the input transport can remain bound
+    // while hosted-call admission is fenced.
+    register_host_tool_completion(&host, thread, "initial-missing-history").await?;
+    host.attach_primary_with_input(thread, handle.clone())
+        .await?;
+    assert!(
+        wait_for_recovery_intervention(&host)
+            .await?
+            .contains("thread is not persisted")
+    );
+    assert_eq!(host.primary_thread_id(), Some(thread));
+    let _registration = callbacks.recv()?;
+    let first_attachment = callbacks.recv()?;
+    host.attach_primary_with_input(ThreadId::new(), handle.clone())
+        .await?;
+    assert_eq!(host.session_generation.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        callbacks.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    // Remove the synthetic recovery blocker and wake the retained worker.
+    host.settle_reattached_pending(
+        &thread.to_string(),
+        &std::collections::BTreeSet::from(["initial-missing-history".to_string()]),
+    )
+    .await?;
+    host.wake_recovery(None);
+    let mut health = host.recovery.health.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *health.borrow_and_update() != recovery::Health::Healthy {
+            health.changed().await.unwrap();
+        }
+    })
+    .await?;
+    let foreign_thread = ThreadId::new();
+    host.attach_primary_with_input(foreign_thread, handle.clone())
+        .await?;
+    assert_eq!(host.primary_thread_id(), Some(thread));
+    assert_eq!(host.should_attach(foreign_thread), false);
+    assert_eq!(host.session_generation.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        callbacks.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    host.attach_primary_with_input(thread, handle.clone())
+        .await?;
+    let second_attachment = callbacks.recv()?;
+    assert_eq!(first_attachment.body["sessionGeneration"], json!(1));
+    assert_eq!(second_attachment.body["sessionGeneration"], json!(1));
+    assert_eq!(
+        first_attachment.body["applicationInstanceId"],
+        second_attachment.body["applicationInstanceId"]
+    );
+
+    let binding = |attachment: &RecordedRequest| {
+        json!({
+            "protocolVersion": 5,
+            "launchId": attachment.body["launchId"],
+            "instanceId": attachment.body["applicationInstanceId"],
+            "generation": attachment.body["sessionGeneration"],
+            "nonce": attachment.body["inputControlNonce"],
+        })
+    };
+    let bind = |attachment: &RecordedRequest| {
+        json!({
+            "operation": "bind",
+            "binding": binding(attachment),
+        })
+    };
+    let query = |attachment: &RecordedRequest| {
+        json!({
+            "operation": "query",
+            "binding": binding(attachment),
+            "producer_id": "run/inbox/actor-1.1",
+            "sequence": 1,
+        })
+    };
+    let client = reqwest::Client::builder()
+        .unix_socket(input_socket)
+        .no_proxy()
+        .build()?;
+    let mut stale_attachment = first_attachment.clone();
+    stale_attachment.body["sessionGeneration"] = json!(0);
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&bind(&stale_attachment))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&bind(&second_attachment))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["outcome"],
+        json!("admitted")
+    );
+    let mut foreign_bind = bind(&second_attachment);
+    foreign_bind["binding"]["nonce"] = json!("foreign");
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&foreign_bind)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        client
+            .post("http://localhost/v1/input/control")
+            .json(&query(&stale_attachment))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .post("http://localhost/v1/input/control")
+        .json(&query(&second_attachment))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await?["outcome"],
+        json!("evidenceUnavailable")
+    );
+
+    // A new pending completion without durable history fences call admission
+    // while leaving the established input transport intact.
+    register_host_tool_completion(&host, thread, "missing-history").await?;
+    host.recovery.history_pending.store(true, Ordering::Release);
+    host.recovery
+        .health
+        .send_replace(recovery::Health::Recovering);
+    host.wake_recovery(None);
+    assert!(
+        wait_for_recovery_intervention(&host)
+            .await?
+            .contains("thread is not persisted")
+    );
+    let response = host
+        .call(&call_params(thread, Some("blocked-by-history"), "blocked"))
+        .await?;
+    assert!(!response.success);
+    assert!(callbacks.try_recv().is_err());
+
+    drop(host);
+    drop(handle);
+    remote.shutdown().await?;
+    websocket_task.await??;
+    host_task.join().expect("host task")?;
+    Ok(())
+}
+
+fn spawn_host_configured(
+    socket_path: &std::path::Path,
+    request_count: usize,
+    completion_delay: Duration,
+    input_control_socket: Option<std::path::PathBuf>,
+) -> std::io::Result<(
+    mpsc::Receiver<RecordedRequest>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = UnixListener::bind(socket_path)?;
+    let (request_tx, request_rx) = mpsc::channel();
+    let task = std::thread::spawn(move || {
+        for _ in 0..request_count {
+            let (stream, _) = listener.accept()?;
+            let request = read_request(&stream)?;
+            if request.path == "/v1/dynamic-tools/completed" {
+                std::thread::sleep(completion_delay);
+            }
+            let response = match request.path.as_str() {
+                REGISTRATION_PATH => Some((
+                    "200 OK",
+                    serde_json::to_vec(&json!({
+                        "protocolVersion": 5,
+                        "dynamicTools": [{
+                            "type": "custom",
+                            "name": "evaluate",
+                            "description": "Evaluate source",
+                            "deferLoading": false
+                        }],
+                        "scope": "primaryThread",
+                        "inputControlSocket": input_control_socket,
+                        "launchId": "launch-test",
+                        "inputControlNonce": "nonce-test",
+                    }))?,
+                )),
+                SESSION_PATH | "/v1/dynamic-tools/completed" => {
+                    Some(("204 No Content", Vec::new()))
+                }
+                "/v1/dynamic-tools/interrupted" => {
+                    Some(("200 OK", serde_json::to_vec(&json!({"status":"settled"}))?))
+                }
+                CALL_PATH => Some((
+                    "200 OK",
+                    serde_json::to_vec(&json!({
+                        "contentItems": [{"type": "inputText", "text": "accepted"}],
+                        "success": true
+                    }))?,
+                )),
+                _ => None,
+            };
+            request_tx.send(request).map_err(std::io::Error::other)?;
+            let Some((status, body)) = response else {
+                write_response(&stream, "404 Not Found", &[])?;
+                continue;
+            };
+            write_response(&stream, status, &body)?;
+        }
+        Ok(())
+    });
+    Ok((request_rx, task))
+}
+
+#[tokio::test]
+async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket_path, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket_path)?))
+        .await?
+        .expect("configured host");
+    let thread_id = ThreadId::new();
+    host.attach_primary(thread_id).await?;
+    let source = "module Main where\n\nvalue = \"{\\\"nested\\\":true}\"\nemoji = \"λ🌊\"\n";
+    let params = DynamicToolCallParams {
+        context_call_id: Some("outer-exec".into()),
+        thread_id: thread_id.to_string(),
+        turn_id: "turn-α".to_string(),
+        call_id: "call-1".to_string(),
+        namespace: None,
+        tool: "evaluate".to_string(),
+        arguments: Value::String(source.to_string()),
+    };
+    assert_eq!(host.routing(&params), HostDynamicToolRouting::Forward);
+    let mut wrong_kind = params.clone();
+    wrong_kind.arguments = json!({"program": source});
+    assert_eq!(host.routing(&wrong_kind), HostDynamicToolRouting::Reject);
+    let mut wrong_thread = params.clone();
+    wrong_thread.thread_id = ThreadId::new().to_string();
+    assert_eq!(host.routing(&wrong_thread), HostDynamicToolRouting::Reject);
+    let mut unknown = params.clone();
+    unknown.tool = "someone_elses_tool".to_string();
+    assert_eq!(host.routing(&unknown), HostDynamicToolRouting::Unregistered);
+    let response = host.call(&params).await?;
+    assert_eq!(
+        response,
+        DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "accepted".to_string(),
+            }],
+            success: true,
+        }
+    );
+
+    let registration = requests.recv()?;
+    assert_eq!(
+        registration,
+        RecordedRequest {
+            method: "GET".to_string(),
+            path: REGISTRATION_PATH.to_string(),
+            body: Value::Null,
+        }
+    );
+    let session = requests.recv()?;
+    assert_eq!(session.method, "POST");
+    assert_eq!(session.path, SESSION_PATH);
+    assert_eq!(
+        session.body,
+        json!({"protocolVersion": 5, "threadId": thread_id})
+    );
+    let call = requests.recv()?;
+    assert_eq!(call.method, "POST");
+    assert_eq!(call.path, CALL_PATH);
+    assert_eq!(
+        call.body,
+        json!({
+            "protocolVersion": 5,
+            "threadId": thread_id,
+            "turnId": "turn-α",
+            "callId": "call-1",
+            "contextCallId": "outer-exec",
+            "tool": "evaluate",
+            "arguments": source,
+        })
+    );
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_exact_call_id_is_not_submitted_twice() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    let params = call_params(thread, Some("exact-call"), "host-call");
+
+    assert!(host.call(&params).await?.success);
+    assert!(!host.call(&params).await?.success);
+
+    assert_eq!(requests.recv()?.path, REGISTRATION_PATH);
+    assert_eq!(requests.recv()?.path, SESSION_PATH);
+    assert_eq!(requests.recv()?.path, CALL_PATH);
+    assert!(requests.try_recv().is_err());
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_recovery_never_reaches_host() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 2)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    host.recovery
+        .health
+        .send_replace(recovery::Health::Recovering);
+    let admission = HostedCallAdmission::default();
+    let call = {
+        let host = Arc::clone(&host);
+        let admission = admission.clone();
+        let params = call_params(thread, Some("blocked-call"), "host-call");
+        tokio::spawn(async move { host.call_with_admission(&params, &admission).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(
+        admission.cancel(),
+        cancellation::HostedCallCancellation::NotSubmitted
+    );
+
+    assert!(!call.await??.success);
+    assert_eq!(requests.recv()?.path, REGISTRATION_PATH);
+    assert_eq!(requests.recv()?.path, SESSION_PATH);
+    assert!(requests.try_recv().is_err());
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ledger_capacity_rejects_one_call_without_poisoning_host_session() -> color_eyre::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    for index in 0..256 {
+        host.state_db
+            .thread_queue()
+            .register_host_tool_completion(&codex_state::HostToolCompletionKey {
+                thread_id: thread,
+                context_call_id: format!("retained-{index}"),
+            })
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+    }
+
+    assert!(
+        !host
+            .call(&call_params(thread, Some("overflow"), "rejected"))
+            .await?
+            .success
+    );
+    assert_eq!(*host.recovery.health.borrow(), recovery::Health::Healthy);
+    host.state_db
+        .thread_queue()
+        .mark_host_tool_completion_not_submitted(&codex_state::HostToolCompletionKey {
+            thread_id: thread,
+            context_call_id: "retained-0".into(),
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
+    assert!(
+        host.call(&call_params(
+            thread,
+            Some("after-capacity"),
+            "after-capacity"
+        ))
+        .await?
+        .success
+    );
+
+    assert_eq!(requests.recv()?.path, REGISTRATION_PATH);
+    assert_eq!(requests.recv()?.path, SESSION_PATH);
+    assert_eq!(requests.recv()?.path, CALL_PATH);
+    assert!(requests.try_recv().is_err());
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unkeyed_hosted_execution_is_rejected_before_submission() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 2)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    for context in [None, Some("")] {
+        let response = host.call(&call_params(thread, context, "unkeyed")).await?;
+        assert!(!response.success);
+        assert!(serde_json::to_string(&response)?.contains("requires an exact context call ID"));
+    }
+    assert_eq!(requests.recv()?.path, REGISTRATION_PATH);
+    assert_eq!(requests.recv()?.path, SESSION_PATH);
+    assert!(requests.try_recv().is_err());
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_call_transport_reconciles_without_resubmitting_body() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let server = std::thread::spawn(move || -> std::io::Result<Vec<RecordedRequest>> {
+        let responses = [
+            (
+                REGISTRATION_PATH,
+                "200 OK",
+                json!({
+                    "protocolVersion": 5,
+                    "dynamicTools": [{"type": "custom", "name": "evaluate",
+                        "description": "Evaluate source", "deferLoading": false}],
+                    "scope": "primaryThread", "launchId": "launch-test", "inputControlNonce": "nonce-test"
+                }),
+            ),
+            (SESSION_PATH, "204 No Content", Value::Null),
+            (CALL_PATH, "503 Service Unavailable", Value::Null),
+            (
+                "/v1/dynamic-tools/interrupted",
+                "200 OK",
+                json!({"status": "settled"}),
+            ),
+        ];
+        let mut requests = Vec::new();
+        for (path, status, body) in responses {
+            let (stream, _) = listener.accept()?;
+            let request = read_request(&stream)?;
+            assert_eq!(request.path, path);
+            write_response(&stream, status, &serde_json::to_vec(&body)?)?;
+            requests.push(request);
+        }
+        Ok(requests)
+    });
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    let key = codex_state::HostToolCompletionKey {
+        thread_id: thread,
+        context_call_id: "uncertain-transport".into(),
+    };
+    assert!(
+        host.call(&call_params(thread, Some(&key.context_call_id), "call"))
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let record = host
+                .state_db
+                .thread_queue()
+                .read_host_tool_completion(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            if record.state == codex_state::HostToolCompletionState::ReattachedWithoutCompletion {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let requests = server.join().expect("host thread panicked")?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == CALL_PATH)
+            .count(),
+        1
+    );
+    assert_eq!(requests[3].body["contextCallId"], key.context_call_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_completion_failure_is_retried_until_healthy() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host_with_completion_statuses(
+        &socket,
+        vec![
+            "503 Service Unavailable",
+            "503 Service Unavailable",
+            "503 Service Unavailable",
+            "204 No Content",
+        ],
+    )?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    register_host_tool_completion(&host, thread, "retry-completion").await?;
+    let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
+        thread_id: thread.to_string(),
+        turn_id: "turn".into(),
+        item: serde_json::from_value(item).unwrap(),
+    };
+    host.observe_completion(&notify(json!({
+        "type": "function_call",
+        "call_id": "retry-completion",
+        "name": "exec",
+        "arguments": "{}"
+    })))
+    .await?;
+    let error = host
+        .observe_completion(&notify(json!({
+            "type": "function_call_output",
+            "call_id": "retry-completion",
+            "output": "done"
+        })))
+        .await
+        .expect_err("three transient failures should defer acknowledgement");
+    host.recovery.failed(&error);
+    host.wake_recovery(None);
+    let mut health = host.recovery.health.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *health.borrow_and_update() == recovery::Health::Healthy {
+                break;
+            }
+            health.changed().await.unwrap();
+        }
+    })
+    .await?;
+
+    let record = host
+        .state_db
+        .thread_queue()
+        .read_host_tool_completion(&codex_state::HostToolCompletionKey {
+            thread_id: thread,
+            context_call_id: "retry-completion".to_string(),
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?
+        .expect("completion record");
+    assert_eq!(
+        record.state,
+        codex_state::HostToolCompletionState::Acknowledged
+    );
+    let paths = (0..6)
+        .map(|_| requests.recv().map(|request| request.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        paths,
+        vec![
+            REGISTRATION_PATH,
+            SESSION_PATH,
+            "/v1/dynamic-tools/completed",
+            "/v1/dynamic-tools/completed",
+            "/v1/dynamic-tools/completed",
+            "/v1/dynamic-tools/completed",
+        ]
+    );
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[test]
+fn registration_rejects_duplicates_and_tui_namespace() {
+    let custom = |name: &str| {
+        serde_json::from_value::<DynamicToolSpec>(json!({
+            "type": "custom",
+            "name": name,
+            "description": "test"
+        }))
+        .expect("custom spec")
+    };
+    let registration = HostDynamicToolRegistration {
+        input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
+        protocol_version: PROTOCOL_VERSION,
+        dynamic_tools: vec![custom("same"), custom("same")],
+        scope: HostDynamicToolScope::PrimaryThread,
+    };
+    assert!(validate_registration(&registration).is_err());
+
+    let registration = HostDynamicToolRegistration {
+        input_control_socket: None,
+        launch_id: String::new(),
+        input_control_nonce: String::new(),
+        protocol_version: PROTOCOL_VERSION,
+        dynamic_tools: vec![
+            serde_json::from_value(json!({
+                "type": "namespace",
+                "name": "codex_tui",
+                "description": "collision",
+                "tools": [{"type": "custom", "name": "host", "description": "test"}]
+            }))
+            .expect("namespace spec"),
+        ],
+        scope: HostDynamicToolScope::PrimaryThread,
+    };
+    assert!(validate_registration(&registration).is_err());
+}
+
+#[tokio::test]
+async fn completion_waits_for_sibling_result_and_acknowledges_once() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    register_host_tool_completion(&host, thread, "outer").await?;
+    let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
+        thread_id: thread.to_string(),
+        turn_id: "turn".into(),
+        item: serde_json::from_value(item).unwrap(),
+    };
+    for id in ["outer", "sibling"] {
+        host.observe_completion(&notify(json!({"type":"function_call", "call_id":id,
+            "name":"exec", "arguments":"{}"})))
+            .await?;
+    }
+    host.observe_completion(&notify(
+        json!({"type":"function_call_output", "call_id":"outer", "output":"actual result"}),
+    ))
+    .await?;
+    assert!(requests.try_recv().is_err());
+    let last = notify(json!({"type":"function_call_output", "call_id":"sibling", "output":"done"}));
+    host.observe_completion(&last).await?;
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: "/v1/dynamic-tools/completed".into(),
+            body: json!({"protocolVersion":5, "threadId":thread, "contextCallId":"outer"}),
+        }
+    );
+    host.observe_completion(&last).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
+-> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    register_host_tool_completion(&host, thread, "interrupted").await?;
+    host.settle_turn(&thread.to_string()).await?;
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: "/v1/dynamic-tools/interrupted".into(),
+            body: json!({"protocolVersion":5,"threadId":thread,"contextCallId":"interrupted"}),
+        }
+    );
+    host.settle_turn(&thread.to_string()).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_interrupted_turn_does_not_reattach_an_acknowledged_completion()
+-> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket, 3)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    requests.recv()?;
+    requests.recv()?;
+    register_host_tool_completion(&host, thread, "interrupted").await?;
+
+    let notify = |item: Value| codex_app_server_protocol::RawResponseItemCompletedNotification {
+        thread_id: thread.to_string(),
+        turn_id: "turn".into(),
+        item: serde_json::from_value(item).unwrap(),
+    };
+    host.observe_completion(&notify(json!({
+        "type":"function_call",
+        "call_id":"interrupted",
+        "name":"exec",
+        "arguments":"{}"
+    })))
+    .await?;
+    let turn_prepared_reattach = host
+        .acknowledge_then_execute_stale_reattach(
+            &notify(json!({
+            "type":"function_call_output",
+            "call_id":"interrupted",
+            "output":"done"
+            })),
+            "interrupted",
+        )
+        .await?;
+    assert!(!turn_prepared_reattach);
+
+    assert_eq!(
+        requests.recv()?,
+        RecordedRequest {
+            method: "POST".into(),
+            path: "/v1/dynamic-tools/completed".into(),
+            body: json!({
+                "protocolVersion":5,
+                "threadId":thread,
+                "contextCallId":"interrupted"
+            }),
+        }
+    );
+    assert!(requests.try_recv().is_err());
+    assert!(!matches!(
+        *host.recovery.health.borrow(),
+        recovery::Health::NeedsIntervention(_)
+    ));
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_accepts_acknowledgement_after_five_seconds() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("host.sock");
+    let (_requests, task) = spawn_host_with_completion_delay(
+        &socket,
+        /*request_count*/ 3,
+        Duration::from_secs(6),
+    )?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket)?))
+        .await?
+        .expect("configured host");
+    let thread = ThreadId::new();
+    host.attach_primary(thread).await?;
+    register_host_tool_completion(&host, thread, "outer").await?;
+    for item in [
+        json!({"type":"function_call", "call_id":"outer", "name":"exec", "arguments":"{}"}),
+        json!({"type":"function_call_output", "call_id":"outer", "output":"done"}),
+    ] {
+        host.observe_completion(
+            &codex_app_server_protocol::RawResponseItemCompletedNotification {
+                thread_id: thread.to_string(),
+                turn_id: "turn".into(),
+                item: serde_json::from_value(item)?,
+            },
+        )
+        .await?;
+    }
+    assert!(!matches!(
+        *host.recovery.health.borrow(),
+        recovery::Health::NeedsIntervention(_)
+    ));
+    // No pending acknowledgement remains to trigger another host request.
+    host.settle_turn(&thread.to_string()).await?;
+    task.join().expect("host thread panicked")?;
+    Ok(())
+}

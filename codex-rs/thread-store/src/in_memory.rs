@@ -167,6 +167,7 @@ mod tests {
                 .create_thread(CreateThreadParams {
                     creator_user_id: None,
                     creator_account_id: None,
+                    cache_affinity: None,
                     session_id: thread_id.into(),
                     thread_id,
                     extra_config: None,
@@ -463,6 +464,7 @@ mod tests {
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -592,11 +594,32 @@ impl InMemoryThreadStore {
             .store(true, Ordering::Relaxed);
     }
 
+    /// Makes rollout flushes fail after persistence has succeeded.
+    pub fn fail_flush_for_testing(&self) {
+        self.fail_flush.store(true, Ordering::Relaxed);
+    }
+
+    /// Pauses the next live-writer shutdown until [`Self::resume_shutdown_for_testing`] is called.
+    pub fn pause_shutdown_for_testing(&self) {
+        self.pause_shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Waits until a paused live-writer shutdown reaches the store.
+    pub async fn wait_for_shutdown_for_testing(&self) {
+        self.shutdown_started.notified().await;
+    }
+
+    /// Allows a paused live-writer shutdown to continue.
+    pub fn resume_shutdown_for_testing(&self) {
+        self.resume_shutdown.notify_one();
+    }
+
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
         reject_paginated_history_mode(params.history_mode)?;
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
         let session_meta = SessionMeta {
+            cache_affinity: params.cache_affinity.clone(),
             session_id: params.session_id,
             id: params.thread_id,
             forked_from_id: params.forked_from_id,
@@ -945,13 +968,23 @@ impl ThreadStore for InMemoryThreadStore {
     fn flush_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.state.lock().await.calls.flush_thread += 1;
-            Ok(())
+            if self.fail_flush.load(Ordering::Relaxed) {
+                Err(ThreadStoreError::Internal {
+                    message: "injected rollout flush failure".to_string(),
+                })
+            } else {
+                Ok(())
+            }
         })
     }
 
     fn shutdown_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.state.lock().await.calls.shutdown_thread += 1;
+            if self.pause_shutdown.swap(false, Ordering::Relaxed) {
+                self.shutdown_started.notify_one();
+                self.resume_shutdown.notified().await;
+            }
             Ok(())
         })
     }

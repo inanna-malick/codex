@@ -40,9 +40,39 @@ const ROOT_PROMPT: &str = "spawn a child";
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 const UNSUPPORTED_CODE_MODE_WARNING: &str = "does not advertise Code Mode support";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lite_sol_uses_request_effort_without_astra_configuration_items() -> Result<()> {
+    for (slug, expected_updates) in [("gpt-5.6-sol", 0), ("gpt-6-astra", 1)] {
+        let mut model = remote_model(slug);
+        model.use_responses_lite = true;
+        let response = response_for_remote_model(model, |config| {
+            config.model_reasoning_effort =
+                Some(codex_protocol::openai_models::ReasoningEffort::Low);
+        })
+        .await?;
+        let updates = response.body["input"]
+            .as_array()
+            .expect("request input")
+            .iter()
+            .filter(|item| item["type"] == "configuration_update")
+            .count();
+        assert_eq!(
+            updates, expected_updates,
+            "configuration controls for {slug}"
+        );
+        assert_eq!(
+            response.recorded_configuration_updates, expected_updates,
+            "durable configuration controls for {slug}"
+        );
+        assert_eq!(response.body["reasoning"]["effort"], "low");
+    }
+    Ok(())
+}
+
 struct RemoteModelResponse {
     body: Value,
     warnings: Vec<String>,
+    recorded_configuration_updates: usize,
 }
 
 fn remote_model(slug: &str) -> ModelInfo {
@@ -147,9 +177,22 @@ async fn response_for_remote_model(
         }
     }
 
+    test.codex.flush_rollout().await?;
+    let rollout =
+        tokio::fs::read_to_string(test.codex.rollout_path().expect("rollout path")).await?;
+    let recorded_configuration_updates = rollout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .filter(|item| {
+            item["type"] == "response_item" && item["payload"]["type"] == "configuration_update"
+        })
+        .count();
     Ok(RemoteModelResponse {
         body: response_mock.single_request().body_json(),
         warnings,
+        recorded_configuration_updates,
     })
 }
 

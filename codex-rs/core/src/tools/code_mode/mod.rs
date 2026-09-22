@@ -292,20 +292,8 @@ fn handle_runtime_response(
     )
 }
 
-fn format_script_status(response: &RuntimeResponse) -> String {
-    match response {
-        RuntimeResponse::Yielded { cell_id, .. } => {
-            format!("Script running with cell ID {cell_id}")
-        }
-        RuntimeResponse::Terminated { .. } => "Script terminated".to_string(),
-        RuntimeResponse::Result { error_text, .. } => {
-            if error_text.is_none() {
-                "Script completed".to_string()
-            } else {
-                "Script failed".to_string()
-            }
-        }
-    }
+fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
+    sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
 }
 
 fn truncate_code_mode_result(
@@ -456,6 +444,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::build_nested_tool_payload;
+    use super::completed_runtime_output;
     use super::truncate_code_mode_result;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
@@ -467,6 +456,7 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::openai_models::ToolMode;
     use codex_tools::ToolName;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     #[tokio::test]
@@ -530,6 +520,40 @@ mod tests {
             }
             other => panic!("expected freeform payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completed_output_preserves_host_text_without_a_status_wrapper() {
+        let diagnostic = "src/Main.hs:7:3: error:\n  Ambiguous type variable ‘a₀’\n  literal: {\\\"json\\\": true}\n";
+        let output = completed_runtime_output(
+            vec![FunctionCallOutputContentItem::InputText {
+                text: diagnostic.to_string(),
+            }],
+            None,
+            Some(10_000),
+        );
+
+        assert_eq!(
+            output.body,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: diagnostic.to_string(),
+            }]
+        );
+        assert_eq!(output.success, Some(true));
+    }
+
+    #[test]
+    fn runtime_error_text_is_not_prefixed() {
+        let output =
+            completed_runtime_output(Vec::new(), Some("Error: boom".to_string()), Some(10_000));
+
+        assert_eq!(
+            output.body,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: "Error: boom".to_string(),
+            }]
+        );
+        assert_eq!(output.success, Some(false));
     }
 
     #[test]

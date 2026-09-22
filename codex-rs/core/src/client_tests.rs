@@ -810,7 +810,7 @@ async fn responses_http_omits_raw_tool_metadata_for_openai_named_custom_endpoint
 }
 
 #[test]
-fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
+fn responses_lite_prefix_ids_track_payload_across_threads() -> anyhow::Result<()> {
     let thread_id = ThreadId::new();
     let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
     let mut model = test_model_info();
@@ -870,8 +870,7 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
         &test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli),
         &prompt,
     )?;
-    assert_ne!(independent.input[0].id(), changed_tools.input[0].id());
-    assert_ne!(independent.input[1].id(), changed_tools.input[1].id());
+    assert_eq!(independent.input, changed_tools.input);
     Ok(())
 }
 
@@ -983,6 +982,85 @@ fn reasoning_effort_for_requests_uses_multi_agent_override_for_ultra() {
     });
 
     assert_eq!(actual, [ReasoningEffort::High, ReasoningEffort::High]);
+}
+
+#[test]
+fn responses_lite_configuration_keeps_baseline_and_all_effort_values() -> anyhow::Result<()> {
+    let client = test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli);
+    let mut model = test_model_info();
+    for (slug, use_responses_lite, supports_configuration) in [
+        ("gpt-6-astra", true, true),
+        ("gpt-6-astra", false, false),
+        ("gpt-5.6-sol", true, false),
+        ("gpt-5.6-sol", false, false),
+    ] {
+        model.slug = slug.to_string();
+        model.use_responses_lite = use_responses_lite;
+        for selected in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Persistent,
+            ReasoningEffort::Custom("future-effort".to_string()),
+        ] {
+            let input = vec![
+                ResponseItem::ConfigurationUpdate {
+                    reasoning: codex_protocol::models::ConfigurationReasoning {
+                        effort: ReasoningEffort::High,
+                    },
+                },
+                ResponseItem::ConfigurationUpdate {
+                    reasoning: codex_protocol::models::ConfigurationReasoning {
+                        effort: super::reasoning_effort_for_request(&model, selected.clone()),
+                    },
+                },
+            ];
+            let request = client.build_responses_request(
+                &Prompt {
+                    input: input.clone(),
+                    ..Default::default()
+                },
+                &model,
+                Some(selected.clone()),
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &test_responses_metadata_for_client(
+                    &client,
+                    /*turn_id*/ None,
+                    "step".to_string(),
+                    /*parent_thread_id*/ None,
+                    TestCodexResponsesRequestKind::Turn,
+                ),
+            )?;
+            if supports_configuration {
+                assert_eq!(
+                    request.reasoning.unwrap().effort,
+                    Some(ReasoningEffort::High)
+                );
+                assert_eq!(
+                    &request.input[request.input.len() - input.len()..],
+                    input.as_slice()
+                );
+            } else {
+                assert_eq!(
+                    request.reasoning.unwrap().effort,
+                    Some(super::reasoning_effort_for_request(&model, selected))
+                );
+                assert!(
+                    !request
+                        .input
+                        .iter()
+                        .any(|item| matches!(item, ResponseItem::ConfigurationUpdate { .. }))
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -1213,6 +1291,41 @@ fn internal_session_prompt_cache_key_is_scoped_to_parent_thread() {
     assert_eq!(
         client.prompt_cache_key(&metadata),
         format!("guardian:{parent_thread_id}")
+    );
+}
+
+#[tokio::test]
+async fn inherited_cache_affinity_routes_both_transports_without_replacing_identity() {
+    let mut client = test_model_client(SessionSource::Cli);
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        Some("turn-routing"),
+        "window-routing".to_string(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let routing_session_id = codex_protocol::SessionId::from(ThreadId::new());
+    client.cache_affinity = Some(codex_protocol::protocol::ProviderCacheAffinity {
+        routing_session_id,
+        prompt_cache_key: "dedicated-cache-bucket".to_string(),
+    });
+    let headers = client.build_websocket_headers(&metadata).await;
+    assert_eq!(headers["session-id"], routing_session_id.to_string());
+    assert_eq!(headers["thread-id"], metadata.thread_id);
+    let provider_metadata = client.build_provider_client_metadata(&metadata);
+    assert_eq!(
+        provider_metadata["session_id"],
+        routing_session_id.to_string()
+    );
+    assert_eq!(provider_metadata["thread_id"], metadata.thread_id);
+    let identity: serde_json::Value =
+        serde_json::from_str(&provider_metadata["x-codex-turn-metadata"]).unwrap();
+    assert_eq!(identity["session_id"], metadata.session_id);
+    assert_eq!(identity["thread_id"], metadata.thread_id);
+    assert_eq!(client.prompt_cache_key(&metadata), "dedicated-cache-bucket");
+    assert_eq!(
+        client.build_ws_client_metadata(&metadata, false),
+        provider_metadata
     );
 }
 

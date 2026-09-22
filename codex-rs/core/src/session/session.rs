@@ -56,6 +56,7 @@ type McpToolApprovalMetadataMap =
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
+    pub(crate) client_ready: std::sync::atomic::AtomicBool,
     pub(crate) thread_id: ThreadId,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
@@ -773,6 +774,12 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     ) -> anyhow::Result<Arc<Self>> {
+        let require_client_readiness = config
+            .extra_config
+            .as_ref()
+            .is_some_and(|config| config.require_client_readiness)
+            || matches!(&initial_history, InitialHistory::Resumed(history)
+                if matches!(history.history.first(), Some(RolloutItem::SessionMeta(meta)) if meta.meta.require_client_readiness));
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -920,6 +927,44 @@ impl Session {
                 SessionId::from(thread_id)
             }
         });
+        // Cache affinity follows the retained context, not the new CLI session's ownership.
+        let inherited_history = match &initial_history {
+            InitialHistory::Forked(history) => Some(history.as_slice()),
+            InitialHistory::Resumed(resumed) => Some(resumed.history.as_slice()),
+            InitialHistory::New | InitialHistory::Cleared => None,
+        };
+        let inherited_cache_affinity = inherited_history.and_then(|history| {
+            history.iter().find_map(|item| {
+                let RolloutItem::SessionMeta(meta) = item else {
+                    return None;
+                };
+                Some(meta.meta.cache_affinity.clone().unwrap_or_else(|| {
+                    ModelClient::default_cache_affinity(
+                        &meta.meta.source,
+                        meta.meta.parent_thread_id,
+                        meta.meta.session_id,
+                    )
+                }))
+            })
+        });
+        let default_cache_affinity = ModelClient::default_cache_affinity(
+            &session_configuration.session_source,
+            parent_thread_id,
+            session_id,
+        );
+        let dedicated_cache = matches!(
+            &session_configuration.session_source,
+            SessionSource::Internal(_)
+        ) || crate::guardian::prompt_cache_key_override_for_review_session(
+            &session_configuration.session_source,
+            parent_thread_id,
+        )
+        .is_some();
+        let cache_affinity = if dedicated_cache {
+            default_cache_affinity
+        } else {
+            inherited_cache_affinity.unwrap_or(default_cache_affinity)
+        };
         let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
         let restore_child_window = matches!(&initial_history, InitialHistory::Forked(_))
             && session_configuration.session_source.is_non_root_agent()
@@ -1003,6 +1048,7 @@ impl Session {
                         let params = CreateThreadParams {
                             creator_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
                             creator_account_id: auth.as_ref().and_then(CodexAuth::get_account_id),
+                            cache_affinity: Some(cache_affinity.clone()),
                             session_id,
                             thread_id,
                             extra_config: config.extra_config.clone(),
@@ -1726,11 +1772,7 @@ impl Session {
                     InitialHistory::Resumed(_) | InitialHistory::Forked(_)
                 ))
                 .with_session_context(
-                    crate::guardian::prompt_cache_key_override_for_review_session(
-                        &session_configuration.session_source,
-                        session_configuration.parent_thread_id,
-                    )
-                    .or(fork_cache_key),
+                    cache_affinity.clone(),
                     tx_event.clone(),
                     codex_responses_headers,
                 ),
@@ -1746,6 +1788,7 @@ impl Session {
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
+                client_ready: std::sync::atomic::AtomicBool::new(!require_client_readiness),
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),

@@ -2518,6 +2518,7 @@ dependencies = [
  "codex-rollout",
  "codex-rollout-trace",
  "codex-sandboxing",
+ "codex-shoal-protocol",
  "codex-skills-extension",
  "codex-state",
  "codex-stdio-to-uds",
@@ -2545,6 +2546,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "supports-color 3.0.2",
  "sys-locale",
@@ -4473,6 +4475,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-shoal-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "codex-skills"
 version = "0.0.0"
 dependencies = [
@@ -4714,6 +4725,7 @@ dependencies = [
  "codex-rollout",
  "codex-sandboxing",
  "codex-shell-command",
+ "codex-shoal-protocol",
  "codex-state",
  "codex-terminal-detection",
  "codex-uds",
@@ -4728,6 +4740,7 @@ dependencies = [
  "codex-utils-path",
  "codex-utils-path-uri",
  "codex-utils-plugins",
+ "codex-utils-pty",
  "codex-utils-sandbox-summary",
  "codex-utils-sleep-inhibitor",
  "codex-utils-string",
@@ -4756,6 +4769,7 @@ dependencies = [
  "ratatui",
  "ratatui-macros",
  "regex-lite",
+ "reqwest 0.12.28",
  "rmcp",
  "semver",
  "serde",
@@ -5017,9 +5031,12 @@ dependencies = [
  "log",
  "portable-pty",
  "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
  "shared_library",
  "tempfile",
  "tokio",
+ "uuid",
  "winapi",
 ]
 

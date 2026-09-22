@@ -1,0 +1,10 @@
+---
+source: tui/src/host_dynamic_tools/recovery_tests.rs
+assertion_line: 69
+expression: "text.join(\"\\n\\n\")"
+---
+⚠ Hosted calls are retained; settlement is recovering. New executions wait up to
+  30 seconds, then return not submitted. completion transport temporarily
+  unavailable
+
+• Hosted tools recovered. Blocked calls were not submitted; existing calls were reconciled without reexecution.

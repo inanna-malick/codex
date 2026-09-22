@@ -17,6 +17,11 @@ mod thread_sections;
 mod types;
 
 pub use codex_state::AddThreadAttachmentOutcome;
+pub use codex_state::HostInputAdmission;
+pub use codex_state::HostInputOperation;
+pub use codex_state::HostInputRecord;
+pub use codex_state::HostInputState;
+pub use codex_state::HostInputWithdrawal;
 pub use codex_state::MAX_QUEUE_ITEMS;
 pub use codex_state::MAX_THREAD_ATTACHMENT_PAYLOAD_BYTES;
 pub use codex_state::ProjectSortKey;

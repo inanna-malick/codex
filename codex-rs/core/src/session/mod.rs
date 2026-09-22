@@ -246,6 +246,7 @@ mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_history;
+mod reasoning_configuration;
 mod retained_context;
 mod review;
 mod rollout_budget;
@@ -273,7 +274,7 @@ pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
-use self::session::Session;
+pub(crate) use self::session::Session;
 use self::session::SessionConfiguration;
 use self::session::SessionSettingsCommit;
 pub(crate) use self::session::SessionSettingsUpdate;
@@ -499,6 +500,17 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
+
+fn terminal_tool_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
 
 impl Session {
     /// Spawn and initialize a new session.
@@ -3560,6 +3572,10 @@ impl Session {
         .await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the history lock reserves a terminal call id through its durable rollout append"
+    )]
     async fn record_prepared_conversation_items(
         &self,
         turn_context: &TurnContext,
@@ -3567,54 +3583,46 @@ impl Session {
         mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
-        // Save the originating history budget for replay.
-        // Preserve any existing tool-specific override.
-        let policy: codex_utils_output_truncation::TruncationPolicy =
-            model_info.truncation_policy.into();
-        for envelope in &mut items {
-            if matches!(
-                envelope.item,
-                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
-            ) {
-                envelope
-                    .metadata
-                    .get_or_insert_default()
-                    .history_truncation_token_limit
-                    .get_or_insert_with(|| with_serialization_allowance(policy).token_budget());
-            }
-        }
-        // Last-N-turn forks retain a suffix starting at a user turn boundary. Repeat the
-        // cumulative checkpoint there so the suffix remains self-contained even when the fork
-        // happens mid-turn; dirty checkpoints preserve new sources between boundaries.
-        let force_mcp_checkpoint = items
-            .iter()
-            .any(|envelope| crate::context_manager::is_user_turn_boundary(&envelope.item));
-        let mcp_revision = self
-            .services
-            .executed_tool_calls
-            .mcp_attribution_checkpoint(force_mcp_checkpoint)
-            .and_then(|(attribution, revision)| {
-                let first_persisted = items
-                    .iter()
-                    .position(|envelope| should_persist_response_item(&envelope.item))?;
-                for (index, envelope) in items.iter_mut().enumerate() {
-                    // Rollout batches may be partially written. Checkpoint the first persisted
-                    // item, and repeat the checkpoint at turn boundaries retained by forks.
-                    if index == first_persisted
-                        || crate::context_manager::is_user_turn_boundary(&envelope.item)
-                    {
-                        envelope.metadata.get_or_insert_default().mcp_attribution =
-                            Some(attribution.clone());
-                    }
-                }
-                Some(revision)
-            });
-        let response_items = items
-            .iter()
-            .map(|envelope| envelope.item.clone())
-            .collect::<Vec<_>>();
-        {
+        let (response_items, terminal_items_prequeued) = {
             let mut state = self.state.lock().await;
+            // A tool call has one terminal protocol output. Enforce that at the shared history
+            // owner so recovery injection and a late ordinary result cannot both append it.
+            let mut terminal_call_ids = state
+                .history
+                .raw_items()
+                .filter_map(terminal_tool_call_id)
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>();
+            items.retain(|envelope| {
+                terminal_tool_call_id(&envelope.item)
+                    .is_none_or(|call_id| terminal_call_ids.insert(call_id.to_owned()))
+            });
+            if items.is_empty() {
+                return;
+            }
+            let response_items = items
+                .iter()
+                .map(|envelope| envelope.item.clone())
+                .collect::<Vec<_>>();
+            let terminal_items_prequeued = response_items
+                .iter()
+                .any(|item| terminal_tool_call_id(item).is_some())
+                && if let Some(live_thread) = self.live_thread() {
+                    let rollout_items = items
+                        .iter()
+                        .cloned()
+                        .map(RolloutItem::ResponseItem)
+                        .collect::<Vec<_>>();
+                    if let Err(error) = live_thread.append_items(&rollout_items).await {
+                        error!(
+                            "failed to queue terminal rollout item before recording history: {error:#}"
+                        );
+                        return;
+                    }
+                    true
+                } else {
+                    false
+                };
             state
                 .current_time_reminder
                 .note_recorded_items(&response_items);
@@ -3636,8 +3644,9 @@ impl Session {
             }
             state
                 .history
-                .record_annotated_items(&items, model_info.truncation_policy.into());
-        }
+                .record_annotated_items(&items, turn_context.model_info().truncation_policy.into());
+            (response_items, terminal_items_prequeued)
+        };
         for image in image_preparations {
             self.services
                 .analytics_events_client
@@ -3648,7 +3657,7 @@ impl Session {
         }
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
-        if self.persist_rollout_items(&rollout_items).await
+        if !terminal_items_prequeued && self.persist_rollout_items(&rollout_items).await
             && let Some(revision) = mcp_revision
         {
             self.services
@@ -4162,6 +4171,29 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+        // Hosted clients release deferred effects on these result notifications.
+        // A notification must never advertise a boundary that is only buffered.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+            )
+        }) && let Err(error) = self.flush_rollout().await
+        {
+            tracing::error!(%error, "cannot publish durable tool completion");
+            if let Some((_, cancellation)) = self.active_turn_context_and_cancellation_token().await
+            {
+                cancellation.cancel();
+            }
+            self.send_event(turn_context, EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message: format!("Could not persist tool completion; deferred forks were not released: {error}"),
+                codex_error_info: Some(codex_protocol::protocol::CodexErrorInfo::Other),
+                misalignment: None,
+            })).await;
+            return;
+        }
         for item in items {
             self.send_event(
                 turn_context,

@@ -47,6 +47,12 @@ pub(super) struct CodeModeCellDelegate {
     pub(super) step_context: Arc<StepContext>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CellOrigin {
+    pub call_id: String,
+    pub item_id: Option<ResponseItemId>,
+}
+
 struct CellDispatchGate {
     ready: watch::Sender<bool>,
     // Callbacks may create the gate before exec attaches its origin. None means

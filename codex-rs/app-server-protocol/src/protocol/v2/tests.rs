@@ -1803,6 +1803,7 @@ fn command_exec_output_delta_round_trips() {
         stream: CommandExecOutputStream::Stdout,
         delta_base64: "AQI=".to_string(),
         cap_reached: false,
+        end_of_stream: None,
     };
 
     let value = serde_json::to_value(&notification)
@@ -1814,6 +1815,7 @@ fn command_exec_output_delta_round_trips() {
             "stream": "stdout",
             "deltaBase64": "AQI=",
             "capReached": false,
+            "endOfStream": null,
         })
     );
 
@@ -3325,6 +3327,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let dynamic_tool_call_item = TurnItem::DynamicToolCall(DynamicToolCallItem {
+        context_call_id: None,
         id: "dynamic-1".to_string(),
         namespace: Some("apps".to_string()),
         tool: "lookup".to_string(),
@@ -4837,6 +4840,31 @@ fn thread_start_params_preserve_explicit_null_service_tier() {
     let serialized_without_override =
         serde_json::to_value(ThreadStartParams::default()).expect("params should serialize");
     assert_eq!(serialized_without_override.get("serviceTier"), None);
+}
+
+#[test]
+fn thread_start_persistence_defaults_to_lazy() {
+    let params: ThreadStartParams =
+        serde_json::from_value(json!({})).expect("params should deserialize");
+    assert_eq!(
+        params.persistence.unwrap_or_default(),
+        ThreadStartPersistence::Lazy
+    );
+
+    let serialized = serde_json::to_value(params).expect("params should serialize");
+    assert_eq!(
+        serialized.get("persistence"),
+        Some(&serde_json::Value::Null)
+    );
+
+    let immediate: ThreadStartParams = serde_json::from_value(json!({
+        "persistence": "immediate"
+    }))
+    .expect("immediate persistence should deserialize");
+    assert_eq!(
+        immediate.persistence,
+        Some(ThreadStartPersistence::Immediate)
+    );
 }
 
 #[test]

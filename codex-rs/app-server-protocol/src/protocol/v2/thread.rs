@@ -26,6 +26,8 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+pub use codex_protocol::dynamic_tools::DynamicToolCustomFormat;
+pub use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
@@ -50,6 +52,15 @@ use std::path::PathBuf;
 pub enum ThreadStartSource {
     Startup,
     Clear,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadStartPersistence {
+    #[default]
+    Lazy,
+    Immediate,
 }
 
 // === Threads, Turns, and Items ===
@@ -113,6 +124,10 @@ pub struct ThreadStartParams {
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    /// Controls when this thread's rollout becomes durably discoverable.
+    #[experimental("thread/start.persistence")]
+    #[ts(optional = nullable)]
+    pub persistence: Option<ThreadStartPersistence>,
     /// Persisted thread history contract to use for this new thread.
     #[experimental("thread/start.historyMode")]
     #[ts(optional = nullable)]
@@ -352,6 +367,11 @@ pub struct ThreadSettingsUpdatedNotification {
 ///
 /// Prefer using thread_id whenever possible.
 pub struct ThreadResumeParams {
+    /// Emit raw response items, including durably recorded tool results.
+    #[experimental("thread/resume.experimentalRawEvents")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_raw_events: bool,
+
     pub thread_id: String,
 
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
@@ -542,7 +562,37 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 ///
 /// Prefer using thread_id whenever possible.
 pub struct ThreadForkParams {
+    /// Emit raw response items, including durably recorded tool results.
+    #[experimental("thread/fork.experimentalRawEvents")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_raw_events: bool,
+
     pub thread_id: String,
+
+    /// Freeze history through this complete invocation, excluding its future result.
+    /// Reuse the source thread id and call id for siblings, even after the source advances.
+    /// Mutually exclusive with turn boundaries. Does not interrupt the source operation.
+    #[experimental("thread/fork.throughCallId")]
+    #[ts(optional = nullable)]
+    pub through_call_id: Option<String>,
+
+    /// Freeze history after this call's actual result and all outstanding tool results.
+    /// Rejects an incomplete call; never includes subsequent parent progress.
+    #[experimental("thread/fork.afterCallId")]
+    #[ts(optional = nullable)]
+    pub after_call_id: Option<String>,
+
+    /// Require thread/ready before inference, including on subsequent runtime attachments.
+    /// Implies deferred goal continuation. Queued assignments remain queued until readiness.
+    #[experimental("thread/fork.requireClientReadiness")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_client_readiness: bool,
+
+    /// Validate destination-hosted declarations against the inherited declarations without
+    /// replacing them. A mismatch rejects the fork before any child is created.
+    #[experimental("thread/fork.expectedDynamicTools")]
+    #[ts(optional = nullable)]
+    pub expected_dynamic_tools: Option<Vec<DynamicToolSpec>>,
 
     /// Optional last turn id to fork through, inclusive.
     ///
@@ -1692,6 +1742,11 @@ pub struct ThreadInjectItemsParams {
     pub thread_id: String,
     /// Raw Responses API items to append to the thread's model-visible history.
     pub items: Vec<JsonValue>,
+    /// Append exactly one matching terminal tool output directly to durable
+    /// history, even while a turn is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub terminal_call_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1878,6 +1933,8 @@ pub struct RawResponseCompletedNotification {
 pub struct ResponseUsageMetadata {
     pub amount: Option<String>,
     pub metadata: Option<JsonValue>,
+    pub prompt_cache_diagnostics: Option<JsonValue>,
+    pub prompt_cache_options: Option<JsonValue>,
 }
 
 impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
@@ -1885,6 +1942,8 @@ impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
         Self {
             amount: value.amount,
             metadata: value.metadata,
+            prompt_cache_diagnostics: value.prompt_cache_diagnostics,
+            prompt_cache_options: value.prompt_cache_options,
         }
     }
 }

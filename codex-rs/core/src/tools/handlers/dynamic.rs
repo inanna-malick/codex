@@ -9,6 +9,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
+use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -23,8 +24,10 @@ use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use codex_tools::default_namespace_description;
+use codex_tools::dynamic_custom_tool_to_responses_api_tool;
 use codex_tools::dynamic_tool_to_responses_api_tool;
 use serde_json::Value;
+use serde_json::json;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -33,21 +36,54 @@ pub struct DynamicToolHandler {
     tool_name: ToolName,
     spec: ToolSpec,
     exposure: ToolExposure,
+    payload_kind: DynamicToolPayloadKind,
+}
+
+#[derive(Clone, Copy)]
+enum DynamicToolPayloadKind {
+    Function,
+    Custom,
+}
+
+fn dynamic_tool_exposure(
+    namespace: Option<&DynamicToolNamespaceSpec>,
+    defer_loading: bool,
+) -> ToolExposure {
+    match (
+        namespace.is_some_and(|namespace| namespace.model_only),
+        defer_loading,
+    ) {
+        (true, false) => ToolExposure::DirectModelOnly,
+        (true, true) => ToolExposure::DeferredModelOnly,
+        (false, false) => ToolExposure::Direct,
+        (false, true) => ToolExposure::Deferred,
+    }
 }
 
 impl DynamicToolHandler {
     pub fn new(tool: &DynamicToolFunctionSpec) -> Option<Self> {
-        Self::from_parts(tool, /*namespace*/ None)
+        Self::from_function_parts(tool, /*namespace*/ None)
     }
 
     pub fn new_in_namespace(
         namespace: &DynamicToolNamespaceSpec,
         tool: &DynamicToolFunctionSpec,
     ) -> Option<Self> {
-        Self::from_parts(tool, Some(namespace))
+        Self::from_function_parts(tool, Some(namespace))
     }
 
-    fn from_parts(
+    pub fn new_custom(tool: &DynamicToolCustomSpec) -> Self {
+        Self::from_custom_parts(tool, /*namespace*/ None)
+    }
+
+    pub fn new_custom_in_namespace(
+        namespace: &DynamicToolNamespaceSpec,
+        tool: &DynamicToolCustomSpec,
+    ) -> Self {
+        Self::from_custom_parts(tool, Some(namespace))
+    }
+
+    fn from_function_parts(
         tool: &DynamicToolFunctionSpec,
         namespace: Option<&DynamicToolNamespaceSpec>,
     ) -> Option<Self> {
@@ -70,15 +106,57 @@ impl DynamicToolHandler {
             }),
             None => ToolSpec::Function(output_tool),
         };
-        Some(Self {
+        Some(Self::from_spec(
             tool_name,
             spec,
-            exposure: if tool.defer_loading {
-                ToolExposure::Deferred
-            } else {
-                ToolExposure::Direct
-            },
-        })
+            dynamic_tool_exposure(namespace, tool.defer_loading),
+            DynamicToolPayloadKind::Function,
+        ))
+    }
+
+    fn from_custom_parts(
+        tool: &DynamicToolCustomSpec,
+        namespace: Option<&DynamicToolNamespaceSpec>,
+    ) -> Self {
+        let tool_name = ToolName::new(
+            namespace.map(|namespace| namespace.name.clone()),
+            tool.name.clone(),
+        );
+        let mut output_tool = dynamic_custom_tool_to_responses_api_tool(tool);
+        // Exposure controls deferral; tool search restores this marker for deferred results.
+        output_tool.defer_loading = None;
+        let spec = match namespace {
+            Some(namespace) => ToolSpec::Namespace(ResponsesApiNamespace {
+                name: namespace.name.clone(),
+                description: if namespace.description.trim().is_empty() {
+                    default_namespace_description(&namespace.name)
+                } else {
+                    namespace.description.clone()
+                },
+                tools: vec![ResponsesApiNamespaceTool::Custom(output_tool)],
+            }),
+            None => ToolSpec::Freeform(output_tool),
+        };
+        Self::from_spec(
+            tool_name,
+            spec,
+            dynamic_tool_exposure(namespace, tool.defer_loading),
+            DynamicToolPayloadKind::Custom,
+        )
+    }
+
+    fn from_spec(
+        tool_name: ToolName,
+        spec: ToolSpec,
+        exposure: ToolExposure,
+        payload_kind: DynamicToolPayloadKind,
+    ) -> Self {
+        Self {
+            tool_name,
+            spec,
+            exposure,
+            payload_kind,
+        }
     }
 }
 
@@ -118,6 +196,7 @@ impl DynamicToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let context_call_id = invocation.context_call_id();
         let ToolInvocation {
             session,
             turn,
@@ -127,21 +206,32 @@ impl DynamicToolHandler {
         } = invocation;
 
         let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
-            _ => {
+            ToolPayload::Function { arguments } => parse_arguments(&arguments)?,
+            ToolPayload::Custom { input } => Value::String(input),
+            ToolPayload::ToolSearch { .. } => {
                 return Err(FunctionCallError::RespondToModel(
                     "dynamic tool handler received unsupported payload".to_string(),
                 ));
             }
         };
 
-        let args: Value = parse_arguments(&arguments)?;
+        // The invocation was recorded before this handler was scheduled. Hosts may fork from
+        // another process while servicing it, so publish the call only after that prefix is durable.
+        session.flush_rollout().await.map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "could not persist dynamic tool invocation before dispatch: {err}"
+            ))
+        })?;
+
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),
-            call_id,
-            self.tool_name.clone(),
-            args,
+            DynamicToolRequest {
+                call_id,
+                context_call_id,
+                tool_name: self.tool_name.clone(),
+                arguments,
+            },
         )
         .await
         .ok_or_else(|| {
@@ -165,7 +255,29 @@ impl DynamicToolHandler {
     }
 }
 
-impl CoreToolRuntime for DynamicToolHandler {}
+impl CoreToolRuntime for DynamicToolHandler {
+    fn code_mode_output_schema(&self) -> Option<Value> {
+        matches!(self.payload_kind, DynamicToolPayloadKind::Custom)
+            .then(|| json!({ "type": "string" }))
+    }
+
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(
+            (self.payload_kind, payload),
+            (
+                DynamicToolPayloadKind::Function,
+                ToolPayload::Function { .. }
+            ) | (DynamicToolPayloadKind::Custom, ToolPayload::Custom { .. })
+        )
+    }
+}
+
+struct DynamicToolRequest {
+    call_id: String,
+    context_call_id: Option<String>,
+    tool_name: ToolName,
+    arguments: Value,
+}
 
 #[expect(
     clippy::await_holding_invalid_type,
@@ -174,10 +286,14 @@ impl CoreToolRuntime for DynamicToolHandler {}
 async fn request_dynamic_tool(
     session: &Session,
     turn_context: &TurnContext,
-    call_id: String,
-    tool_name: ToolName,
-    arguments: Value,
+    request: DynamicToolRequest,
 ) -> Option<DynamicToolResponse> {
+    let DynamicToolRequest {
+        call_id,
+        context_call_id,
+        tool_name,
+        arguments,
+    } = request;
     let namespace = tool_name.namespace;
     let tool = tool_name.name;
     let (tx_response, rx_response) = oneshot::channel();
@@ -201,6 +317,7 @@ async fn request_dynamic_tool(
         .emit_turn_item_started(
             turn_context,
             &TurnItem::DynamicToolCall(DynamicToolCallItem {
+                context_call_id: context_call_id.clone(),
                 id: call_id.clone(),
                 namespace: namespace.clone(),
                 tool: tool.clone(),
@@ -217,6 +334,7 @@ async fn request_dynamic_tool(
 
     let item = match &response {
         Some(response) => DynamicToolCallItem {
+            context_call_id: context_call_id.clone(),
             id: call_id,
             namespace,
             tool,
@@ -232,6 +350,7 @@ async fn request_dynamic_tool(
             duration: Some(started_at.elapsed()),
         },
         None => DynamicToolCallItem {
+            context_call_id: context_call_id.clone(),
             id: call_id,
             namespace,
             tool,

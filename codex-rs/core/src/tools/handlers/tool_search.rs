@@ -262,6 +262,7 @@ mod tests {
     use crate::tools::handlers::McpHandler;
     use crate::tools::registry::ToolExposure;
     use codex_mcp::ToolInfo;
+    use codex_protocol::dynamic_tools::DynamicToolCustomSpec;
     use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
     use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
     use codex_tools::ResponsesApiNamespace;
@@ -355,8 +356,51 @@ mod tests {
     }
 
     #[test]
+    fn deferred_custom_dynamic_tools_are_searchable() {
+        let cache = ToolSearchHandlerCache::default();
+        let namespace = DynamicToolNamespaceSpec {
+            model_only: false,
+            name: "languages".to_string(),
+            description: "Language runtimes".to_string(),
+            tools: Vec::new(),
+        };
+        let custom_tool = DynamicToolCustomSpec {
+            name: "tidepool".to_string(),
+            description: "Evaluate Tidepool Haskell programs".to_string(),
+            defer_loading: true,
+            format: None,
+        };
+        let mut registry = ToolRegistry::default();
+        registry.register_external(Arc::new(DynamicToolHandler::new_custom_in_namespace(
+            &namespace,
+            &custom_tool,
+        )));
+
+        let handler = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+
+        assert_eq!(handler.search_infos.len(), 1);
+        assert!(
+            handler.search_infos[0]
+                .entry
+                .search_text
+                .contains("Tidepool")
+        );
+        let LoadableToolSpec::Namespace(output_namespace) = &handler.search_infos[0].entry.output
+        else {
+            panic!("expected custom tool namespace");
+        };
+        assert_eq!(output_namespace.name, namespace.name);
+        assert!(matches!(
+            output_namespace.tools.as_slice(),
+            [ResponsesApiNamespaceTool::Custom(tool)]
+                if tool.name == "tidepool" && tool.defer_loading == Some(true)
+        ));
+    }
+
+    #[test]
     fn mixed_search_results_coalesce_mcp_namespaces() {
         let dynamic_namespace = DynamicToolNamespaceSpec {
+            model_only: false,
             name: "codex_app".to_string(),
             description: "Tools in the codex_app namespace.".to_string(),
             tools: Vec::new(),

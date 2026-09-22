@@ -391,7 +391,7 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
             .args(["-c", crate::SAFE_BARE_REPOSITORY_CONFIG])
             .args(args)
             .current_dir(self.cwd);
-        match run_git_command_with_timeout_output(&mut command, GIT_COMMAND_TIMEOUT).await {
+        match run_git_command_with_timeout_output(command, GIT_COMMAND_TIMEOUT).await {
             Some(output) if output.status.success() => Some(output.stdout),
             _ => None,
         }
@@ -422,7 +422,7 @@ pub(crate) async fn run_git_command_with_timeout_from(
         .args(["-c", fsmonitor.git_config_arg()])
         .args(args)
         .current_dir(cwd);
-    run_git_command_with_timeout_output(&mut command, GIT_COMMAND_TIMEOUT).await
+    run_git_command_with_timeout_output(command, GIT_COMMAND_TIMEOUT).await
 }
 
 async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {

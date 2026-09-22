@@ -20,6 +20,16 @@ mod sqlite;
 mod telemetry;
 
 pub use model::CreatedProject;
+pub use model::HostInputAdmission;
+pub use model::HostInputOperation;
+pub use model::HostInputRecord;
+pub use model::HostInputState;
+pub use model::HostInputWithdrawal;
+pub use model::HostToolCompletionError;
+pub use model::HostToolCompletionKey;
+pub use model::HostToolCompletionRecord;
+pub use model::HostToolCompletionRegistration;
+pub use model::HostToolCompletionState;
 pub use model::LogEntry;
 pub use model::LogQuery;
 pub use model::LogRow;

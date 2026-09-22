@@ -93,6 +93,8 @@ pub struct RolloutRecorder {
 #[allow(clippy::large_enum_variant)]
 pub enum RolloutRecorderParams {
     Create {
+        cache_affinity: Option<codex_protocol::protocol::ProviderCacheAffinity>,
+        require_client_readiness: bool,
         session_id: SessionId,
         conversation_id: ThreadId,
         /// Overrides the rollout ID encoded in the filename.
@@ -205,6 +207,8 @@ impl RolloutRecorderParams {
         dynamic_tools: Vec<DynamicToolSpec>,
     ) -> Self {
         Self::Create {
+            cache_affinity: None,
+            require_client_readiness: false,
             session_id: conversation_id.into(),
             conversation_id,
             rollout_id_override: None,
@@ -245,6 +249,18 @@ impl RolloutRecorderParams {
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         if let Self::Create { session_id: id, .. } = &mut self {
             *id = session_id;
+        }
+        self
+    }
+
+    /// Persist the requirement to acknowledge each new runtime before inference.
+    pub fn with_client_readiness(mut self, required: bool) -> Self {
+        if let Self::Create {
+            require_client_readiness,
+            ..
+        } = &mut self
+        {
+            *require_client_readiness = required;
         }
         self
     }
@@ -898,7 +914,9 @@ impl RolloutRecorder {
         let cwd = config.cwd().to_path_buf();
         let state = match params {
             RolloutRecorderParams::Create {
+                cache_affinity,
                 session_id,
+                require_client_readiness,
                 conversation_id,
                 rollout_id_override,
                 forked_from_id,
@@ -933,6 +951,8 @@ impl RolloutRecorder {
                     .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 
                 let session_meta = SessionMeta {
+                    cache_affinity,
+                    require_client_readiness,
                     session_id,
                     id: conversation_id,
                     forked_from_id,

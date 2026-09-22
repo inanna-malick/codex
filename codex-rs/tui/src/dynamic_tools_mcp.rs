@@ -217,11 +217,13 @@ impl ServerHandler for DynamicToolMcpHandler {
         for spec in dynamic_tools::tool_specs() {
             let functions = match spec {
                 DynamicToolSpec::Function(function) => vec![function],
+                DynamicToolSpec::Custom(_) => Vec::new(),
                 DynamicToolSpec::Namespace(namespace) => namespace
                     .tools
                     .into_iter()
-                    .map(|tool| match tool {
-                        DynamicToolNamespaceTool::Function(function) => function,
+                    .filter_map(|tool| match tool {
+                        DynamicToolNamespaceTool::Function(function) => Some(function),
+                        DynamicToolNamespaceTool::Custom(_) => None,
                     })
                     .collect(),
             };
@@ -272,6 +274,7 @@ impl ServerHandler for DynamicToolMcpHandler {
             .and_then(Value::as_str)
             .map_or_else(|| format!("mcp-call-{}", Uuid::new_v4()), str::to_string);
         let params = DynamicToolCallParams {
+            context_call_id: None,
             thread_id: thread_id.to_string(),
             turn_id,
             call_id,

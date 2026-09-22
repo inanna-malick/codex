@@ -585,6 +585,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .create_thread(CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: legacy_thread_id.into(),
             thread_id: legacy_thread_id,
             extra_config: None,
@@ -2626,6 +2627,7 @@ async fn create_paginated_subagent_thread(
         .create_thread(CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

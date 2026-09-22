@@ -5,6 +5,8 @@ mod daemon_continuation;
 mod daemon_snapshot;
 
 use super::persisted_resume_settings::PersistedResumeSettings;
+mod observe;
+mod readiness;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
@@ -342,41 +344,49 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     }
 
     fn validate_dynamic_tool<'a>(
-        tool: &'a DynamicToolFunctionSpec,
+        name: &'a str,
+        defer_loading: bool,
+        input_schema: Option<&serde_json::Value>,
         namespace: Option<&str>,
         seen: &mut HashSet<&'a str>,
     ) -> Result<(), String> {
-        let name = tool.name.trim();
-        if name.is_empty() {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
             return Err("dynamic tool name must not be empty".to_string());
         }
-        if name != tool.name {
+        if trimmed_name != name {
             return Err(format!(
                 "dynamic tool name has leading/trailing whitespace: {}",
-                escape_identifier_for_error(&tool.name),
+                escape_identifier_for_error(name),
             ));
         }
-        validate_dynamic_tool_identifier(name, "dynamic tool name", DYNAMIC_TOOL_NAME_MAX_LEN)?;
-        if name == "mcp" || name.starts_with("mcp__") {
-            return Err(format!("dynamic tool name is reserved: {name}"));
+        validate_dynamic_tool_identifier(
+            trimmed_name,
+            "dynamic tool name",
+            DYNAMIC_TOOL_NAME_MAX_LEN,
+        )?;
+        if trimmed_name == "mcp" || trimmed_name.starts_with("mcp__") {
+            return Err(format!("dynamic tool name is reserved: {trimmed_name}"));
         }
-        if !seen.insert(name) {
+        if !seen.insert(trimmed_name) {
             if let Some(namespace) = namespace {
                 return Err(format!(
-                    "duplicate dynamic tool name in namespace {namespace}: {name}"
+                    "duplicate dynamic tool name in namespace {namespace}: {trimmed_name}"
                 ));
             }
-            return Err(format!("duplicate dynamic tool name: {name}"));
+            return Err(format!("duplicate dynamic tool name: {trimmed_name}"));
         }
-        if tool.defer_loading && namespace.is_none() {
+        if defer_loading && namespace.is_none() {
             return Err(format!(
-                "deferred dynamic tool must include a namespace: {name}"
+                "deferred dynamic tool must include a namespace: {trimmed_name}"
             ));
         }
 
-        if let Err(err) = codex_tools::parse_tool_input_schema(&tool.input_schema) {
+        if let Some(input_schema) = input_schema
+            && let Err(err) = codex_tools::parse_tool_input_schema(input_schema)
+        {
             return Err(format!(
-                "dynamic tool input schema is not supported for {name}: {err}"
+                "dynamic tool input schema is not supported for {trimmed_name}: {err}"
             ));
         }
         Ok(())
@@ -387,7 +397,22 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     for spec in tools {
         match spec {
             DynamicToolSpec::Function(tool) => {
-                validate_dynamic_tool(tool, /*namespace*/ None, &mut seen_tools)?;
+                validate_dynamic_tool(
+                    &tool.name,
+                    tool.defer_loading,
+                    Some(&tool.input_schema),
+                    /*namespace*/ None,
+                    &mut seen_tools,
+                )?;
+            }
+            DynamicToolSpec::Custom(tool) => {
+                validate_dynamic_tool(
+                    &tool.name,
+                    tool.defer_loading,
+                    /*input_schema*/ None,
+                    /*namespace*/ None,
+                    &mut seen_tools,
+                )?;
             }
             DynamicToolSpec::Namespace(namespace) => {
                 let name = namespace.name.trim();
@@ -430,8 +455,22 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                 }
                 let mut seen_namespace_tools = HashSet::new();
                 for tool in &namespace.tools {
-                    let DynamicToolNamespaceTool::Function(tool) = tool;
-                    validate_dynamic_tool(tool, Some(name), &mut seen_namespace_tools)?;
+                    match tool {
+                        DynamicToolNamespaceTool::Function(tool) => validate_dynamic_tool(
+                            &tool.name,
+                            tool.defer_loading,
+                            Some(&tool.input_schema),
+                            Some(name),
+                            &mut seen_namespace_tools,
+                        )?,
+                        DynamicToolNamespaceTool::Custom(tool) => validate_dynamic_tool(
+                            &tool.name,
+                            tool.defer_loading,
+                            /*input_schema*/ None,
+                            Some(name),
+                            &mut seen_namespace_tools,
+                        )?,
+                    }
                 }
             }
         }
@@ -1153,6 +1192,7 @@ impl ThreadRequestProcessor {
             personality,
             multi_agent_mode: _multi_agent_mode,
             ephemeral,
+            persistence,
             history_mode,
             session_start_source,
             thread_source,
@@ -1249,6 +1289,7 @@ impl ThreadRequestProcessor {
                 service_name,
                 allow_provider_model_fallback,
                 experimental_raw_events,
+                persistence.unwrap_or_default(),
                 request_trace,
                 initial_config_warnings,
             )
@@ -1264,14 +1305,9 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
-    pub(crate) async fn drain_background_tasks(&self) {
+    pub(crate) async fn drain_background_tasks(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.background_tasks.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
-            .await
-            .is_err()
-        {
-            warn!("timed out waiting for background tasks to shut down; proceeding");
-        }
+        tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait()).await
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
@@ -1331,6 +1367,7 @@ impl ThreadRequestProcessor {
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
         experimental_raw_events: bool,
+        persistence: ThreadStartPersistence,
         request_trace: Option<W3cTraceContext>,
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
     ) -> Result<(), JSONRPCErrorError> {
@@ -1453,7 +1490,7 @@ impl ThreadRequestProcessor {
         let dynamic_tool_count: usize = dynamic_tools
             .iter()
             .map(|tool| match tool {
-                DynamicToolSpec::Function(_) => 1,
+                DynamicToolSpec::Function(_) | DynamicToolSpec::Custom(_) => 1,
                 DynamicToolSpec::Namespace(namespace) => namespace.tools.len(),
             })
             .sum();
@@ -1482,6 +1519,10 @@ impl ThreadRequestProcessor {
             .await?
         };
         start_options.reserved_thread_id = reserved_thread_id;
+        start_options.persistence = match persistence {
+            ThreadStartPersistence::Lazy => codex_core::ThreadStartPersistence::Lazy,
+            ThreadStartPersistence::Immediate => codex_core::ThreadStartPersistence::Immediate,
+        };
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager
@@ -3658,6 +3699,7 @@ impl ThreadRequestProcessor {
         };
 
         let ThreadResumeParams {
+            experimental_raw_events,
             thread_id,
             history,
             path,
@@ -4012,7 +4054,7 @@ impl ThreadRequestProcessor {
                     self.ensure_conversation_listener(
                         thread_id,
                         request_id.connection_id,
-                        /*raw_events_enabled*/ false,
+                        experimental_raw_events,
                     )
                     .await,
                     thread_id,
@@ -4386,6 +4428,9 @@ impl ThreadRequestProcessor {
                 .thread_state_manager
                 .thread_state(existing_thread_id)
                 .await;
+            if params.experimental_raw_events {
+                thread_state.lock().await.experimental_raw_events = true;
+            }
             self.ensure_listener_task_running(
                 existing_thread_id,
                 existing_thread.clone(),
@@ -4813,13 +4858,27 @@ impl ThreadRequestProcessor {
     async fn thread_fork_inner(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadForkParams,
+        mut params: ThreadForkParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<(), JSONRPCErrorError> {
+        let source_thread = self
+            .read_stored_thread_for_resume(
+                &params.thread_id,
+                params.path.as_ref(),
+                /*include_history*/ false,
+            )
+            .await?;
+        super::thread_fork_settings::inherit(&mut params, &source_thread, &self.thread_manager)
+            .await;
         let ThreadForkParams {
+            experimental_raw_events,
             thread_id,
+            through_call_id,
+            after_call_id,
+            require_client_readiness,
+            expected_dynamic_tools,
             last_turn_id,
             before_turn_id,
             path,
@@ -4841,19 +4900,34 @@ impl ThreadRequestProcessor {
             defer_goal_continuation,
         } = params;
         let include_turns = !exclude_turns;
+        let defer_goal_continuation = defer_goal_continuation || require_client_readiness;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
-        let source_thread = self
-            .read_stored_thread_for_resume(
-                &thread_id,
-                path.as_ref(),
-                /*include_history*/ false,
-            )
-            .await?;
         let paginated_source = matches!(source_thread.history_mode, ThreadHistoryMode::Paginated);
+        if let Some(call_id) = through_call_id.as_deref()
+            && (call_id.is_empty()
+                || call_id.len() > 256
+                || last_turn_id.is_some()
+                || before_turn_id.is_some())
+        {
+            return Err(invalid_request(
+                "`throughCallId` requires a 1–256 byte call id and cannot be combined with turn boundaries",
+            ));
+        }
+        if let Some(call_id) = after_call_id.as_deref()
+            && (call_id.is_empty()
+                || call_id.len() > 256
+                || through_call_id.is_some()
+                || last_turn_id.is_some()
+                || before_turn_id.is_some())
+        {
+            return Err(invalid_request(
+                "`afterCallId` requires a 1–256 byte call id and cannot be combined with other boundaries",
+            ));
+        }
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
                 "`beforeTurnId` cannot be combined with `lastTurnId`",
@@ -4882,15 +4956,21 @@ impl ThreadRequestProcessor {
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
         let mut prepared_fork = if paginated_source {
-            let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
-                (Some(turn_id), None) => {
-                    codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
+            let boundary = if let Some(call_id) = after_call_id.as_ref() {
+                codex_thread_store::ForkBoundary::AfterCall(call_id.clone())
+            } else if let Some(call_id) = through_call_id.as_ref() {
+                codex_thread_store::ForkBoundary::ThroughCall(call_id.clone())
+            } else {
+                match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
+                    (Some(turn_id), None) => {
+                        codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
+                    }
+                    (None, Some(turn_id)) => {
+                        codex_thread_store::ForkBoundary::BeforeTurn(turn_id.to_string())
+                    }
+                    (None, None) => codex_thread_store::ForkBoundary::Latest,
+                    (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
                 }
-                (None, Some(turn_id)) => {
-                    codex_thread_store::ForkBoundary::BeforeTurn(turn_id.to_string())
-                }
-                (None, None) => codex_thread_store::ForkBoundary::Latest,
-                (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
             Some(
                 self.thread_store
@@ -4936,6 +5016,23 @@ impl ThreadRequestProcessor {
             )
         };
         let history_cwd = Some(source_thread.cwd.clone());
+
+        if let Some(expected) = expected_dynamic_tools {
+            let inherited = source_history_items
+                .iter()
+                .find_map(|item| match item {
+                    RolloutItem::SessionMeta(meta) => {
+                        Some(meta.meta.dynamic_tools.as_deref().unwrap_or_default())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if inherited != expected.as_slice() {
+                return Err(invalid_request(
+                    "destination hosted tool declarations do not match the inherited declarations",
+                ));
+            }
+        }
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -5050,11 +5147,16 @@ impl ThreadRequestProcessor {
             }
         }
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let config = self
+        let mut config = self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
             .map_err(|err| config_load_error(&err))?;
+        if require_client_readiness {
+            config.extra_config = Some(codex_thread_store::ExtraConfig {
+                require_client_readiness: true,
+            });
+        }
         let goals_enabled = config.features.enabled(Feature::Goals);
 
         let fallback_model_provider = config.model_provider_id.clone();
@@ -5074,7 +5176,15 @@ impl ThreadRequestProcessor {
                     truncate_rollout_before_turn_id(source_history_items, before_turn_id)
                         .map_err(|err| core_thread_write_error("truncate thread for fork", err))?
                 }
-                (None, None) => source_history_items,
+                (None, None) => {
+                    if let Some(call_id) = after_call_id.as_deref() {
+                        super::thread_fork_boundary::after_call(source_history_items, call_id)?
+                    } else if let Some(call_id) = through_call_id.as_deref() {
+                        super::thread_fork_boundary::through_call(source_history_items, call_id)?
+                    } else {
+                        source_history_items
+                    }
+                }
                 (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
             Arc::new(history_items)
@@ -5129,22 +5239,32 @@ impl ThreadRequestProcessor {
             .await?
         };
 
-        let fork_options = StartThreadOptions {
-            thread_source,
-            parent_trace,
-            client_mcp_extensions,
-            reserved_thread_id,
-            ..StartThreadOptions::new(config)
+        let snapshot = if after_call_id.is_some() {
+            ForkSnapshot::CompletedCallBoundary
+        } else if through_call_id.is_some() {
+            ForkSnapshot::InvocationBoundary
+        } else {
+            ForkSnapshot::Interrupted
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
-                .fork_prepared_thread(fork_options, prepared_fork)
+                .fork_prepared_thread(
+                    snapshot,
+                    config,
+                    prepared_fork,
+                )
                 .await
         } else {
             self.thread_manager
                 .fork_thread_from_history(
-                    ForkSnapshot::Interrupted,
-                    fork_options,
+                    snapshot,
+                    StartThreadOptions {
+                        thread_source,
+                        parent_trace,
+                        client_mcp_extensions,
+                        reserved_thread_id,
+                        ..StartThreadOptions::new(config)
+                    },
                     InitialHistory::Resumed(ResumedHistory {
                         conversation_id: source_thread_id,
                         history: history_items,
@@ -5229,7 +5349,7 @@ impl ThreadRequestProcessor {
             self.ensure_conversation_listener(
                 thread_id,
                 request_id.connection_id,
-                /*raw_events_enabled*/ false,
+                experimental_raw_events,
             )
             .await,
             thread_id,

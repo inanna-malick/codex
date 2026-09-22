@@ -41,6 +41,7 @@ members = [
     "context-fragments",
     "shell-command",
     "shell-escalation",
+    "shoal-protocol",
     "skills",
     "core",
     "core-api",
@@ -267,6 +268,7 @@ codex-sandboxing = { path = "sandboxing" }
 codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
+codex-shoal-protocol = { path = "shoal-protocol" }
 codex-skills-extension = { path = "ext/skills" }
 codex-skills = { path = "skills" }
 codex-state = { path = "state" }
@@ -614,6 +616,16 @@ strip = false
 
 # Balance parallel release code generation against binary size.
 codegen-units = 4
+
+# Local Nix packages need the release runtime semantics without whole-program
+# optimization. Keep the distribution profile above for explicit release builds.
+[profile.local]
+inherits = "release"
+opt-level = 0
+lto = false
+codegen-units = 256
+debug = "none"
+strip = "symbols"
 
 [profile.profiling]
 inherits = "release"

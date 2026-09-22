@@ -376,6 +376,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
         .create_thread(StoreCreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: unloaded_thread_id.into(),
             thread_id: unloaded_thread_id,
             extra_config: None,

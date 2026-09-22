@@ -4511,6 +4511,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -6535,6 +6536,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
 
     let session = Session {
+        client_ready: std::sync::atomic::AtomicBool::new(true),
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
@@ -8219,6 +8221,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8333,6 +8336,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8805,6 +8809,7 @@ where
     };
 
     let session = Arc::new(Session {
+        client_ready: std::sync::atomic::AtomicBool::new(true),
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
@@ -11037,6 +11042,7 @@ async fn attach_in_memory_thread_store(
         CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,

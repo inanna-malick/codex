@@ -54,6 +54,12 @@ pub struct ThreadResumeInput<'a> {
     pub thread_store: &'a ExtensionData,
 }
 
+/// Input supplied when client setup opens admission for existing queued work.
+pub struct ThreadInputReadyInput<'a> {
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+}
+
 /// Why a thread has no immediately pending work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadIdleCause {

@@ -110,6 +110,8 @@ mod thread_processor_behavior_tests {
     use anyhow::Result;
     use chrono::DateTime;
     use chrono::Utc;
+    use codex_app_server_protocol::DynamicToolCustomSpec;
+    use codex_app_server_protocol::DynamicToolFunctionSpec;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -157,6 +159,7 @@ mod thread_processor_behavior_tests {
         match namespace {
             Some(namespace) => {
                 DynamicToolSpec::Namespace(codex_app_server_protocol::DynamicToolNamespaceSpec {
+                    model_only: false,
                     name: namespace.to_string(),
                     description: "test namespace".to_string(),
                     tools: vec![DynamicToolNamespaceTool::Function(function)],
@@ -264,6 +267,7 @@ mod thread_processor_behavior_tests {
         };
         let tools = vec![DynamicToolSpec::Namespace(
             codex_app_server_protocol::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: "codex_app".to_string(),
                 description: "test namespace".to_string(),
                 tools: vec![
@@ -275,6 +279,52 @@ mod thread_processor_behavior_tests {
         let err = validate_dynamic_tools(&tools).expect_err("duplicate name");
         assert!(err.contains("codex_app"), "unexpected error: {err}");
         assert!(err.contains("my_tool"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_dynamic_tools_rejects_mixed_kind_duplicate_name() {
+        let tools = vec![DynamicToolSpec::Namespace(
+            codex_app_server_protocol::DynamicToolNamespaceSpec {
+                model_only: false,
+                name: "codex_app".to_string(),
+                description: "test namespace".to_string(),
+                tools: vec![
+                    DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                        name: "my_tool".to_string(),
+                        description: "function".to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }),
+                        defer_loading: false,
+                    }),
+                    DynamicToolNamespaceTool::Custom(DynamicToolCustomSpec {
+                        name: "my_tool".to_string(),
+                        description: "custom".to_string(),
+                        defer_loading: false,
+                        format: None,
+                    }),
+                ],
+            },
+        )];
+
+        let err = validate_dynamic_tools(&tools).expect_err("duplicate name");
+        assert!(err.contains("codex_app"), "unexpected error: {err}");
+        assert!(err.contains("my_tool"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_dynamic_tools_applies_reserved_names_to_custom_tools() {
+        let tools = vec![DynamicToolSpec::Custom(DynamicToolCustomSpec {
+            name: "mcp__server__tool".to_string(),
+            description: "custom".to_string(),
+            defer_loading: false,
+            format: None,
+        })];
+
+        let err = validate_dynamic_tools(&tools).expect_err("reserved name");
+        assert!(err.contains("reserved"), "unexpected error: {err}");
     }
 
     #[test]
@@ -679,6 +729,7 @@ mod thread_processor_behavior_tests {
             personality: None,
             exclude_turns: false,
             initial_turns_page: None,
+            ..Default::default()
         };
         let config_snapshot = ThreadConfigSnapshot {
             disabled_plugin_ids: Vec::new(),

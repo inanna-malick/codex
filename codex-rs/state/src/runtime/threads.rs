@@ -2640,7 +2640,9 @@ mod tests {
                 history_base: None,
                 subagent_history_start_ordinal: None,
                 multi_agent_version: None,
+                cache_affinity: None,
                 context_window: None,
+                require_client_readiness: false,
             },
             git: None,
         })];
@@ -2714,7 +2716,9 @@ mod tests {
                 history_base: None,
                 subagent_history_start_ordinal: None,
                 multi_agent_version: None,
+                cache_affinity: None,
                 context_window: None,
+                require_client_readiness: false,
             },
             git: Some(GitInfo {
                 commit_hash: Some(codex_git_utils::GitSha::new("rollout-sha")),

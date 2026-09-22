@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ControlShutdownState": {
+      "oneOf": [
+        {
+          "enum": [
+            "notStarted",
+            "draining"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Session loops and accepted request/startup tasks stopped; process exit is unconfirmed.",
+          "enum": [
+            "sessionsStopped"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Session/request cleanup failed or timed out; launcher teardown remains required.",
+          "enum": [
+            "incomplete"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ControlState": {
+      "enum": [
+        "awaitingController",
+        "controlled",
+        "fenced"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "instanceId": {
+      "type": "string"
+    },
+    "reconciliationRequired": {
+      "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+      "type": "boolean"
+    },
+    "shutdown": {
+      "$ref": "#/definitions/ControlShutdownState"
+    },
+    "state": {
+      "$ref": "#/definitions/ControlState"
+    }
+  },
+  "required": [
+    "instanceId",
+    "reconciliationRequired",
+    "shutdown",
+    "state"
+  ],
+  "title": "ControlStatus",
+  "type": "object"
+}

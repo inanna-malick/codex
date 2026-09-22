@@ -1,6 +1,8 @@
 mod managed;
 mod shared_instructions;
 
+#[path = "execution_fence.rs"]
+mod execution_fence;
 use crate::CodexAppsToolsCache;
 use crate::agent::LocalAgentControl;
 use crate::agents_md_manager::SessionInstructions;
@@ -78,6 +80,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
+use codex_thread_store::DeleteThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
@@ -105,6 +108,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tracing::Instrument;
 use tracing::instrument;
 use tracing::warn;
 
@@ -140,6 +144,23 @@ fn capture_test_op(op: &Op) -> Option<Op> {
 
 pub(crate) fn default_thread_id_generator() -> ThreadIdGenerator {
     Arc::new(ThreadId::new)
+}
+
+async fn cleanup_unregistered_thread(
+    thread_store: Arc<dyn ThreadStore>,
+    thread_id: ThreadId,
+    discard: bool,
+) {
+    if discard && let Err(cleanup_error) = thread_store.discard_thread(thread_id).await {
+        warn!("failed to discard unregistered thread {thread_id}: {cleanup_error}");
+    }
+    if let Err(cleanup_error) = thread_store
+        .delete_thread(DeleteThreadParams { thread_id })
+        .await
+        && !matches!(cleanup_error, ThreadStoreError::ThreadNotFound { .. })
+    {
+        warn!("failed to delete unregistered thread {thread_id}: {cleanup_error}");
+    }
 }
 
 pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
@@ -197,6 +218,11 @@ pub enum ForkSnapshot {
     /// already at a turn boundary, this returns the current persisted history
     /// unchanged.
     Interrupted,
+    /// Preserve a frozen invocation prefix and append child-only protocol closures.
+    /// Unlike `Interrupted`, this never describes the source turn as aborted.
+    InvocationBoundary,
+    /// Preserve a prefix ending after a recorded, protocol-complete tool result.
+    CompletedCallBoundary,
 }
 
 struct ForkHistory {
@@ -245,6 +271,44 @@ pub struct InternalSessionParent {
     pub(crate) inherited_instructions: Option<SessionInstructions>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThreadStartPersistence {
+    #[default]
+    Lazy,
+    Immediate,
+}
+
+struct ThreadStartTransactionLease {
+    thread_id: ThreadId,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    gates: Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+struct ThreadSpawnFailure {
+    error: CodexErr,
+    session: Arc<Session>,
+    io: SessionIo,
+}
+
+impl Drop for ThreadStartTransactionLease {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gate = Arc::downgrade(&self.gate);
+        if Arc::strong_count(&self.gate) == 1
+            && gates
+                .get(&self.thread_id)
+                .is_some_and(|registered| std::sync::Weak::ptr_eq(registered, &gate))
+        {
+            gates.remove(&self.thread_id);
+        }
+    }
+}
+
 pub struct StartThreadOptions {
     pub config: Config,
     /// Host-owned provider for this root thread's additional instructions.
@@ -277,6 +341,7 @@ pub struct StartThreadOptions {
     pub user_instructions: Option<LoadedUserInstructions>,
     pub thread_extension_init: ExtensionDataInit,
     pub client_mcp_extensions: ClientMcpExtensions,
+    pub persistence: ThreadStartPersistence,
     /// Thread ID reserved before startup so the caller can associate host-owned state with it.
     pub reserved_thread_id: Option<ThreadId>,
     /// Initial thread-owned plugin selection; omission restores persisted settings.
@@ -302,6 +367,7 @@ impl StartThreadOptions {
             user_instructions: None,
             thread_extension_init: ExtensionDataInit::default(),
             client_mcp_extensions: ClientMcpExtensions::default(),
+            persistence: ThreadStartPersistence::Lazy,
             reserved_thread_id: None,
             disabled_plugin_ids: None,
         }
@@ -394,8 +460,11 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     // Eviction updates this registry and residency together, locking the registry first.
-    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
-    shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
+    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>
+    shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders
+    pub(crate) execution_fence: tokio_util::sync::CancellationToken,
+    pub(crate) require_client_readiness: AtomicBool,
+    start_transaction_gates: Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<tokio::sync::Mutex<()>>>>>
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -556,8 +625,11 @@ impl ThreadManager {
             };
         Self {
             state: Arc::new(ThreadManagerState {
+                execution_fence: tokio_util::sync::CancellationToken::new(),
+                require_client_readiness: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
+                start_transaction_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
@@ -705,8 +777,11 @@ impl ThreadManager {
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         Self {
             state: Arc::new(ThreadManagerState {
+                execution_fence: tokio_util::sync::CancellationToken::new(),
+                require_client_readiness: AtomicBool::new(false),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
+                start_transaction_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -1444,7 +1519,8 @@ impl ThreadManager {
     /// Fork prepared reference-backed history using the same snapshot semantics as copied forks.
     pub async fn fork_prepared_thread(
         &self,
-        options: StartThreadOptions,
+        snapshot: ForkSnapshot,
+        config: Config,
         prepared: PreparedFork,
     ) -> CodexResult<NewThread> {
         let history = InitialHistory::Resumed(ResumedHistory {
@@ -1460,7 +1536,7 @@ impl ThreadManager {
             .fork_thread_with_initial_history(
                 options,
                 ForkHistory {
-                    snapshot: ForkSnapshot::Interrupted,
+                    snapshot,
                     initial_history: history,
                     persistence: fork_persistence,
                 },
@@ -1567,6 +1643,31 @@ impl ThreadManagerState {
     ) -> Option<Arc<dyn ThreadInstructionsProvider>> {
         self.shared_thread_instructions
             .for_root(root_thread_id, provider)
+    }
+
+    async fn acquire_start_transaction(&self, thread_id: ThreadId) -> ThreadStartTransactionLease {
+        let gate = {
+            let mut gates = self
+                .start_transaction_gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            gates
+                .get(&thread_id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let gate = Arc::new(tokio::sync::Mutex::new(()));
+                    gates.insert(thread_id, Arc::downgrade(&gate));
+                    gate
+                })
+        };
+        let guard = Arc::clone(&gate).lock_owned().await;
+        ThreadStartTransactionLease {
+            thread_id,
+            gate,
+            guard: Some(guard),
+            gates: Arc::clone(&self.start_transaction_gates),
+        }
     }
 
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
@@ -1850,7 +1951,7 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with no history using a provided config.
     pub(crate) async fn spawn_new_thread(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         agent_control: LocalAgentControl,
     ) -> CodexResult<NewThread> {
@@ -1872,7 +1973,7 @@ impl ThreadManagerState {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_new_thread_with_source(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         agent_control: LocalAgentControl,
         session_source: SessionSource,
@@ -1905,7 +2006,7 @@ impl ThreadManagerState {
     }
 
     pub(crate) async fn resume_thread_with_history_with_source(
-        &self,
+        self: &Arc<Self>,
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
@@ -1949,7 +2050,7 @@ impl ThreadManagerState {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fork_thread_with_source(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         initial_history: InitialHistory,
         history_mode: Option<ThreadHistoryMode>,
@@ -1998,7 +2099,22 @@ impl ThreadManagerState {
     }
 
     /// Spawn a new thread with optional history and register it with the manager.
-    async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+    async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        if request.options.persistence == ThreadStartPersistence::Immediate {
+            let state = Arc::clone(self);
+            return tokio::spawn(
+                async move { state.spawn_thread_inner(request).await }.in_current_span(),
+            )
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("immediate thread startup task failed: {error}"))
+            })?;
+        }
+        self.spawn_thread_inner(request).await
+    }
+
+    async fn spawn_thread_inner(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        self.ensure_execution_active()?;
         let ThreadSpawnRequest {
             startup,
             options,
@@ -2030,10 +2146,61 @@ impl ThreadManagerState {
             user_instructions: supplied_user_instructions,
             mut thread_extension_init,
             client_mcp_extensions,
+            persistence,
             reserved_thread_id,
             disabled_plugin_ids,
         } = options;
         let inherited_environments = captured_environments.or(inherited_environments);
+        if parent_thread_id.is_none() && self.require_client_readiness.load(Ordering::Acquire) {
+            config.extra_config = Some(codex_thread_store::ExtraConfig {
+                require_client_readiness: true,
+            });
+        }
+        if persistence == ThreadStartPersistence::Immediate && config.ephemeral {
+            return Err(CodexErr::InvalidRequest(
+                "immediate persistence cannot be used for an ephemeral thread".to_string(),
+            ));
+        }
+        if persistence == ThreadStartPersistence::Immediate
+            && matches!(&initial_history, InitialHistory::Resumed(_))
+        {
+            return Err(CodexErr::InvalidRequest(
+                "immediate persistence cannot be used when resuming a thread".to_string(),
+            ));
+        }
+        if reserved_thread_id.is_some() && matches!(&initial_history, InitialHistory::Resumed(_)) {
+            return Err(CodexErr::InvalidRequest(
+                "reserved thread ID cannot be used when resuming a thread".to_string(),
+            ));
+        }
+        let reserved_thread_id = match &initial_history {
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                Some(reserved_thread_id.unwrap_or_else(|| self.thread_id_generator.as_ref()()))
+            }
+            InitialHistory::Resumed(_) => None,
+        };
+        let thread_id = match (&initial_history, reserved_thread_id) {
+            (
+                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
+                Some(thread_id),
+            ) => thread_id,
+            (InitialHistory::Resumed(resumed), None) => resumed.conversation_id,
+            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None)
+            | (InitialHistory::Resumed(_), Some(_)) => {
+                unreachable!("thread ID normalization covers every history mode")
+            }
+        };
+        // The per-ID lease spans store/session creation through registration or failure cleanup.
+        // This prevents same-ID state from being created while an immediate transaction deletes
+        // its unpublished partial state without serializing unrelated thread starts.
+        let start_transaction = self.acquire_start_transaction(thread_id).await;
+        if !matches!(&initial_history, InitialHistory::Resumed(_))
+            && self.threads.read().await.contains_key(&thread_id)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "thread {thread_id} is already running"
+            )));
+        }
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
         // Older callers and saved reviewers identify isolation through their source.
         // New internal callers supply an explicit runtime policy before startup.
@@ -2056,11 +2223,6 @@ impl ThreadManagerState {
             )
         });
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
-        if reserved_thread_id.is_some() && matches!(&initial_history, InitialHistory::Resumed(_)) {
-            return Err(CodexErr::InvalidRequest(
-                "reserved thread ID cannot be used when resuming a thread".to_string(),
-            ));
-        }
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
@@ -2256,6 +2418,131 @@ impl ThreadManagerState {
                 warn!(%thread_id, %source_thread_id, %error, "failed to copy fork attachments");
             }
         }
+        if persistence == ThreadStartPersistence::Immediate {
+            let persistence_result = async {
+                session
+                    .try_ensure_rollout_materialized(codex_thread_store::PersistContext::Standard)
+                    .await?;
+                session.flush_rollout().await
+            }
+            .await;
+            let Err(error) = persistence_result else {
+                return match self
+                    .finish_thread_spawn(session, io, tracked_session_source, thread_source)
+                    .await
+                {
+                    Ok(thread) => {
+                        drop(start_transaction);
+                        Ok(self
+                            .finish_registered_thread_start(
+                                thread,
+                                source_changed_during_startup,
+                                is_resumed_thread,
+                            )
+                            .await)
+                    }
+                    Err(failure) => Err(self
+                        .finish_failed_immediate_start(failure, start_transaction)
+                        .await),
+                };
+            };
+            let startup_error = CodexErr::Io(std::io::Error::other(format!(
+                "failed to persist thread before start completed: {error}"
+            )));
+            return Err(self
+                .finish_failed_immediate_start(
+                    Box::new(ThreadSpawnFailure {
+                        error: startup_error,
+                        session,
+                        io,
+                    }),
+                    start_transaction,
+                )
+                .await);
+        }
+        match self
+            .finish_thread_spawn(session, io, tracked_session_source, thread_source)
+            .await
+        {
+            Ok(thread) => {
+                drop(start_transaction);
+                Ok(self
+                    .finish_registered_thread_start(
+                        thread,
+                        source_changed_during_startup,
+                        is_resumed_thread,
+                    )
+                    .await)
+            }
+            Err(failure) => {
+                let ThreadSpawnFailure { error, session, io } = *failure;
+                let thread_id = session.thread_id();
+                let cleanup = tokio::spawn(async move {
+                    let _start_transaction = start_transaction;
+                    let session_loop_termination = io.session_loop_termination.clone();
+                    if let Err(cleanup_error) = io.shutdown_and_wait().await {
+                        warn!(
+                            "failed to shut down unregistered thread {thread_id}: {cleanup_error}"
+                        );
+                        session_loop_termination.await;
+                    }
+                    drop(session);
+                });
+                if let Err(cleanup_error) = cleanup.await {
+                    warn!("unregistered thread {thread_id} cleanup task failed: {cleanup_error}");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn finish_failed_immediate_start(
+        &self,
+        failure: Box<ThreadSpawnFailure>,
+        start_transaction: ThreadStartTransactionLease,
+    ) -> CodexErr {
+        let ThreadSpawnFailure { error, session, io } = *failure;
+        let thread_id = session.thread_id();
+        let session_loop_termination = io.session_loop_termination.clone();
+        match tokio::time::timeout(Duration::from_secs(10), io.shutdown_and_wait()).await {
+            Ok(Ok(())) => {
+                cleanup_unregistered_thread(Arc::clone(&self.thread_store), thread_id, false).await;
+            }
+            Ok(Err(cleanup_error)) => {
+                warn!("failed to shut down unregistered thread {thread_id}: {cleanup_error}");
+                let thread_store = Arc::clone(&self.thread_store);
+                tokio::spawn(async move {
+                    let _start_transaction = start_transaction;
+                    let _io = io;
+                    session_loop_termination.await;
+                    cleanup_unregistered_thread(thread_store, thread_id, true).await;
+                    drop(session);
+                });
+                return error;
+            }
+            Err(_) => {
+                warn!("timed out shutting down unregistered thread {thread_id}");
+                let thread_store = Arc::clone(&self.thread_store);
+                tokio::spawn(async move {
+                    let _start_transaction = start_transaction;
+                    let _io = io;
+                    session_loop_termination.await;
+                    cleanup_unregistered_thread(thread_store, thread_id, false).await;
+                    drop(session);
+                });
+                return error;
+            }
+        }
+        error
+    }
+
+    async fn finish_thread_spawn(
+        &self,
+        session: Arc<Session>,
+        io: SessionIo,
+        tracked_session_source: SessionSource,
+        thread_source: Option<ThreadSource>,
+    ) -> Result<NewThread, Box<ThreadSpawnFailure>> {
         // Enable Full Access form input only after session startup so a required MCP server cannot
         // block startup while waiting for form input.
         if session
@@ -2267,9 +2554,16 @@ impl ThreadManagerState {
         {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
-        let new_thread = self
-            .finalize_thread_spawn(session, io, tracked_session_source)
-            .await?;
+        self.finalize_thread_spawn(session, io, tracked_session_source)
+            .await
+    }
+
+    async fn finish_registered_thread_start(
+        &self,
+        new_thread: NewThread,
+        source_changed_during_startup: Arc<AtomicBool>,
+        is_resumed_thread: bool,
+    ) -> NewThread {
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();
@@ -2277,7 +2571,7 @@ impl ThreadManagerState {
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
         }
-        Ok(new_thread)
+        new_thread
     }
 
     async fn finalize_thread_spawn(
@@ -2285,21 +2579,34 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
-    ) -> CodexResult<NewThread> {
+    ) -> Result<NewThread, Box<ThreadSpawnFailure>> {
+        if let Err(error) = self.ensure_execution_active() {
+            return Err(Box::new(ThreadSpawnFailure { error, session, io }));
+        }
         let thread_id = session.thread_id();
-        let event = io.next_event().await?;
+        let event = match io.next_event().await {
+            Ok(event) => event,
+            Err(error) => return Err(Box::new(ThreadSpawnFailure { error, session, io })),
+        };
         let session_configured = match event {
             Event {
                 id,
                 msg: EventMsg::SessionConfigured(session_configured),
             } if id == INITIAL_SUBMIT_ID => session_configured,
             _ => {
-                return Err(CodexErr::SessionConfiguredNotFirstEvent);
+                return Err(Box::new(ThreadSpawnFailure {
+                    error: CodexErr::SessionConfiguredNotFirstEvent,
+                    session,
+                    io,
+                }));
             }
         };
 
         {
             let mut threads = self.threads.write().await;
+            if let Err(error) = self.ensure_execution_active() {
+                return Err(Box::new(ThreadSpawnFailure { error, session, io }));
+            }
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 let thread = Arc::new(CodexThread::new(
                     session,
@@ -2317,12 +2624,11 @@ impl ThreadManagerState {
             }
         }
 
-        if let Err(err) = io.shutdown_and_wait().await {
-            warn!("failed to shut down duplicate thread {thread_id}: {err}");
-        }
-        Err(CodexErr::InvalidRequest(format!(
-            "thread {thread_id} is already running"
-        )))
+        Err(Box::new(ThreadSpawnFailure {
+            error: CodexErr::InvalidRequest(format!("thread {thread_id} is already running")),
+            session,
+            io,
+        }))
     }
 
     pub(crate) fn notify_thread_created(&self, thread_id: ThreadId) {
@@ -2508,6 +2814,10 @@ fn fork_history_from_snapshot(
 ) -> InitialHistory {
     let snapshot_state = snapshot_turn_state(&history);
     match snapshot {
+        ForkSnapshot::InvocationBoundary => crate::forked_invocations::close(history),
+        ForkSnapshot::CompletedCallBoundary => {
+            InitialHistory::Forked(history.get_rollout_items().to_vec())
+        }
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }

@@ -2928,12 +2928,43 @@
       "title": "CommandExecutionRequestApprovalResponse",
       "type": "object"
     },
+    "ControlStatus": {
+      "properties": {
+        "instanceId": {
+          "type": "string"
+        },
+        "reconciliationRequired": {
+          "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+          "type": "boolean"
+        },
+        "shutdown": {
+          "$ref": "#/definitions/v2/ControlShutdownState"
+        },
+        "state": {
+          "$ref": "#/definitions/v2/ControlState"
+        }
+      },
+      "required": [
+        "instanceId",
+        "reconciliationRequired",
+        "shutdown",
+        "state"
+      ],
+      "type": "object"
+    },
     "DynamicToolCallParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "arguments": true,
         "callId": {
           "type": "string"
+        },
+        "contextCallId": {
+          "description": "Recorded model invocation owning this execution; absent for legacy events.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "namespace": {
           "type": [
@@ -4598,6 +4629,26 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Notification sent from the server to the client.",
       "oneOf": [
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "control/status/changed"
+              ],
+              "title": "Control/status/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ControlStatus"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Control/status/changedNotification",
+          "type": "object"
+        },
         {
           "description": "NEW NOTIFICATIONS",
           "properties": {
@@ -8787,6 +8838,18 @@
             "description": "Base64-encoded output bytes.",
             "type": "string"
           },
+          "endOfStream": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CommandExecOutputEnd"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Final stream disposition; absent on ordinary chunks. This can precede or follow delivery of the command response in a client's event loop."
+          },
           "processId": {
             "description": "Client-supplied, connection-scoped `processId` from the original `command/exec` request.",
             "type": "string"
@@ -8808,6 +8871,15 @@
         ],
         "title": "CommandExecOutputDeltaNotification",
         "type": "object"
+      },
+      "CommandExecOutputEnd": {
+        "description": "Why no further output notifications will be emitted for a stream.",
+        "enum": [
+          "complete",
+          "capped",
+          "drainTimeout"
+        ],
+        "type": "string"
       },
       "CommandExecOutputStream": {
         "description": "Stream label for `command/exec/outputDelta` notifications.",
@@ -10680,6 +10752,98 @@
         "title": "ContextCompactedNotification",
         "type": "object"
       },
+      "ControlPendingEntry": {
+        "properties": {
+          "callId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": "string"
+          },
+          "requestId": {
+            "$ref": "#/definitions/v2/RequestId"
+          },
+          "threadId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turnId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "method",
+          "requestId"
+        ],
+        "type": "object"
+      },
+      "ControlShutdownState": {
+        "oneOf": [
+          {
+            "enum": [
+              "notStarted",
+              "draining"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Session loops and accepted request/startup tasks stopped; process exit is unconfirmed.",
+            "enum": [
+              "sessionsStopped"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Session/request cleanup failed or timed out; launcher teardown remains required.",
+            "enum": [
+              "incomplete"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "ControlState": {
+        "enum": [
+          "awaitingController",
+          "controlled",
+          "fenced"
+        ],
+        "type": "string"
+      },
+      "ControlStatusChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "reconciliationRequired": {
+            "description": "Fencing never establishes the outcomes of effects dispatched before it.",
+            "type": "boolean"
+          },
+          "shutdown": {
+            "$ref": "#/definitions/v2/ControlShutdownState"
+          },
+          "state": {
+            "$ref": "#/definitions/v2/ControlState"
+          }
+        },
+        "required": [
+          "instanceId",
+          "reconciliationRequired",
+          "shutdown",
+          "state"
+        ],
+        "title": "ControlStatus",
+        "type": "object"
+      },
       "ConversationTextRole": {
         "enum": [
           "user",
@@ -10817,6 +10981,25 @@
         ],
         "type": "string"
       },
+      "DynamicToolCustomFormat": {
+        "properties": {
+          "definition": {
+            "type": "string"
+          },
+          "syntax": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition",
+          "syntax",
+          "type"
+        ],
+        "type": "object"
+      },
       "DynamicToolNamespaceTool": {
         "oneOf": [
           {
@@ -10846,6 +11029,44 @@
               "type"
             ],
             "title": "FunctionDynamicToolNamespaceTool",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "deferLoading": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "format": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/DynamicToolCustomFormat"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "custom"
+                ],
+                "title": "CustomDynamicToolNamespaceToolType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "name",
+              "type"
+            ],
+            "title": "CustomDynamicToolNamespaceTool",
             "type": "object"
           }
         ]
@@ -10883,8 +11104,50 @@
           },
           {
             "properties": {
+              "deferLoading": {
+                "type": "boolean"
+              },
               "description": {
                 "type": "string"
+              },
+              "format": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/DynamicToolCustomFormat"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "custom"
+                ],
+                "title": "CustomDynamicToolSpecType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "name",
+              "type"
+            ],
+            "title": "CustomDynamicToolSpec",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "modelOnly": {
+                "description": "Keep this namespace on the model tool surface, excluding code-mode wrappers.",
+                "type": "boolean"
               },
               "name": {
                 "type": "string"
@@ -19759,7 +20022,9 @@
               "null"
             ]
           },
-          "metadata": true
+          "metadata": true,
+          "promptCacheDiagnostics": true,
+          "promptCacheOptions": true
         },
         "type": "object"
       },
@@ -22073,6 +22338,13 @@
             "description": "Raw Responses API items to append to the thread's model-visible history.",
             "items": true,
             "type": "array"
+          },
+          "terminalCallId": {
+            "description": "Append exactly one matching terminal tool output directly to durable history, even while a turn is active.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "threadId": {
             "type": "string"
@@ -24804,6 +25076,13 @@
         },
         "title": "ThreadStartParams",
         "type": "object"
+      },
+      "ThreadStartPersistence": {
+        "enum": [
+          "lazy",
+          "immediate"
+        ],
+        "type": "string"
       },
       "ThreadStartResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",

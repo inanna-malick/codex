@@ -177,6 +177,84 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
 
+pub(crate) struct CompactConversationRequestSettings {
+    pub(crate) effort: Option<ReasoningEffortConfig>,
+    pub(crate) summary: ReasoningSummaryConfig,
+    pub(crate) service_tier: Option<String>,
+}
+
+fn reasoning_effort_for_request(
+    model_info: &ModelInfo,
+    effort: ReasoningEffortConfig,
+) -> ReasoningEffortConfig {
+    match effort {
+        ReasoningEffortConfig::Ultra => model_info
+            .multi_agent_reasoning_effort
+            .as_ref()
+            .filter(|effort| {
+                *effort != &ReasoningEffortConfig::Ultra
+                    && model_info
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|preset| &preset.effort == *effort)
+            })
+            .cloned()
+            .or_else(|| {
+                let supported_reasoning_levels = &model_info.supported_reasoning_levels;
+                supported_reasoning_levels
+                    .iter()
+                    .find(|preset| preset.effort == ReasoningEffortConfig::Max)
+                    .or_else(|| {
+                        supported_reasoning_levels
+                            .iter()
+                            .rev()
+                            .find(|preset| preset.effort != ReasoningEffortConfig::Ultra)
+                    })
+                    .map(|preset| preset.effort.clone())
+            })
+            .unwrap_or(ReasoningEffortConfig::Medium),
+        // Keep "persistent" in local settings; the Responses API calls it "disabled".
+        ReasoningEffortConfig::Persistent => ReasoningEffortConfig::Custom("disabled".to_string()),
+        effort => effort,
+    }
+}
+
+pub(crate) fn reasoning_effort_for_request(
+    model_info: &ModelInfo,
+    effort: ReasoningEffortConfig,
+) -> ReasoningEffortConfig {
+    match effort {
+        ReasoningEffortConfig::Ultra => model_info
+            .multi_agent_reasoning_effort
+            .as_ref()
+            .filter(|effort| {
+                *effort != &ReasoningEffortConfig::Ultra
+                    && model_info
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|preset| &preset.effort == *effort)
+            })
+            .cloned()
+            .or_else(|| {
+                let supported_reasoning_levels = &model_info.supported_reasoning_levels;
+                supported_reasoning_levels
+                    .iter()
+                    .find(|preset| preset.effort == ReasoningEffortConfig::Max)
+                    .or_else(|| {
+                        supported_reasoning_levels
+                            .iter()
+                            .rev()
+                            .find(|preset| preset.effort != ReasoningEffortConfig::Ultra)
+                    })
+                    .map(|preset| preset.effort.clone())
+            })
+            .unwrap_or(ReasoningEffortConfig::Medium),
+        // Keep "persistent" in local settings; the Responses API calls it "disabled".
+        ReasoningEffortConfig::Persistent => ReasoningEffortConfig::Custom("disabled".to_string()),
+        effort => effort,
+    }
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -263,6 +341,8 @@ pub struct ModelClient {
     agent_identity_policy: AgentIdentityAuthPolicy,
     prompt_cache_key_override: Option<String>,
     codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
+    cache_affinity: Option<codex_protocol::protocol::ProviderCacheAffinity>,
+    free_guardian_enabled: bool,
     event_sender: Option<Sender<ProtocolEvent>>,
     http_client_factory: HttpClientFactory,
     restored_history: bool,
@@ -539,6 +619,8 @@ impl ModelClient {
             agent_identity_policy,
             prompt_cache_key_override: None,
             codex_responses_headers: None,
+            cache_affinity: None,
+            free_guardian_enabled: false,
             event_sender: None,
             http_client_factory,
             restored_history: false,
@@ -558,28 +640,85 @@ impl ModelClient {
 
     pub(crate) fn with_session_context(
         mut self,
-        prompt_cache_key_override: Option<String>,
+        cache_affinity: codex_protocol::protocol::ProviderCacheAffinity,
         event_sender: Sender<ProtocolEvent>,
         codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
     ) -> Self {
-        self.prompt_cache_key_override = prompt_cache_key_override;
+        self.cache_affinity = Some(cache_affinity);
         self.event_sender = Some(event_sender);
         self.codex_responses_headers = codex_responses_headers;
         self
     }
 
     fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
-        if let Some(prompt_cache_key) = &self.prompt_cache_key_override {
-            return prompt_cache_key.clone();
+        if let Some(affinity) = &self.cache_affinity {
+            return affinity.prompt_cache_key.clone();
         }
 
-        if let SessionSource::Internal(source) = &self.state.session_source
-            && let Some(parent_thread_id) = responses_metadata.parent_thread_id
+        Self::default_prompt_cache_key(
+            &self.state.session_source,
+            responses_metadata.parent_thread_id,
+            &responses_metadata.session_id,
+        )
+    }
+
+    pub(crate) fn default_cache_affinity(
+        source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        session_id: codex_protocol::SessionId,
+    ) -> codex_protocol::protocol::ProviderCacheAffinity {
+        codex_protocol::protocol::ProviderCacheAffinity {
+            routing_session_id: session_id,
+            prompt_cache_key: Self::default_prompt_cache_key(
+                source,
+                parent_thread_id,
+                &session_id.to_string(),
+            ),
+        }
+    }
+
+    fn routing_session_id(&self, metadata: &CodexResponsesMetadata) -> String {
+        self.cache_affinity.as_ref().map_or_else(
+            || metadata.session_id.clone(),
+            |affinity| affinity.routing_session_id.to_string(),
+        )
+    }
+
+    fn build_provider_client_metadata(
+        &self,
+        metadata: &CodexResponsesMetadata,
+    ) -> HashMap<String, String> {
+        let mut result = metadata.client_metadata();
+        // The provider routes by this transport field; full Codex identity remains
+        // in x-codex-turn-metadata and thread_id.
+        result.insert("session_id".to_string(), self.routing_session_id(metadata));
+        tracing::info!(
+            target: "codex_core::cache_routing",
+            thread_id = %metadata.thread_id,
+            session_id = %metadata.session_id,
+            routing_session_id = %self.routing_session_id(metadata),
+            prompt_cache_key = %self.prompt_cache_key(metadata),
+            "provider request routing"
+        );
+        result
+    }
+
+    pub(crate) fn default_prompt_cache_key(
+        source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        session_id: &str,
+    ) -> String {
+        if let Some(key) =
+            crate::guardian::prompt_cache_key_override_for_review_session(source, parent_thread_id)
+        {
+            return key;
+        }
+        if let SessionSource::Internal(source) = source
+            && let Some(parent_thread_id) = parent_thread_id
         {
             return format!("{source}:{parent_thread_id}");
         }
-
-        responses_metadata.session_id.clone()
+        session_id.to_owned()
     }
 
     // ChatGPT derives cache affinity from the Responses session-id header. Keep the
@@ -660,6 +799,124 @@ impl ModelClient {
 
         self.store_cached_websocket_session(WebsocketSession::default());
         activated
+    }
+
+    /// Compacts the current conversation history using the Compact endpoint.
+    ///
+    /// This is a unary call (no streaming) that returns a new list of
+    /// `ResponseItem`s representing the compacted transcript.
+    ///
+    /// The model selection and telemetry context are passed explicitly to keep `ModelClient`
+    /// session-scoped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn compact_conversation_history(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        settings: CompactConversationRequestSettings,
+        session_telemetry: &SessionTelemetry,
+        compaction_trace: &CompactionTraceContext,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<Vec<ResponseItem>> {
+        if prompt.input.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client_setup = self.current_client_setup().await?;
+        let transport =
+            self.build_api_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
+        let request_telemetry = Self::build_request_telemetry(
+            session_telemetry,
+            AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                PendingUnauthorizedRetry::default(),
+            ),
+            RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
+            self.state.auth_env_telemetry.clone(),
+        );
+        let request = self.build_responses_request(
+            prompt,
+            model_info,
+            settings.effort,
+            settings.summary,
+            settings.service_tier,
+            responses_metadata,
+        )?;
+        let ResponsesApiRequest {
+            model,
+            instructions,
+            mut input,
+            tools,
+            parallel_tool_calls,
+            reasoning,
+            service_tier,
+            prompt_cache_key,
+            text,
+            ..
+        } = request;
+        self.prepare_response_items_for_request(&mut input);
+        let payload = ApiCompactionInput {
+            model: &model,
+            input: &input,
+            instructions: &instructions,
+            tools,
+            parallel_tool_calls,
+            reasoning,
+            service_tier: service_tier.as_deref(),
+            prompt_cache_key: prompt_cache_key.as_deref(),
+            text,
+            access_programs: cyber_access_program::for_auth(
+                client_setup.auth.as_ref(),
+                prompt.cyber_access_program,
+            ),
+        };
+
+        let mut extra_headers = ApiHeaderMap::new();
+        if let Ok(header_value) = HeaderValue::from_str(&responses_metadata.installation_id) {
+            extra_headers.insert(X_CODEX_INSTALLATION_ID_HEADER, header_value);
+        }
+        extra_headers.extend(build_responses_headers(
+            self.state.beta_features_header.as_deref(),
+            turn_state.as_ref(),
+        ));
+        add_originator_header(&mut extra_headers, self.state.originator.as_str());
+        extra_headers.extend(self.build_responses_compatibility_headers(responses_metadata));
+        extra_headers.extend(build_session_headers(
+            Some(self.routing_session_id(responses_metadata)),
+            Some(responses_metadata.thread_id.to_string()),
+        ));
+        if let Some(header_value) = self.generate_attestation_header_for().await {
+            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        if let Some(header_value) = self.build_routing_hint_header(
+            client_setup.auth.as_ref(),
+            &model,
+            service_tier.as_deref(),
+        ) {
+            extra_headers.insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
+        }
+        add_responses_lite_header(&mut extra_headers, model_info.use_responses_lite);
+        let compact_request_timeout = client_setup
+            .api_provider
+            .stream_idle_timeout
+            .saturating_mul(COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER);
+        let client =
+            ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry));
+        let trace_attempt = compaction_trace.start_attempt(&payload);
+        let result = client
+            .compact_input(
+                &payload,
+                extra_headers,
+                compact_request_timeout,
+                turn_state.as_deref(),
+            )
+            .await
+            .map_err(|error| self.state.provider.map_api_error(error));
+        trace_attempt.record_result(result.as_deref());
+        result
     }
 
     pub(crate) async fn create_realtime_call_with_headers(
@@ -816,6 +1073,7 @@ impl ModelClient {
         use_responses_lite: bool,
     ) -> HashMap<String, String> {
         let mut client_metadata = responses_metadata.client_metadata(include_internal);
+        let mut client_metadata = self.build_provider_client_metadata(responses_metadata);
         if use_responses_lite {
             client_metadata.insert(
                 WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY.to_string(),
@@ -894,14 +1152,19 @@ impl ModelClient {
             // Filter only the request copy; persisted history remains unchanged.
             input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
         }
+        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+        let supports_configuration =
+            codex_models_manager::model_info::supports_reasoning_configuration(model_info);
+        if !supports_configuration {
+            // Keep durable history intact across model switches, but project
+            // unsupported controls out of this model's outgoing request.
+            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
+        }
         let is_openai = self.state.provider.info().is_openai();
         let (instructions, tools) = if model_info.use_responses_lite {
-            // These prompt-only items are rebuilt on every request. Hash their visible payloads
-            // within the thread so retries and resumed sessions preserve their identity.
-            let prefix_namespace = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                self.state.thread_id.to_string().as_bytes(),
-            );
+            // Content-address prompt-only items so exact-context forks, retries,
+            // and resumes preserve the same provider-visible prefix identities.
+            let prefix_namespace = Uuid::NAMESPACE_OID;
             let tools = if self.state.provider.capabilities().namespace_tools {
                 create_tools_json_for_responses_lite(&prompt.tools)?
             } else {
@@ -945,6 +1208,23 @@ impl ModelClient {
                 }
             }
         }
+        // Trusted history has already been filtered by the session owner. Keep
+        // its original request-level baseline stable across effort-only forks;
+        // the backend applies subsequent configuration updates in order.
+        let effort = if supports_configuration {
+            prompt
+                .input
+                .iter()
+                .find_map(|item| match item {
+                    ResponseItem::ConfigurationUpdate { reasoning } => {
+                        Some(reasoning.effort.clone())
+                    }
+                    _ => None,
+                })
+                .or(effort)
+        } else {
+            effort
+        };
         let reasoning = self.build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
@@ -997,7 +1277,7 @@ impl ModelClient {
             service_tier,
             prompt_cache_key,
             text,
-            client_metadata: Some(client_metadata),
+            client_metadata: Some(self.build_provider_client_metadata(responses_metadata)),
             access_programs: None,
         };
         Ok(request)
@@ -1296,6 +1576,16 @@ impl ModelClient {
         &self,
         responses_metadata: &CodexResponsesMetadata,
     ) -> ApiHeaderMap {
+        let cache_key = self.prompt_cache_key(responses_metadata);
+        let routing_session_id = self.routing_session_id(responses_metadata);
+        tracing::info!(
+            target: "codex_core::cache_routing",
+            thread_id = %responses_metadata.thread_id,
+            session_id = %responses_metadata.session_id,
+            handshake_session_id = %routing_session_id,
+            prompt_cache_key = %cache_key,
+            "opening provider connection"
+        );
         let mut headers = build_responses_headers(
             self.state.beta_features_header.as_deref(),
             /*turn_state*/ None,
@@ -1305,7 +1595,7 @@ impl ModelClient {
             headers.insert("x-client-request-id", header_value);
         }
         headers.extend(build_session_headers(
-            Some(self.responses_session_id(responses_metadata)),
+            Some(routing_session_id),
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -1350,7 +1640,14 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-            session_id: Some(self.client.responses_session_id(responses_metadata)),
+        let mut input = prompt.get_formatted_input_for_request(model_info);
+        let supports_configuration =
+            codex_models_manager::model_info::supports_reasoning_configuration(model_info);
+        if !self.reasoning_effort_override_enabled(model_info) || !supports_configuration {
+            // Unsupported models and disabled overrides must also accept saved history.
+            // Filter only the request copy; persisted history remains unchanged.
+            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
+        }
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {
@@ -2085,6 +2382,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
+        let prewarm_started = Instant::now();
         let disabled_trace = InferenceTraceContext::disabled();
         match self
             .stream_responses_websocket(
@@ -2105,7 +2403,34 @@ impl ModelClientSession {
                 // Wait for the v2 warmup request to complete before sending the first turn request.
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Ok(ResponseEvent::Completed {
+                            response_id,
+                            token_usage,
+                            usage_metadata,
+                            ..
+                        }) => {
+                            tracing::info!(
+                                target: "codex_core::cache_routing",
+                                %response_id,
+                                thread_id = %responses_metadata.thread_id,
+                                elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+                                input_tokens = token_usage.as_ref().map(|usage| usage.input_tokens),
+                                cached_input_tokens = token_usage
+                                    .as_ref()
+                                    .map(|usage| usage.cached_input_tokens),
+                                cache_write_input_tokens = token_usage
+                                    .as_ref()
+                                    .map(|usage| usage.cache_write_input_tokens),
+                                prompt_cache_diagnostics = ?usage_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.prompt_cache_diagnostics.as_ref()),
+                                prompt_cache_options = ?usage_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.prompt_cache_options.as_ref()),
+                                "startup websocket prewarm completed"
+                            );
+                            break;
+                        }
                         Err(err) => return Err(err),
                         _ => {}
                     }
@@ -2343,6 +2668,25 @@ where
                     usage_metadata,
                     end_turn,
                 }) => {
+                    tracing::debug!(
+                        target: "codex_core::cache_routing",
+                        %response_id,
+                        upstream_request_id,
+                        input_tokens = token_usage.as_ref().map(|usage| usage.input_tokens),
+                        cached_input_tokens = token_usage
+                            .as_ref()
+                            .map(|usage| usage.cached_input_tokens),
+                        cache_write_input_tokens = token_usage
+                            .as_ref()
+                            .map(|usage| usage.cache_write_input_tokens),
+                        prompt_cache_diagnostics = ?usage_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.prompt_cache_diagnostics.as_ref()),
+                        prompt_cache_options = ?usage_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.prompt_cache_options.as_ref()),
+                        "provider response cache outcome"
+                    );
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);

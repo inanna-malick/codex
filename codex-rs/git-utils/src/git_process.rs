@@ -3,10 +3,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+#[cfg(target_os = "linux")]
+use codex_utils_pty::CommandChild as Child;
 #[cfg(windows)]
 use codex_utils_pty::JobObject;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
+#[cfg(not(target_os = "linux"))]
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -29,7 +32,7 @@ impl Drop for KillGitProcessTreeOnDrop {
     }
 }
 
-fn spawn_git_command(command: &mut Command) -> Option<(Child, KillGitProcessTreeOnDrop)> {
+async fn spawn_git_command(mut command: Command) -> Option<(Child, KillGitProcessTreeOnDrop)> {
     scrub_non_inheritable_env_vars(command.as_std_mut());
     #[cfg(unix)]
     command.process_group(0);
@@ -42,7 +45,7 @@ fn spawn_git_command(command: &mut Command) -> Option<(Child, KillGitProcessTree
 
     #[cfg(windows)]
     let (child, job) = match JobObject::create()
-        .and_then(|job| job.spawn_contained(command).map(|child| (child, job)))
+        .and_then(|job| job.spawn_contained(&mut command).map(|child| (child, job)))
     {
         Ok((child, job)) => (child, Some(job)),
         Err(_) => {
@@ -51,7 +54,11 @@ fn spawn_git_command(command: &mut Command) -> Option<(Child, KillGitProcessTree
             (command.spawn().ok()?, None)
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let child = codex_utils_pty::workspace_admission::spawn_command(command)
+        .await
+        .ok()?;
+    #[cfg(not(any(windows, target_os = "linux")))]
     let child = command.spawn().ok()?;
 
     let process_tree = KillGitProcessTreeOnDrop {
@@ -94,10 +101,10 @@ async fn wait_for_git_command_with_timeout_output(
 }
 
 pub(crate) async fn run_git_command_with_timeout_output(
-    command: &mut Command,
+    command: Command,
     timeout_duration: Duration,
 ) -> Option<Output> {
-    let (child, process_tree) = spawn_git_command(command)?;
+    let (child, process_tree) = spawn_git_command(command).await?;
     wait_for_git_command_with_timeout_output(child, process_tree, timeout_duration).await
 }
 

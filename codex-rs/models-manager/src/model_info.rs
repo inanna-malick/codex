@@ -16,6 +16,12 @@ use tracing::warn;
 pub const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
 const PERSONALITY_SECTION_HEADER: &str = "# Personality";
 
+/// Whether this model accepts durable reasoning configuration items.
+/// Lite transport alone does not imply support for this Astra control item.
+pub fn supports_reasoning_configuration(model: &ModelInfo) -> bool {
+    model.use_responses_lite && model.slug == "gpt-6-astra"
+}
+
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
     if let Some(context_window) = config.model_context_window {
         model.context_window = Some(

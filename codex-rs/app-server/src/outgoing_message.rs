@@ -1,3 +1,4 @@
+mod control;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -127,6 +128,8 @@ pub(crate) enum OutgoingEnvelope {
 
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
+    pub(crate) control: Arc<crate::control::Control>,
+    fenced_pending: Mutex<(Vec<codex_app_server_protocol::ControlPendingEntry>, bool)>,
     verification_auth: OnceLock<Arc<codex_login::AuthManager>>,
     verification_connections: Mutex<HashSet<ConnectionId>>,
     next_server_request_id: AtomicI64,
@@ -163,6 +166,8 @@ impl ThreadScopedOutgoingMessageSender {
         thread_id: ThreadId,
     ) -> Self {
         Self {
+            control: Arc::new(crate::control::Control::default()),
+            fenced_pending: Mutex::new((Vec::new(), true)),
             outgoing,
             connection_ids: Arc::new(connection_ids),
             thread_id,
@@ -238,11 +243,18 @@ impl ThreadScopedOutgoingMessageSender {
 }
 
 impl OutgoingMessageSender {
+    pub(crate) fn with_control(mut self, control: Arc<crate::control::Control>) -> Self {
+        self.control = control;
+        self
+    }
+
     pub(crate) fn new(
         sender: mpsc::Sender<OutgoingEnvelope>,
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
+            control: Arc::new(crate::control::Control::default()),
+            fenced_pending: Mutex::new((Vec::new(), true)),
             verification_auth: OnceLock::new(),
             verification_connections: Mutex::new(HashSet::new()),
             next_server_request_id: AtomicI64::new(0),
@@ -333,6 +345,21 @@ impl OutgoingMessageSender {
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
+        let controlled_connections;
+        let connection_ids = if self.control.enabled() {
+            controlled_connections = self.control.request_connections(&[]);
+            if controlled_connections.is_empty() {
+                let id = self.next_request_id();
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(Err(crate::control::control_error(
+                    "controller is unavailable",
+                )));
+                return (id, receiver);
+            }
+            Some(controlled_connections.as_slice())
+        } else {
+            connection_ids
+        };
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
@@ -374,6 +401,12 @@ impl OutgoingMessageSender {
         };
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            if self.control.enabled() && self.control.request_connections(&[]).is_empty() {
+                let _ = tx_approve.send(Err(crate::control::control_error(
+                    "controller disconnected before dispatch",
+                )));
+                return (outgoing_message_id, rx_approve);
+            }
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
@@ -448,6 +481,9 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         thread_id: ThreadId,
     ) {
+        if self.control.enabled() {
+            return;
+        }
         let requests = self.pending_requests_for_thread(thread_id).await;
         for request in requests {
             if let Err(err) = self
@@ -470,7 +506,12 @@ impl OutgoingMessageSender {
         id: RequestId,
         result: Result,
     ) {
-        let entry = self.take_connection_callback(connection_id, &id).await;
+        let entry = {
+            let mut callbacks = self.request_id_to_callback.lock().await;
+            self.control
+                .with_authority(connection_id, || callbacks.remove_entry(&id))
+                .flatten()
+        };
 
         match entry {
             Some((id, entry)) => {
@@ -500,7 +541,12 @@ impl OutgoingMessageSender {
         id: RequestId,
         error: JSONRPCErrorError,
     ) {
-        let entry = self.take_connection_callback(connection_id, &id).await;
+        let entry = {
+            let mut callbacks = self.request_id_to_callback.lock().await;
+            self.control
+                .with_authority(connection_id, || callbacks.remove_entry(&id))
+                .flatten()
+        };
 
         match entry {
             Some((id, entry)) => {
@@ -1510,6 +1556,7 @@ mod tests {
         let (dynamic_tool_request_id, _dynamic_tool_waiter) = thread_outgoing
             .send_request(ServerRequestPayload::DynamicToolCall(
                 DynamicToolCallParams {
+                    context_call_id: None,
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),
@@ -1574,6 +1621,7 @@ mod tests {
         let (_dynamic_tool_request_id, dynamic_tool_waiter) = thread_outgoing
             .send_request(ServerRequestPayload::DynamicToolCall(
                 DynamicToolCallParams {
+                    context_call_id: None,
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),

@@ -1,3 +1,5 @@
+mod control;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -70,6 +72,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::UserVerificationCancelResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
@@ -96,15 +99,11 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
-use tokio::time::Duration;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::models_refresh_worker::ModelsRefreshWorker;
 use crate::turn_admission::TurnAdmission;
-
-const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
     reject_obsolete_request_fields(&request)?;
@@ -141,6 +140,7 @@ pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
+    controlled_thread_manager: Arc<ThreadManager>,
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -164,6 +164,7 @@ pub(crate) struct MessageProcessor {
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
+    host_input_queue: Option<Arc<QueuedItemService>>,
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
@@ -498,7 +499,7 @@ impl MessageProcessor {
             Arc::clone(&thread_store),
             outgoing.clone(),
             config_manager.clone(),
-            queue_service,
+            queue_service.clone(),
         );
         let project_processor = ProjectRequestProcessor::new(
             Arc::clone(&thread_store),
@@ -581,10 +582,14 @@ impl MessageProcessor {
             config_manager,
         );
 
+        if outgoing.control.enabled() {
+            thread_manager.require_client_readiness();
+        }
         Self {
             turn_admission,
             user_verification,
             outgoing,
+            controlled_thread_manager: thread_manager,
             models_refresh_worker,
             turn_cost_worker,
             skills_watcher,
@@ -608,11 +613,16 @@ impl MessageProcessor {
             search_processor,
             thread_goal_processor,
             thread_queue_processor,
+            host_input_queue: queue_service,
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues,
         }
+    }
+
+    pub(crate) fn host_input_queue(&self) -> Option<Arc<QueuedItemService>> {
+        self.host_input_queue.clone()
     }
 
     pub(crate) fn clear_runtime_references(&self) {
@@ -819,7 +829,12 @@ impl MessageProcessor {
             .connection_initialized(
                 connection_id,
                 ConnectionCapabilities {
-                    request_attestation,
+                    request_attestation: request_attestation
+                        && self
+                            .outgoing
+                            .control
+                            .with_authority(connection_id, || ())
+                            .is_some(),
                 },
             )
             .await;
@@ -836,6 +851,7 @@ impl MessageProcessor {
         thread_id: ThreadId,
         connection_ids: Vec<ConnectionId>,
     ) {
+        let connection_ids = self.outgoing.control.request_connections(&connection_ids);
         self.thread_processor
             .try_attach_thread_listener(thread_id, connection_ids)
             .await;
@@ -846,7 +862,14 @@ impl MessageProcessor {
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
-        self.thread_processor.drain_background_tasks().await;
+        if self
+            .thread_processor
+            .drain_background_tasks()
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out waiting for thread starts to drain");
+        }
     }
 
     pub(crate) async fn cancel_active_login(&self) {
@@ -946,7 +969,14 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(connection_id, session.request_attestation())
+                self.thread_processor
+                    .connection_initialized(
+                        connection_id,
+                        ConnectionCapabilities {
+                            request_attestation: !self.outgoing.control.enabled()
+                                && session.request_attestation(),
+                        },
+                    )
                     .await;
             }
             return Ok(());
@@ -978,6 +1008,9 @@ impl MessageProcessor {
             return Err(invalid_request(experimental_required_message(reason)));
         }
         let connection_id = connection_request_id.connection_id;
+        self.outgoing
+            .control
+            .authorize(connection_id, &codex_request)?;
         self.initialize_processor.track_initialized_request(
             connection_id,
             connection_request_id.request_id.clone(),
@@ -1068,6 +1101,9 @@ impl MessageProcessor {
         event_stream_ready: Option<McpEventStreamReady>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        self.outgoing
+            .control
+            .authorize(connection_id, &codex_request)?;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let client_version = session.client_version().map(str::to_string);
         let client_mcp_extensions = session.client_mcp_extensions();
@@ -1078,6 +1114,40 @@ impl MessageProcessor {
         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
+            }
+            ClientRequest::ControlAcquire { params, .. } => {
+                let status = self.outgoing.control.acquire(connection_id, &params.token)?;
+                self.thread_processor
+                    .connection_initialized(
+                        connection_id,
+                        ConnectionCapabilities {
+                            request_attestation: session.request_attestation(),
+                        },
+                    )
+                    .await;
+                self.outgoing
+                    .send_server_notification(ServerNotification::ControlStatusChanged(
+                        codex_app_server_protocol::ControlStatusChangedNotification(status.clone()),
+                    ))
+                    .await;
+                Ok(Some(ClientResponsePayload::ControlAcquire(
+                    codex_app_server_protocol::ControlAcquireResponse(status),
+                )))
+            }
+            ClientRequest::ControlStatusRead { .. } => Ok(Some(
+                ClientResponsePayload::ControlStatusRead(
+                    codex_app_server_protocol::ControlStatusReadResponse(
+                        self.outgoing.control.status()?,
+                    ),
+                ),
+            )),
+            ClientRequest::ControlPendingList { params, .. } => Ok(Some(
+                self.outgoing.control_pending_list(params).await?.into(),
+            )),
+            ClientRequest::ThreadObserve { params, .. } => {
+                self.thread_processor
+                    .thread_observe(request_id.clone(), params)
+                    .await
             }
             ClientRequest::UserVerificationCancel { params, .. } => {
                 self.outgoing
@@ -1208,7 +1278,7 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ConfigRequirementsRead { params: _, .. } => self
+            ClientRequest::ConfigRequirementsRead { .. } => self
                 .config_processor
                 .config_requirements_read()
                 .await
@@ -1267,7 +1337,7 @@ impl MessageProcessor {
                 .unwatch(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ModelProviderCapabilitiesRead { params: _, .. } => self
+            ClientRequest::ModelProviderCapabilitiesRead { .. } => self
                 .config_processor
                 .model_provider_capabilities_read()
                 .await
@@ -1420,6 +1490,9 @@ impl MessageProcessor {
                 self.turn_processor
                     .thread_settings_update(&request_id, params)
                     .await
+            }
+            ClientRequest::ThreadReady { params, .. } => {
+                self.thread_processor.thread_ready(params).await
             }
             ClientRequest::ThreadMemoryModeSet { params, .. } => {
                 self.thread_processor.thread_memory_mode_set(params).await
@@ -1673,7 +1746,7 @@ impl MessageProcessor {
             ClientRequest::ThreadTimelineList { params, .. } => {
                 self.thread_processor.thread_timeline_list(params).await
             }
-            ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
+            ClientRequest::ThreadRealtimeListVoices { .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
             ClientRequest::ReviewStart { params, .. } => {

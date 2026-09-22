@@ -1120,6 +1120,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         "additionalProperties": false,
     });
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "codex_app".to_string(),
         description: "Automation tools.".to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(
@@ -1774,6 +1775,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
     .await;
 
     let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: "orbit_ops".to_string(),
         description: "Orbital reminder operations.".to_string(),
         tools: vec![DynamicToolNamespaceTool::Function(

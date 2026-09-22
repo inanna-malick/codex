@@ -1066,7 +1066,11 @@ async fn run_script_with_timeout(
         });
     }
     handler.kill_on_drop(true);
-    let output = timeout(snapshot_timeout, handler.output())
+    #[cfg(target_os = "linux")]
+    let output = codex_utils_pty::workspace_admission::command_output(handler);
+    #[cfg(not(target_os = "linux"))]
+    let output = handler.output();
+    let output = timeout(snapshot_timeout, output)
         .await
         .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?
         .with_context(|| format!("Failed to execute {shell_name}"))?;

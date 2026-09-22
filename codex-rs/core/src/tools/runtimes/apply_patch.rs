@@ -171,6 +171,15 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         _ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
+        #[cfg(target_os = "linux")]
+        let _workspace_mutation = match codex_utils_pty::workspace_admission::availability() {
+            codex_utils_pty::workspace_admission::Availability::Ready(owner) => {
+                Some(owner.mutation().await)
+            }
+            codex_utils_pty::workspace_admission::Availability::Disabled
+            | codex_utils_pty::workspace_admission::Availability::Unavailable(_) => None,
+        };
+
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);

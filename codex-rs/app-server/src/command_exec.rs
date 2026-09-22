@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+use codex_app_server_protocol::CommandExecOutputEnd;
 use codex_app_server_protocol::CommandExecOutputStream;
 use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecResizeResponse;
@@ -251,9 +252,9 @@ impl CommandExecManager {
         };
 
         let sessions = Arc::clone(&self.sessions);
-        let (program, args) = command
-            .split_first()
-            .ok_or_else(|| invalid_request("command must not be empty"))?;
+        if command.is_empty() {
+            return Err(invalid_request("command must not be empty"));
+        }
         {
             let mut sessions = self.sessions.lock().await;
             if sessions.contains_key(&process_key) {
@@ -267,31 +268,53 @@ impl CommandExecManager {
                 CommandExecSession::Active { control_tx },
             );
         }
-        let spawned = if tty {
-            codex_utils_pty::spawn_pty_process(
-                program,
-                args,
-                cwd.as_path(),
-                &env,
-                &arg0,
-                size.unwrap_or_default(),
-                &[],
-            )
-            .await
-        } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
+        let spawn = async move {
+            let (program, args) = command.split_first().expect("validated command");
+            if tty {
+                codex_utils_pty::spawn_pty_process(
+                    program,
+                    args,
+                    cwd.as_path(),
+                    &env,
+                    &arg0,
+                    size.unwrap_or_default(),
+                    &[],
+                )
                 .await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(
-                program,
-                args,
-                cwd.as_path(),
-                &env,
-                &arg0,
-                &[],
-            )
-            .await
+            } else if stream_stdin {
+                codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
+                    .await
+            } else {
+                codex_utils_pty::spawn_pipe_process_no_stdin(
+                    program,
+                    args,
+                    cwd.as_path(),
+                    &env,
+                    &arg0,
+                    &[],
+                )
+                .await
+            }
         };
+        #[cfg(target_os = "linux")]
+        let spawned = if codex_utils_pty::managed_commands() {
+            let id = match &process_id {
+                InternalProcessId::Client(id) => id.clone(),
+                InternalProcessId::Generated(_) => uuid::Uuid::new_v4().to_string(),
+            };
+            Ok(codex_utils_pty::defer_process(async move {
+                codex_utils_pty::with_hosted_job(
+                    id,
+                    codex_utils_pty::workspace_admission::track_process(spawn),
+                )
+                .await
+                .map(|process| (process, ()))
+            }))
+        } else {
+            codex_utils_pty::workspace_admission::track_process(spawn).await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let spawned = spawn.await;
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -579,14 +602,19 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
+        #[cfg(target_os = "linux")]
+        let hosted_capture = stream_output && codex_utils_pty::managed_commands();
+        #[cfg(not(target_os = "linux"))]
+        let hosted_capture = false;
+        let mut tail = codex_utils_pty::OutputTail::default();
         let mut observed_num_bytes = 0usize;
-        loop {
+        let end = loop {
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => break,
+                    None => break CommandExecOutputEnd::Complete,
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => break,
+                _ = stdio_timeout_rx.wait_for(|&v| v) => break CommandExecOutputEnd::DrainTimeout,
             };
             // Individual chunks are at most 8KiB, so overshooting a bit is acceptable.
             while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
@@ -615,18 +643,44 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                                 stream,
                                 delta_base64: STANDARD.encode(capped_chunk),
                                 cap_reached,
+                                end_of_stream: None,
                             },
                         ),
                     )
                     .await;
+            }
+            // Hosted consumers transfer the final bounded capture to their job
+            // result, independently of when the TUI drains live output events.
+            if hosted_capture {
+                tail.push(capped_chunk);
             } else if !stream_output {
                 buffer.extend_from_slice(capped_chunk);
             }
             if cap_reached {
-                break;
+                break CommandExecOutputEnd::Capped;
             }
+        };
+        if let (true, Some(process_id)) = (stream_output, process_id.as_ref()) {
+            outgoing
+                .send_server_notification_to_connection_and_wait(
+                    connection_id,
+                    ServerNotification::CommandExecOutputDelta(
+                        CommandExecOutputDeltaNotification {
+                            process_id: process_id.clone(),
+                            stream,
+                            delta_base64: String::new(),
+                            cap_reached: false,
+                            end_of_stream: Some(end),
+                        },
+                    ),
+                )
+                .await;
         }
-        bytes_to_string_smart(&buffer)
+        if hosted_capture {
+            bytes_to_string_smart(&tail.read(codex_utils_pty::OutputTail::CAPACITY))
+        } else {
+            bytes_to_string_smart(&buffer)
+        }
     })
 }
 

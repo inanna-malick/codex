@@ -1,0 +1,13 @@
+[package]
+name = "codex-shoal-protocol"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+# Keep these explicit: Tidepool consumes this leaf crate through a path nested
+# inside its own Cargo workspace, where `workspace = true` would resolve
+# against Tidepool rather than Codex.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

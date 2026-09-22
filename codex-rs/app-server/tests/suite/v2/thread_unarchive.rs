@@ -248,6 +248,7 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
         .create_thread(CreateThreadParams {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

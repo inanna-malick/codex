@@ -7,4 +7,9 @@ export type ThreadInjectItemsParams = { threadId: string,
 /**
  * Raw Responses API items to append to the thread's model-visible history.
  */
-items: Array<JsonValue>, };
+items: Array<JsonValue>,
+/**
+ * Append exactly one matching terminal tool output directly to durable
+ * history, even while a turn is active.
+ */
+terminalCallId?: string | null, };

@@ -192,6 +192,16 @@ pub enum CommandExecOutputStream {
     /// stderr stream.
     Stderr,
 }
+/// Why no further output notifications will be emitted for a stream.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum CommandExecOutputEnd {
+    Complete,
+    Capped,
+    DrainTimeout,
+}
+
 /// Base64-encoded output chunk emitted for a streaming `command/exec` request.
 ///
 /// These notifications are connection-scoped. If the originating connection
@@ -210,4 +220,8 @@ pub struct CommandExecOutputDeltaNotification {
     /// `true` on the final streamed chunk for a stream when `outputBytesCap`
     /// truncated later output on that stream.
     pub cap_reached: bool,
+    /// Final stream disposition; absent on ordinary chunks. This can precede or
+    /// follow delivery of the command response in a client's event loop.
+    #[serde(default)]
+    pub end_of_stream: Option<CommandExecOutputEnd>,
 }

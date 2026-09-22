@@ -232,6 +232,7 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
     ];
 
     vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        model_only: false,
         name: NAMESPACE.to_string(),
         description: "Manage Codex tasks available through the connected app server.".to_string(),
         tools: definitions
@@ -260,11 +261,13 @@ pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
             DynamicToolSpec::Function(function) => (!DELEGATION_TOOLS
                 .contains(&function.name.as_str()))
             .then_some(DynamicToolSpec::Function(function)),
+            DynamicToolSpec::Custom(custom) => Some(DynamicToolSpec::Custom(custom)),
             DynamicToolSpec::Namespace(mut namespace) => {
                 namespace.tools.retain(|tool| match tool {
                     DynamicToolNamespaceTool::Function(function) => {
                         !DELEGATION_TOOLS.contains(&function.name.as_str())
                     }
+                    DynamicToolNamespaceTool::Custom(_) => true,
                 });
                 Some(DynamicToolSpec::Namespace(namespace))
             }
@@ -524,11 +527,21 @@ async fn execute_inner(
             if let Some(model) = arguments.model {
                 thread_start_params.model = Some(model);
             }
+            let task_tools_available = thread_start_params.dynamic_tools.is_some()
+                || thread_start_params
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
             let (started, _, task_tools_available) =
                 crate::app_server_session::request_thread_start_with_history_fallback(
                     &handle,
                     RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
                     thread_start_params,
+                    crate::app_server_session::ThreadStartToolPolicy {
+                        dynamic_tool_fallback:
+                            crate::app_server_session::DynamicToolFallback::Optional,
+                        task_tools_available,
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;

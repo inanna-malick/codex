@@ -37,6 +37,8 @@ fn write_rollout_with_source_and_provider(
             meta: SessionMeta {
                 creator_user_id: None,
                 creator_account_id: None,
+                cache_affinity: None,
+                require_client_readiness: false,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,

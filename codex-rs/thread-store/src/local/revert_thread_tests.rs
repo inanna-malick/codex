@@ -274,6 +274,7 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
         .create_thread(CreateThreadParams {
             creator_user_id: Some("creator-user".to_string()),
             creator_account_id: Some("creator-account".to_string()),
+            cache_affinity: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

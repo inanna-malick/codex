@@ -22,6 +22,7 @@ mod tool_search;
 mod tool_spec;
 
 pub use code_mode::augment_tool_spec_for_code_mode;
+pub use code_mode::augment_tool_spec_for_code_mode_with_output_schema;
 pub use code_mode::code_mode_name_for_tool_name;
 pub use code_mode::collect_code_mode_exec_prompt_tool_definitions;
 pub use code_mode::collect_code_mode_tool_definitions;
@@ -62,6 +63,7 @@ pub use responses_api::ResponsesApiTool;
 pub use responses_api::agent_plugin_mcp_tool_to_responses_api_tool;
 pub use responses_api::coalesce_loadable_tool_specs;
 pub use responses_api::default_namespace_description;
+pub use responses_api::dynamic_custom_tool_to_responses_api_tool;
 pub use responses_api::dynamic_tool_to_responses_api_tool;
 pub use responses_api::mcp_tool_to_deferred_responses_api_tool;
 pub use responses_api::mcp_tool_to_responses_api_tool;

@@ -50,6 +50,7 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
 fn paginated_session_meta_item(thread_id: ThreadId, cwd: &Path) -> RolloutItem {
     RolloutItem::SessionMeta(SessionMetaLine {
         meta: SessionMeta {
+            cache_affinity: None,
             session_id: thread_id.into(),
             id: thread_id,
             timestamp: "2026-07-09T00:00:00Z".to_string(),
@@ -191,6 +192,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
         meta: SessionMeta {
             creator_user_id: None,
             creator_account_id: None,
+            cache_affinity: None,
+            require_client_readiness: false,
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,

@@ -6,4 +6,4 @@ import type { JsonValue } from "../serde_json/JsonValue";
 /**
  * Usage metadata reported for one upstream response.
  */
-export type ResponseUsageMetadata = { amount: string | null, metadata: JsonValue | null, };
+export type ResponseUsageMetadata = { amount: string | null, metadata: JsonValue | null, promptCacheDiagnostics: JsonValue | null, promptCacheOptions: JsonValue | null, };

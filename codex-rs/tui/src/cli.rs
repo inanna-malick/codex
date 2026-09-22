@@ -42,6 +42,14 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_include_non_interactive: bool,
 
+    /// Connect to an experimental host dynamic-tool service over HTTP on this Unix socket.
+    #[arg(
+        long = "host-dynamic-tools-socket",
+        value_name = "ABSOLUTE_PATH",
+        value_parser = parse_absolute_socket_path
+    )]
+    pub host_dynamic_tools_socket: Option<AbsolutePathBuf>,
+
     /// Internal: open the daemon-wide agents overview instead of starting a thread.
     #[clap(skip)]
     pub agents_overview: bool,
@@ -62,6 +70,15 @@ pub struct Cli {
     /// Internal: show all sessions (disables cwd filtering and shows CWD column).
     #[clap(skip)]
     pub fork_show_all: bool,
+
+    #[clap(skip)]
+    pub fork_destination_local: bool,
+
+    #[clap(skip)]
+    pub fork_through_call: Option<String>,
+
+    #[clap(skip)]
+    pub fork_after_call: Option<String>,
 
     #[clap(flatten)]
     pub shared: TuiSharedCliOptions,
@@ -86,6 +103,11 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+fn parse_absolute_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
+    AbsolutePathBuf::from_absolute_path_checked(raw)
+        .map_err(|err| format!("invalid host dynamic-tools socket path `{raw}`: {err}"))
 }
 
 impl std::ops::Deref for Cli {

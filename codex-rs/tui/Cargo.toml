@@ -61,6 +61,7 @@ futures = { workspace = true }
 codex-rollout = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-shell-command = { workspace = true }
+codex-shoal-protocol = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-worktree = { workspace = true }
@@ -137,8 +138,12 @@ uuid = { workspace = true }
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+codex-utils-pty = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }

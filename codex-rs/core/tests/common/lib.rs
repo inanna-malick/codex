@@ -85,7 +85,7 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
     let regex = Regex::new(pattern).expect("failed to compile regex");
     regex
         .captures(actual)
-        .expect("regex did not match actual value")
+        .unwrap_or_else(|| panic!("pattern {pattern:?} did not match {actual:?}"))
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {

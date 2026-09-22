@@ -464,6 +464,7 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
     match namespace {
         Some(namespace) => {
             DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+                model_only: false,
                 name: namespace.to_string(),
                 description: format!("{namespace} dynamic tools"),
                 tools: vec![
@@ -472,6 +473,32 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
             })
         }
         None => DynamicToolSpec::Function(function),
+    }
+}
+
+fn custom_dynamic_tool(
+    namespace: Option<&str>,
+    name: &str,
+    defer_loading: bool,
+) -> DynamicToolSpec {
+    let custom = codex_protocol::dynamic_tools::DynamicToolCustomSpec {
+        name: name.to_string(),
+        description: format!("{name} custom dynamic tool"),
+        defer_loading,
+        format: None,
+    };
+    match namespace {
+        Some(namespace) => {
+            DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+                model_only: false,
+                name: namespace.to_string(),
+                description: format!("{namespace} dynamic tools"),
+                tools: vec![
+                    codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Custom(custom),
+                ],
+            })
+        }
+        None => DynamicToolSpec::Custom(custom),
     }
 }
 
@@ -1138,6 +1165,56 @@ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
 }
 
 #[tokio::test]
+async fn hosted_shell_tools_replace_disabled_native_tools() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ShellTool, /*enabled*/ false);
+            update_turn_settings_for_test(turn, |settings| {
+                Arc::make_mut(&mut settings.model_info).apply_patch_tool_type =
+                    Some(ApplyPatchToolType::Freeform);
+            });
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![
+                dynamic_tool(
+                    /*namespace*/ None,
+                    "exec_command",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    /*namespace*/ None,
+                    "write_stdin",
+                    /*defer_loading*/ false,
+                ),
+                custom_dynamic_tool(
+                    /*namespace*/ None, "bash", /*defer_loading*/ false,
+                ),
+                custom_dynamic_tool(
+                    /*namespace*/ None, "haskell", /*defer_loading*/ false,
+                ),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    plan.assert_visible_contains(&[
+        "exec_command",
+        "write_stdin",
+        "bash",
+        "haskell",
+        "apply_patch",
+    ]);
+    plan.assert_registered_contains(&[
+        "exec_command",
+        "write_stdin",
+        "bash",
+        "haskell",
+        "apply_patch",
+    ]);
+    plan.assert_registered_lacks(&["shell_command"]);
+}
+
+#[tokio::test]
 async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
     let plan = probe_with(
         duplicate_primary_environment,
@@ -1162,6 +1239,137 @@ async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
     assert_eq!(
         plan.namespace_function_names("client"),
         &["exec_command".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn custom_dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
+    let plan = probe_with(
+        duplicate_primary_environment,
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                /*namespace*/ None,
+                "exec_command",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["exec_command"]);
+    plan.assert_registered_contains(&["exec_command"]);
+    assert!(
+        plan.visible_specs
+            .iter()
+            .all(|spec| !matches!(spec, ToolSpec::Freeform(tool) if tool.name == "exec_command"))
+    );
+}
+
+#[tokio::test]
+async fn namespaced_custom_dynamic_tools_support_direct_and_deferred_exposure() {
+    let namespace = "languages";
+    let visible_name = "haskell";
+    let deferred_name = "idris";
+    let mut dynamic_tool =
+        custom_dynamic_tool(Some(namespace), visible_name, /*defer_loading*/ false);
+    let DynamicToolSpec::Namespace(dynamic_namespace) = &mut dynamic_tool else {
+        panic!("expected namespace");
+    };
+    dynamic_namespace.tools.push(
+        codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Custom(
+            codex_protocol::dynamic_tools::DynamicToolCustomSpec {
+                name: deferred_name.to_string(),
+                description: "Deferred Idris evaluator".to_string(),
+                defer_loading: true,
+                format: None,
+            },
+        ),
+    );
+
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&[namespace]);
+    assert_eq!(
+        plan.namespace_function_names(namespace),
+        &[visible_name.to_string()]
+    );
+    let visible_spec = plan
+        .visible_specs
+        .iter()
+        .find(|spec| spec.name() == namespace)
+        .expect("visible custom namespace");
+    let ToolSpec::Namespace(namespace_spec) = visible_spec else {
+        panic!("expected namespace spec");
+    };
+    assert!(matches!(
+        namespace_spec.tools.as_slice(),
+        [ResponsesApiNamespaceTool::Custom(tool)] if tool.name == visible_name
+    ));
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced(namespace, visible_name).to_string(),
+        &ToolName::namespaced(namespace, deferred_name).to_string(),
+    ]);
+    assert_eq!(
+        plan.exposures
+            .get(&ToolName::namespaced(namespace, deferred_name).to_string()),
+        Some(&ToolExposure::Deferred)
+    );
+}
+
+#[tokio::test]
+async fn code_mode_describes_dynamic_custom_tool_results_as_text() {
+    let direct_plan = probe_with(
+        |turn| set_features(turn, &[Feature::CodeMode]),
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                Some("tidepool_actor"),
+                "haskell",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    let ToolSpec::Namespace(namespace) = direct_plan.visible_spec("tidepool_actor") else {
+        panic!("expected dynamic tool namespace");
+    };
+    let ResponsesApiNamespaceTool::Custom(tool) = &namespace.tools[0] else {
+        panic!("expected custom dynamic tool");
+    };
+    assert!(
+        tool.description
+            .contains("tidepool_actor__haskell(input: string): Promise<string>;")
+    );
+
+    let plan = probe_with(
+        |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
+        ToolPlanInputs {
+            dynamic_tools: vec![custom_dynamic_tool(
+                Some("tidepool_actor"),
+                "haskell",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(
+        exec.description
+            .contains("tidepool_actor__haskell(input: string): Promise<string>;"),
+        "{}",
+        exec.description
     );
 }
 
@@ -3408,4 +3616,47 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     .await;
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
+}
+
+#[tokio::test]
+async fn declared_model_only_custom_namespace_survives_model_tool_mode_changes() {
+    for tool_mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        let mut tool = custom_dynamic_tool(Some("resident"), "haskell", false);
+        let DynamicToolSpec::Namespace(namespace) = &mut tool else {
+            unreachable!()
+        };
+        namespace.model_only = true;
+        let plan = probe_with(
+            |turn| {
+                set_features(turn, &[Feature::CodeMode]);
+                update_turn_settings_for_test(turn, |settings| {
+                    Arc::make_mut(&mut settings.model_info).tool_mode = Some(tool_mode);
+                });
+            },
+            ToolPlanInputs {
+                dynamic_tools: vec![tool],
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+        plan.assert_visible_contains(&["resident"]);
+        assert_eq!(
+            plan.exposure(&ToolName::namespaced("resident", "haskell").to_string()),
+            ToolExposure::DirectModelOnly
+        );
+        let ToolSpec::Namespace(namespace) = plan.visible_spec("resident") else {
+            panic!("missing resident namespace")
+        };
+        assert!(matches!(
+            &namespace.tools[0],
+            ResponsesApiNamespaceTool::Custom(_)
+        ));
+        if tool_mode != ToolMode::Direct {
+            let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME)
+            else {
+                panic!("missing exec")
+            };
+            assert!(!exec.description.contains("resident_haskell"));
+        }
+    }
 }

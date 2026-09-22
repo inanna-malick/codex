@@ -89,6 +89,7 @@ fn fork_cutoff_distinguishes_logical_parent_from_reverted_rollout() {
         ),
     ] {
         let meta = SessionMeta {
+            cache_affinity: None,
             id: thread_id,
             forked_from_id: parent,
             forked_from_ordinal_exclusive: cutoff,
@@ -119,6 +120,8 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     let session_meta = SessionMeta {
         creator_user_id: Some("creator-user".to_string()),
         creator_account_id: Some("creator-account".to_string()),
+        cache_affinity: None,
+        require_client_readiness: false,
         session_id: id.into(),
         id,
         forked_from_id: None,
@@ -208,6 +211,7 @@ async fn extract_metadata_from_rollout_rejects_unknown_history_mode() {
         ordinal: None,
         item: RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                cache_affinity: None,
                 session_id: id.into(),
                 id,
                 timestamp: "2026-01-27T12:34:56Z".to_string(),
@@ -243,6 +247,8 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
     let session_meta = SessionMeta {
         creator_user_id: None,
         creator_account_id: None,
+        cache_affinity: None,
+        require_client_readiness: false,
         session_id: id.into(),
         id,
         forked_from_id: None,
@@ -270,6 +276,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         context_window: None,
     };
     let polluted_meta = SessionMeta {
+        cache_affinity: None,
         memory_mode: Some("polluted".to_string()),
         multi_agent_version: None,
         ..session_meta.clone()
@@ -592,6 +599,8 @@ fn write_rollout_in_sessions_with_cwd(
     let session_meta = SessionMeta {
         creator_user_id: None,
         creator_account_id: None,
+        cache_affinity: None,
+        require_client_readiness: false,
         session_id: id.into(),
         id,
         forked_from_id: None,

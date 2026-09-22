@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_core::ForkSnapshot;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
@@ -21,6 +22,76 @@ use serde_json::Value;
 use std::time::Duration;
 
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_fork_sends_inherited_history_on_first_request() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warm-root"), ev_completed("warm-root")],
+            vec![
+                ev_response_created("root"),
+                ev_assistant_message("root-message", "remembered cedar"),
+                ev_completed("root"),
+            ],
+        ],
+        vec![
+            vec![
+                ev_response_created("child-1"),
+                ev_assistant_message("child-message", "cedar"),
+                ev_completed("child-1"),
+            ],
+            vec![ev_response_created("child-2"), ev_completed("child-2")],
+        ],
+    ])
+    .await;
+    let mut builder = test_codex().with_model("gpt-5.2");
+    let test = builder.build_with_websocket_server(&server).await?;
+    test.submit_turn_with_policy("remember cedar", test.config.legacy_sandbox_policy())
+        .await?;
+
+    let fork = test
+        .thread_manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            test.config.clone(),
+            test.codex.rollout_path().expect("root rollout"),
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+        )
+        .await?;
+    for text in ["recall the tree", "thanks"] {
+        fork.thread
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(&fork.thread, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    let child = &connections[1];
+    assert_eq!(child.len(), 2);
+    let first = child[0].body_json();
+    assert_eq!(first["type"], "response.create");
+    assert!(first.get("generate").is_none());
+    assert!(first.get("previous_response_id").is_none());
+    let input = first["input"].to_string();
+    for text in ["remember cedar", "remembered cedar", "recall the tree"] {
+        assert!(
+            input.contains(text),
+            "first fork request must contain {text}"
+        );
+    }
+    server.shutdown().await;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Result<()> {

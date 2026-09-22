@@ -6,6 +6,13 @@
       "items": true,
       "type": "array"
     },
+    "terminalCallId": {
+      "description": "Append exactly one matching terminal tool output directly to durable history, even while a turn is active.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "threadId": {
       "type": "string"
     }

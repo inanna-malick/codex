@@ -153,6 +153,7 @@ impl AppServerSession {
             self.remote_cwd_override.as_deref(),
             model_settings,
         );
+        params.experimental_raw_events = self.host_dynamic_tools.is_some();
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;
@@ -238,6 +239,8 @@ impl AppServerSession {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
         }
+        self.attach_host_primary_if_applicable(started.session.thread_id)
+            .await?;
         Ok(started)
     }
 }

@@ -770,6 +770,25 @@
       ],
       "type": "string"
     },
+    "DynamicToolCustomFormat": {
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "definition",
+        "syntax",
+        "type"
+      ],
+      "type": "object"
+    },
     "DynamicToolNamespaceTool": {
       "oneOf": [
         {
@@ -799,6 +818,44 @@
             "type"
           ],
           "title": "FunctionDynamicToolNamespaceTool",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DynamicToolCustomFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "title": "CustomDynamicToolNamespaceToolType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "type"
+          ],
+          "title": "CustomDynamicToolNamespaceTool",
           "type": "object"
         }
       ]
@@ -836,8 +893,50 @@
         },
         {
           "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
             "description": {
               "type": "string"
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/DynamicToolCustomFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "title": "CustomDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "type"
+          ],
+          "title": "CustomDynamicToolSpec",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "modelOnly": {
+              "description": "Keep this namespace on the model tool surface, excluding code-mode wrappers.",
+              "type": "boolean"
             },
             "name": {
               "type": "string"
@@ -4481,6 +4580,13 @@
           "items": true,
           "type": "array"
         },
+        "terminalCallId": {
+          "description": "Append exactly one matching terminal tool output directly to durable history, even while a turn is active.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
         }
@@ -5351,6 +5457,13 @@
         }
       },
       "type": "object"
+    },
+    "ThreadStartPersistence": {
+      "enum": [
+        "lazy",
+        "immediate"
+      ],
+      "type": "string"
     },
     "ThreadStartSource": {
       "enum": [
