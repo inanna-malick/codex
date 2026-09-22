@@ -10,7 +10,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::num::NonZeroU64;
 
-pub const HOST_PROTOCOL_VERSION: u32 = 4;
+pub const HOST_PROTOCOL_VERSION: u32 = 5;
 pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 pub const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
@@ -26,6 +26,8 @@ pub const COMMAND_PATH: &str = "/v1/commands";
 
 pub const MAX_REGISTRATION_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CALL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_COMMAND_REPLY_BYTES: usize = 800 * 1024;
+pub const MAX_WORKSPACE_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_CORRELATION_BYTES: usize = 256;
 pub const MAX_PRODUCER_BYTES: usize = 512;
@@ -37,6 +39,8 @@ pub struct Manifest {
     pub input_control_protocol_version: u32,
     pub max_registration_response_bytes: usize,
     pub max_call_response_bytes: usize,
+    pub max_command_reply_bytes: usize,
+    pub max_workspace_reply_bytes: usize,
     pub max_input_bytes: usize,
     pub capabilities: Vec<String>,
 }
@@ -48,6 +52,8 @@ impl Default for Manifest {
             input_control_protocol_version: INPUT_CONTROL_PROTOCOL_VERSION,
             max_registration_response_bytes: MAX_REGISTRATION_RESPONSE_BYTES,
             max_call_response_bytes: MAX_CALL_RESPONSE_BYTES,
+            max_command_reply_bytes: MAX_COMMAND_REPLY_BYTES,
+            max_workspace_reply_bytes: MAX_WORKSPACE_REPLY_BYTES,
             max_input_bytes: MAX_INPUT_BYTES,
             capabilities: vec![
                 "hostedRegistration".into(),
