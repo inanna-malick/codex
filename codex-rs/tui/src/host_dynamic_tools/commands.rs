@@ -288,7 +288,17 @@ fn failure(error: impl std::fmt::Display) -> (StatusCode, String) {
 pub(super) async fn dispatch(
     State(target): State<InputTarget>,
     Json(request): Json<Request>,
-) -> Result<Json<Response>, (StatusCode, String)> {
+) -> Result<Json<codex_shoal_protocol::BoundReply<Response>>, (StatusCode, String)> {
+    let binding = request.binding.clone();
+    if !target.binding_matches(&binding).await {
+        return Err(failure("stale or foreign native binding"));
+    }
+    let response = |payload| {
+        Json(codex_shoal_protocol::BoundReply {
+            binding: binding.clone(),
+            payload,
+        })
+    };
     if request.thread_id != target.thread.to_string() || uuid::Uuid::parse_str(&request.id).is_err()
     {
         return Err(failure("invalid hosted command identity"));
@@ -317,7 +327,7 @@ pub(super) async fn dispatch(
                         "command identity already binds another description",
                     ));
                 }
-                return Ok(Json(Response::State(job.phase.borrow().clone())));
+                return Ok(response(Response::State(job.phase.borrow().clone())));
             }
             let size = match spec.input {
                 Input::Terminal => {
@@ -374,7 +384,7 @@ pub(super) async fn dispatch(
                 .map_err(|error| error.to_string());
             jobs.finish(&id, result);
         });
-        return Ok(Json(Response::State(JobState::Starting)));
+        return Ok(response(Response::State(JobState::Starting)));
     }
     let mut phase = {
         let state = target
@@ -393,7 +403,7 @@ pub(super) async fn dispatch(
             if matches!(*phase.borrow_and_update(), JobState::Starting) {
                 let _ = tokio::time::timeout(Duration::from_secs(20), phase.changed()).await;
             }
-            return Ok(Json(Response::State(phase.borrow().clone())));
+            return Ok(response(Response::State(phase.borrow().clone())));
         }
         Operation::Output { bytes } => {
             if bytes > 1024 * 1024 {
@@ -414,7 +424,7 @@ pub(super) async fn dispatch(
                 return Err(failure("retained command output expired"));
             }
             let finished = matches!(*job.phase.borrow(), JobState::Finished { .. });
-            return Ok(Json(Response::Output(Output {
+            return Ok(response(Response::Output(Output {
                 stdout: Page::read(&job.stdout, Position::OutputBeginning, bytes, finished)?,
                 stderr: Page::read(&job.stderr, Position::OutputBeginning, bytes, finished)?,
             })));
@@ -436,7 +446,7 @@ pub(super) async fn dispatch(
                 Stream::Stdout => &job.stdout,
                 Stream::Stderr => &job.stderr,
             };
-            return Ok(Json(Response::Page(Page::read(
+            return Ok(response(Response::Page(Page::read(
                 buffer,
                 position,
                 64 * 1024,
@@ -495,7 +505,7 @@ pub(super) async fn dispatch(
                 job.cancelled = true;
             }
             if !matches!(*phase.borrow(), JobState::Starting) {
-                return Ok(Json(Response::Acknowledged));
+                return Ok(response(Response::Acknowledged));
             }
             let request = ClientRequest::CommandExecTerminate {
                 request_id: request_id(),
@@ -510,7 +520,7 @@ pub(super) async fn dispatch(
                     tracing::warn!(%error, "native command cancellation response unavailable");
                 }
             });
-            return Ok(Json(Response::Acknowledged));
+            return Ok(response(Response::Acknowledged));
         }
     };
     tokio::time::timeout(Duration::from_secs(30), handle.request(call))
@@ -518,7 +528,7 @@ pub(super) async fn dispatch(
         .map_err(failure)?
         .map_err(failure)?
         .map_err(|error| failure(error.message))?;
-    Ok(Json(Response::Acknowledged))
+    Ok(response(Response::Acknowledged))
 }
 
 #[cfg(test)]

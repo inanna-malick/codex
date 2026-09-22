@@ -1750,7 +1750,7 @@ async fn host_custom_tool_call_preserves_payload_and_resolves_original_request()
     assert_eq!(
         call.body,
         serde_json::json!({
-            "protocolVersion": 4,
+            "protocolVersion": 5,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",
@@ -1877,7 +1877,7 @@ async fn hosted_haskell_interrupt_requests_exact_cancel_and_native_interrupt() -
     assert_eq!(
         cancel.body,
         serde_json::json!({
-            "protocolVersion": 4,
+            "protocolVersion": 5,
             "threadId": thread_id,
             "turnId": "turn-host",
             "callId": "call-host",

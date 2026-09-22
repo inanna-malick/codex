@@ -11,7 +11,7 @@ use sha2::Sha256;
 use std::num::NonZeroU64;
 
 pub const HOST_PROTOCOL_VERSION: u32 = 5;
-pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 4;
+pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 pub const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 pub const SESSION_PATH: &str = "/v1/dynamic-tools/session";
@@ -28,6 +28,7 @@ pub const MAX_REGISTRATION_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CALL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_COMMAND_REPLY_BYTES: usize = 800 * 1024;
 pub const MAX_WORKSPACE_REPLY_BYTES: usize = 16 * 1024;
+pub const MAX_INPUT_CONTROL_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 pub const MAX_CORRELATION_BYTES: usize = 256;
 pub const MAX_PRODUCER_BYTES: usize = 512;
@@ -41,6 +42,7 @@ pub struct Manifest {
     pub max_call_response_bytes: usize,
     pub max_command_reply_bytes: usize,
     pub max_workspace_reply_bytes: usize,
+    pub max_input_control_reply_bytes: usize,
     pub max_input_bytes: usize,
     pub capabilities: Vec<String>,
 }
@@ -135,6 +137,7 @@ impl Default for Manifest {
             max_call_response_bytes: MAX_CALL_RESPONSE_BYTES,
             max_command_reply_bytes: MAX_COMMAND_REPLY_BYTES,
             max_workspace_reply_bytes: MAX_WORKSPACE_REPLY_BYTES,
+            max_input_control_reply_bytes: MAX_INPUT_CONTROL_REPLY_BYTES,
             max_input_bytes: MAX_INPUT_BYTES,
             capabilities: vec![
                 "hostedRegistration".into(),
@@ -284,6 +287,7 @@ pub struct InputControlResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommandRequest<Spec, Stream, Position> {
+    pub binding: Binding,
     pub thread_id: String,
     pub id: String,
     #[serde(flatten)]
@@ -328,11 +332,20 @@ pub enum CommandResponse<Output, Page> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspacePublicationRequest {
+    pub binding: Binding,
     pub thread_id: String,
     pub sequence: NonZeroU64,
     pub operation: WorkspacePublicationOperation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_identity: Option<WorkspaceProcessIdentity>,
+}
+
+/// An operation result tied to the exact challenged native generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BoundReply<T> {
+    pub binding: Binding,
+    pub payload: T,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

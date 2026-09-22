@@ -345,3 +345,9 @@ impl InputControl {
         })
     }
 }
+
+impl InputTarget {
+    pub(super) async fn binding_matches(&self, binding: &codex_shoal_protocol::Binding) -> bool {
+        self.binding.lock().await.validate(binding).is_ok()
+    }
+}

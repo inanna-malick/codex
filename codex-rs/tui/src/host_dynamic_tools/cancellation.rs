@@ -592,12 +592,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&call.request).expect("serialize exact cancel request"),
             serde_json::json!({
-                "protocolVersion": 4,
+                "protocolVersion": 5,
                 "threadId": "thread",
                 "turnId": "turn",
                 "callId": "call",
                 "contextCallId": "context-call",
-                "namespace": null,
                 "launchId": "launch",
                 "applicationInstanceId": "application",
                 "sessionGeneration": 7,

@@ -149,7 +149,7 @@ fn spawn_host_with_completion_statuses(
                 REGISTRATION_PATH => (
                     "200 OK",
                     serde_json::to_vec(&json!({
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "dynamicTools": [{
                             "type": "custom",
                             "name": "evaluate",
@@ -283,7 +283,7 @@ fn spawn_cancellable_host_configured(
                         &stream,
                         "200 OK",
                         &serde_json::to_vec(&json!({
-                            "protocolVersion": 4,
+                            "protocolVersion": 5,
                             "dynamicTools": [{
                                 "type": "custom",
                                 "name": "haskell",
@@ -463,7 +463,7 @@ async fn transport_reattach_preserves_binding_and_checks_pending_completions()
 
     let binding = |attachment: &RecordedRequest| {
         json!({
-            "protocolVersion": 4,
+            "protocolVersion": 5,
             "launchId": attachment.body["launchId"],
             "instanceId": attachment.body["applicationInstanceId"],
             "generation": attachment.body["sessionGeneration"],
@@ -589,7 +589,7 @@ fn spawn_host_configured(
                 REGISTRATION_PATH => Some((
                     "200 OK",
                     serde_json::to_vec(&json!({
-                        "protocolVersion": 4,
+                        "protocolVersion": 5,
                         "dynamicTools": [{
                             "type": "custom",
                             "name": "evaluate",
@@ -685,7 +685,7 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(session.path, SESSION_PATH);
     assert_eq!(
         session.body,
-        json!({"protocolVersion": 4, "threadId": thread_id})
+        json!({"protocolVersion": 5, "threadId": thread_id})
     );
     let call = requests.recv()?;
     assert_eq!(call.method, "POST");
@@ -693,12 +693,11 @@ async fn custom_call_round_trips_exact_decoded_source_and_ids() -> color_eyre::R
     assert_eq!(
         call.body,
         json!({
-            "protocolVersion": 4,
+            "protocolVersion": 5,
             "threadId": thread_id,
             "turnId": "turn-α",
             "callId": "call-1",
             "contextCallId": "outer-exec",
-            "namespace": null,
             "tool": "evaluate",
             "arguments": source,
         })
@@ -857,7 +856,7 @@ async fn failed_call_transport_reconciles_without_resubmitting_body() -> color_e
                 REGISTRATION_PATH,
                 "200 OK",
                 json!({
-                    "protocolVersion": 4,
+                    "protocolVersion": 5,
                     "dynamicTools": [{"type": "custom", "name": "evaluate",
                         "description": "Evaluate source", "deferLoading": false}],
                     "scope": "primaryThread", "launchId": "launch-test", "inputControlNonce": "nonce-test"
@@ -1083,7 +1082,7 @@ async fn completion_waits_for_sibling_result_and_acknowledges_once() -> color_ey
         RecordedRequest {
             method: "POST".into(),
             path: "/v1/dynamic-tools/completed".into(),
-            body: json!({"protocolVersion":4, "threadId":thread, "contextCallId":"outer"}),
+            body: json!({"protocolVersion":5, "threadId":thread, "contextCallId":"outer"}),
         }
     );
     host.observe_completion(&last).await?;
@@ -1112,7 +1111,7 @@ async fn interrupted_turn_settles_pending_host_effects_without_a_completion()
         RecordedRequest {
             method: "POST".into(),
             path: "/v1/dynamic-tools/interrupted".into(),
-            body: json!({"protocolVersion":4,"threadId":thread,"contextCallId":"interrupted"}),
+            body: json!({"protocolVersion":5,"threadId":thread,"contextCallId":"interrupted"}),
         }
     );
     host.settle_turn(&thread.to_string()).await?;
@@ -1166,7 +1165,7 @@ async fn stale_interrupted_turn_does_not_reattach_an_acknowledged_completion()
             method: "POST".into(),
             path: "/v1/dynamic-tools/completed".into(),
             body: json!({
-                "protocolVersion":4,
+                "protocolVersion":5,
                 "threadId":thread,
                 "contextCallId":"interrupted"
             }),

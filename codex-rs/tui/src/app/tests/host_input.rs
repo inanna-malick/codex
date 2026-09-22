@@ -94,7 +94,7 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
             .is_some_and(|value| !value.is_empty())
     );
     let binding = json!({
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "launchId": attachment.body["launchId"],
         "instanceId": attachment.body["applicationInstanceId"],
         "generation": attachment.body["sessionGeneration"],
@@ -314,7 +314,7 @@ async fn hosted_actor_input_reconciles_early_not_sleeping_before_admission()
     assert_eq!(call.path, "/v1/dynamic-tools/call");
 
     let binding = json!({
-        "protocolVersion": 4,
+        "protocolVersion": 5,
         "launchId": attachment.body["launchId"],
         "instanceId": attachment.body["applicationInstanceId"],
         "generation": attachment.body["sessionGeneration"],

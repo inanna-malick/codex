@@ -379,7 +379,7 @@ async fn full_tui_attaches_host_owner_and_routes_correlated_input() -> Result<()
 
     let binding = |instance: &str| {
         json!({
-            "protocolVersion": 4,
+            "protocolVersion": 5,
             "launchId": "launch-test",
             "instanceId": instance,
             "generation": 1,
