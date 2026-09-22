@@ -101,4 +101,22 @@ fn command_and_workspace_boundaries_reject_unknown_wire_fields() {
         serde_json::to_string(&WorkspacePublicationReply::<String>::Busy).unwrap(),
         r#"{"status":"busy"}"#
     );
+
+    let hosted = serde_json::from_str::<HostedCallRequest<String, serde_json::Value>>(
+        r#"{"protocolVersion":5,"threadId":"thread-1","turnId":"turn-2","callId":"call-3","tool":"inspect","arguments":{},"unexpected":true}"#,
+    );
+    assert!(hosted.is_err());
+    let session = HostedSessionRequest {
+        protocol_version: HOST_PROTOCOL_VERSION,
+        thread_id: "thread-1",
+        input_control_socket: None::<&str>,
+        launch_id: None,
+        application_instance_id: None,
+        session_generation: None,
+        input_control_nonce: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&session).unwrap(),
+        r#"{"protocolVersion":5,"threadId":"thread-1"}"#
+    );
 }

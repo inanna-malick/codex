@@ -8,7 +8,6 @@ use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_rollout::CompletedCallBoundary;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutRecorder;
-use serde::Serialize;
 
 use super::HostDynamicTools;
 
@@ -42,13 +41,7 @@ impl HostToolCompletions {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompletionRequest<'a> {
-    protocol_version: u32,
-    thread_id: &'a str,
-    context_call_id: &'a str,
-}
+type CompletionRequest<'a> = codex_shoal_protocol::HostedCompletionRequest<&'a str>;
 
 impl HostDynamicTools {
     pub(super) async fn reconcile_completions(&self) -> color_eyre::Result<()> {

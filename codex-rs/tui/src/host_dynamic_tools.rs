@@ -29,7 +29,6 @@ use codex_shoal_protocol::MAX_REGISTRATION_RESPONSE_BYTES;
 use codex_shoal_protocol::REGISTRATION_PATH;
 use codex_shoal_protocol::SESSION_PATH;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,30 +96,8 @@ pub(crate) enum HostDynamicToolRouting {
     Reject,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionRequest<'a> {
-    protocol_version: u32,
-    thread_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_control_socket: Option<&'a AbsolutePathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    launch_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    application_instance_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_control_nonce: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CallRequest<'a> {
-    protocol_version: u32,
-    #[serde(flatten)]
-    params: &'a DynamicToolCallParams,
-}
+type SessionRequest<'a> = codex_shoal_protocol::HostedSessionRequest<&'a str, &'a AbsolutePathBuf>;
+type CallRequest<'a> = codex_shoal_protocol::HostedCallRequest<&'a str, &'a serde_json::Value>;
 
 impl HostDynamicTools {
     #[cfg(target_os = "linux")]
@@ -688,8 +665,14 @@ async fn send_call(
     params: &DynamicToolCallParams,
 ) -> color_eyre::Result<DynamicToolCallResponse> {
     let response = send_request(client.post(endpoint(CALL_PATH)).json(&CallRequest {
+        context_call_id: params.context_call_id.as_deref(),
         protocol_version: PROTOCOL_VERSION,
-        params,
+        thread_id: &params.thread_id,
+        turn_id: &params.turn_id,
+        call_id: &params.call_id,
+        namespace: params.namespace.as_deref(),
+        tool: &params.tool,
+        arguments: &params.arguments,
     }))
     .await?;
     require_status(response.status(), reqwest::StatusCode::OK)?;

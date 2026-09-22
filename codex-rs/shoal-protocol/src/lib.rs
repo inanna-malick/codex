@@ -69,6 +69,63 @@ fn option_none<T>() -> Option<T> {
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedSessionRequest<Text, Path> {
+    pub protocol_version: u32,
+    pub thread_id: Text,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub input_control_socket: Option<Path>,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<Text>,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub application_instance_id: Option<Text>,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub session_generation: Option<u64>,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub input_control_nonce: Option<Text>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedCallRequest<Text, Arguments> {
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub context_call_id: Option<Text>,
+    pub protocol_version: u32,
+    pub thread_id: Text,
+    pub turn_id: Text,
+    pub call_id: Text,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<Text>,
+    pub tool: Text,
+    pub arguments: Arguments,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedCompletionRequest<Text> {
+    pub protocol_version: u32,
+    pub thread_id: Text,
+    pub context_call_id: Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedCancellationRequest<Text> {
+    pub protocol_version: u32,
+    pub thread_id: Text,
+    pub turn_id: Text,
+    pub call_id: Text,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub context_call_id: Option<Text>,
+    #[serde(default = "option_none", skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<Text>,
+    pub launch_id: Text,
+    pub application_instance_id: Text,
+    pub session_generation: u64,
+    pub input_control_nonce: Text,
+}
+
 impl Default for Manifest {
     fn default() -> Self {
         Self {

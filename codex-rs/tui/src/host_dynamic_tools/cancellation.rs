@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::app_event::AppEvent;
@@ -139,20 +138,7 @@ impl Drop for HostedCallAdmissionGuard {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CancellationRequest {
-    protocol_version: u32,
-    thread_id: String,
-    turn_id: String,
-    call_id: String,
-    context_call_id: Option<String>,
-    namespace: Option<String>,
-    launch_id: String,
-    application_instance_id: String,
-    session_generation: u64,
-    input_control_nonce: String,
-}
+type CancellationRequest = codex_shoal_protocol::HostedCancellationRequest<String>;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
