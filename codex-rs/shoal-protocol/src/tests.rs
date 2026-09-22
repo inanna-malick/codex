@@ -83,3 +83,22 @@ fn manifest_is_stable_machine_readable_compatibility_evidence() {
     );
     assert_eq!(encoded["capabilities"].as_array().unwrap().len(), 4);
 }
+
+#[test]
+fn command_and_workspace_boundaries_reject_unknown_wire_fields() {
+    type Command = CommandRequest<serde_json::Value, String, serde_json::Value>;
+    let command = serde_json::from_str::<Command>(
+        r#"{"threadId":"thread-1","id":"job-2","operation":"cancel","extra":true}"#,
+    );
+    assert!(command.is_err());
+
+    let workspace = serde_json::from_str::<WorkspacePublicationRequest>(
+        r#"{"threadId":"thread-1","sequence":1,"operation":"begin","expectedIdentity":null}"#,
+    )
+    .unwrap();
+    assert_eq!(workspace.sequence.get(), 1);
+    assert_eq!(
+        serde_json::to_string(&WorkspacePublicationReply::<String>::Busy).unwrap(),
+        r#"{"status":"busy"}"#
+    );
+}

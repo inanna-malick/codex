@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::num::NonZeroU64;
 
 pub const HOST_PROTOCOL_VERSION: u32 = 4;
 pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 4;
@@ -191,6 +192,95 @@ pub enum Outcome {
 pub struct InputControlResponse {
     pub binding: Binding,
     pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandRequest<Spec, Stream, Position> {
+    pub thread_id: String,
+    pub id: String,
+    #[serde(flatten)]
+    pub operation: CommandOperation<Spec, Stream, Position>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandOperation<Spec, Stream, Position> {
+    Start { spec: Spec },
+    Wait,
+    Output { bytes: usize },
+    Read { stream: Stream, position: Position },
+    Input { text: String },
+    CloseInput,
+    Resize { rows: u16, columns: u16 },
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandState {
+    Starting,
+    Finished { exit_code: i32, cancelled: bool },
+    Failed { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "result",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum CommandResponse<Output, Page> {
+    State(CommandState),
+    Output(Output),
+    Page(Page),
+    Acknowledged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspacePublicationRequest {
+    pub thread_id: String,
+    pub sequence: NonZeroU64,
+    pub operation: WorkspacePublicationOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_identity: Option<WorkspaceProcessIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspacePublicationOperation {
+    Begin,
+    Finish,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceProcessIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub mount_namespace_inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase", deny_unknown_fields)]
+pub enum WorkspacePublicationReply<Path> {
+    Ready {
+        pid: u32,
+        #[serde(rename = "startTicks")]
+        start_ticks: u64,
+        #[serde(rename = "mountNamespaceInode")]
+        mount_namespace_inode: u64,
+        #[serde(rename = "cgroupPath")]
+        cgroup_path: Path,
+    },
+    Settled,
+    Busy,
+    Conflict,
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

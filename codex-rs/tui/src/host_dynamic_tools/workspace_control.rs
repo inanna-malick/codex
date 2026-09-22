@@ -4,61 +4,17 @@ use super::input_control::InputTarget;
 use axum::Json;
 use axum::extract::State;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_shoal_protocol::WorkspacePublicationOperation as Operation;
+use codex_shoal_protocol::WorkspacePublicationReply as Response;
+use codex_shoal_protocol::WorkspacePublicationRequest as Request;
 use codex_utils_pty::workspace_admission::Availability;
 use codex_utils_pty::workspace_admission::PublicationAdmission;
 use codex_utils_pty::workspace_admission::{self};
-use serde::Deserialize;
-use serde::Serialize;
-use std::num::NonZeroU64;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Request {
-    thread_id: String,
-    sequence: NonZeroU64,
-    operation: Operation,
-    expected_identity: Option<Identity>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Identity {
-    pid: u32,
-    start_ticks: u64,
-    mount_namespace_inode: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum Operation {
-    Begin,
-    Finish,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
-pub(super) enum Response {
-    Ready {
-        pid: u32,
-        #[serde(rename = "startTicks")]
-        start_ticks: u64,
-        #[serde(rename = "mountNamespaceInode")]
-        mount_namespace_inode: u64,
-        #[serde(rename = "cgroupPath")]
-        cgroup_path: String,
-    },
-    Settled,
-    Busy,
-    Conflict,
-    Unavailable {
-        reason: String,
-    },
-}
 
 pub(super) async fn publication(
     State(target): State<InputTarget>,
     Json(request): Json<Request>,
-) -> Json<Response> {
+) -> Json<Response<String>> {
     if request.thread_id != target.thread.to_string() {
         return Json(Response::Conflict);
     }

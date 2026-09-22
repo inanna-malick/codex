@@ -47,43 +47,18 @@ enum Input {
     #[serde(rename = "TerminalInput")]
     Terminal,
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct Request {
-    thread_id: String,
-    id: String,
-    #[serde(flatten)]
-    operation: Operation,
-}
-#[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum Operation {
-    Start { spec: Spec },
-    Wait,
-    Output { bytes: usize },
-    Read { stream: Stream, position: Position },
-    Input { text: String },
-    CloseInput,
-    Resize { rows: u16, columns: u16 },
-    Cancel,
-}
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(super) enum JobState {
-    Starting,
-    Finished { exit_code: i32, cancelled: bool },
-    Failed { detail: String },
-}
+pub(super) type Request = codex_shoal_protocol::CommandRequest<Spec, Stream, Position>;
+type Operation = codex_shoal_protocol::CommandOperation<Spec, Stream, Position>;
+pub(super) type JobState = codex_shoal_protocol::CommandState;
+pub(super) type Response = codex_shoal_protocol::CommandResponse<Output, Page>;
+
 #[derive(Serialize)]
-#[serde(tag = "result", content = "value", rename_all = "snake_case")]
-pub(super) enum Response {
-    State(JobState),
-    Output { stdout: Page, stderr: Page },
-    Page(Page),
-    Acknowledged,
+pub(super) struct Output {
+    stdout: Page,
+    stderr: Page,
 }
 #[derive(Deserialize)]
-enum Stream {
+pub(super) enum Stream {
     Stdout,
     Stderr,
 }
@@ -92,7 +67,7 @@ enum Stream {
     clippy::enum_variant_names,
     reason = "Matches Haskell constructors on the private command relay"
 )]
-enum Position {
+pub(super) enum Position {
     OutputBeginning,
     OutputTail,
     OutputOffset(i64),
@@ -439,10 +414,10 @@ pub(super) async fn dispatch(
                 return Err(failure("retained command output expired"));
             }
             let finished = matches!(*job.phase.borrow(), JobState::Finished { .. });
-            return Ok(Json(Response::Output {
+            return Ok(Json(Response::Output(Output {
                 stdout: Page::read(&job.stdout, Position::OutputBeginning, bytes, finished)?,
                 stderr: Page::read(&job.stderr, Position::OutputBeginning, bytes, finished)?,
-            }));
+            })));
         }
         Operation::Read { stream, position } => {
             let state = target
