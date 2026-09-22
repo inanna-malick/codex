@@ -166,8 +166,6 @@ impl ThreadScopedOutgoingMessageSender {
         thread_id: ThreadId,
     ) -> Self {
         Self {
-            control: Arc::new(crate::control::Control::default()),
-            fenced_pending: Mutex::new((Vec::new(), true)),
             outgoing,
             connection_ids: Arc::new(connection_ids),
             thread_id,
@@ -243,11 +241,6 @@ impl ThreadScopedOutgoingMessageSender {
 }
 
 impl OutgoingMessageSender {
-    pub(crate) fn with_control(mut self, control: Arc<crate::control::Control>) -> Self {
-        self.control = control;
-        self
-    }
-
     pub(crate) fn new(
         sender: mpsc::Sender<OutgoingEnvelope>,
         analytics_events_client: AnalyticsEventsClient,

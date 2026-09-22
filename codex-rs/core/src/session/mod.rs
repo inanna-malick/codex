@@ -3583,6 +3583,7 @@ impl Session {
         mut items: Vec<ResponseItemEnvelope>,
         image_preparations: Vec<ImagePreparationMetadata>,
     ) {
+        let mcp_revision: Option<u64> = None;
         let (response_items, terminal_items_prequeued) = {
             let mut state = self.state.lock().await;
             // A tool call has one terminal protocol output. Enforce that at the shared history
@@ -3657,7 +3658,8 @@ impl Session {
         }
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
-        if !terminal_items_prequeued && self.persist_rollout_items(&rollout_items).await
+        if !terminal_items_prequeued
+            && self.persist_rollout_items(&rollout_items).await
             && let Some(revision) = mcp_revision
         {
             self.services

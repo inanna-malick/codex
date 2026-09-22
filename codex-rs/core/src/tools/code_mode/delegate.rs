@@ -12,6 +12,7 @@ use codex_code_mode::ToolInvocationFuture;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ThreadId;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::with_serialization_allowance;

@@ -14,8 +14,6 @@ pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
-#[cfg(target_os = "linux")]
-pub mod workspace_admission;
 #[cfg(test)]
 mod tests;
 #[cfg(unix)]
@@ -24,6 +22,8 @@ mod unix_io;
 mod win;
 #[cfg(windows)]
 mod windows_input;
+#[cfg(target_os = "linux")]
+pub mod workspace_admission;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 
@@ -55,9 +55,9 @@ pub use pty::conpty_supported;
 pub use pty::spawn_process as spawn_pty_process;
 
 #[cfg(target_os = "linux")]
-mod command_resources;
-#[cfg(target_os = "linux")]
 mod command_child;
+#[cfg(target_os = "linux")]
+mod command_resources;
 #[cfg(target_os = "linux")]
 pub use command_child::CommandChild;
 #[cfg(target_os = "linux")]

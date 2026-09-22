@@ -47,6 +47,7 @@ pub(super) async fn record_for_step(session: &Session, step: &StepContext) -> Re
     session
         .record_annotated_conversation_items(
             &step.turn,
+            step.turn.model_info(),
             vec![ResponseItemEnvelope {
                 item: ResponseItem::ConfigurationUpdate {
                     reasoning: ConfigurationReasoning { effort },

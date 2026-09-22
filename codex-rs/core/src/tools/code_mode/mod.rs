@@ -292,6 +292,22 @@ fn handle_runtime_response(
     )
 }
 
+fn format_script_status(response: &RuntimeResponse) -> String {
+    match response {
+        RuntimeResponse::Yielded { cell_id, .. } => {
+            format!("Script running with cell ID {cell_id}")
+        }
+        RuntimeResponse::Terminated { .. } => "Script terminated".to_string(),
+        RuntimeResponse::Result { error_text, .. } => {
+            if error_text.is_none() {
+                "Script completed".to_string()
+            } else {
+                "Script failed".to_string()
+            }
+        }
+    }
+}
+
 fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
     sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
 }

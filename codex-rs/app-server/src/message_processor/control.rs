@@ -21,6 +21,9 @@ impl MessageProcessor {
         session_state: &ConnectionSessionState,
     ) {
         self.fence_disconnected_controller(connection_id);
+        self.account_processor
+            .gateway_connection_closed(connection_id);
+        self.request_serialization_queues.discard_closed().await;
         let cleanup_controller = self.outgoing.control.begin_cleanup(connection_id);
         if cleanup_controller {
             self.outgoing.fence_pending_requests().await;

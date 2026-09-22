@@ -109,7 +109,7 @@ impl Session {
             .into_iter()
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
-        self.record_annotated_conversation_items(turn_context, items)
+        self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
             .await;
     }
 

@@ -244,7 +244,10 @@ impl ToolCallRuntime {
                         match dispatch_handle.await {
                             Ok(result) => result,
                             Err(err) if err.is_cancelled() => {
-                                let response = Self::aborted_response(&call, secs);
+                                let response = Self::aborted_response(
+                                    &call,
+                                    Self::abort_message(&call, secs),
+                                );
                                 call_trace::result_ready(
                                     thread_id,
                                     &abort_turn.sub_id,

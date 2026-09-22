@@ -15,6 +15,7 @@ use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
+use codex_app_server_protocol::ThreadStartPersistence;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
@@ -5248,11 +5249,7 @@ impl ThreadRequestProcessor {
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
-                .fork_prepared_thread(
-                    snapshot,
-                    config,
-                    prepared_fork,
-                )
+                .fork_prepared_thread(snapshot, config, prepared_fork)
                 .await
         } else {
             self.thread_manager

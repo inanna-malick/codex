@@ -460,11 +460,12 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     // Eviction updates this registry and residency together, locking the registry first.
-    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>
-    shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders
+    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
     pub(crate) execution_fence: tokio_util::sync::CancellationToken,
     pub(crate) require_client_readiness: AtomicBool,
-    start_transaction_gates: Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<tokio::sync::Mutex<()>>>>>
+    start_transaction_gates:
+        Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -1523,6 +1524,7 @@ impl ThreadManager {
         config: Config,
         prepared: PreparedFork,
     ) -> CodexResult<NewThread> {
+        let options = StartThreadOptions::new(config);
         let history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: prepared.source_thread_id,
             history: Arc::clone(&prepared.model_context),

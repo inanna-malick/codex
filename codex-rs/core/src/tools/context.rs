@@ -90,6 +90,14 @@ pub(crate) struct ToolCallOrigin {
 }
 
 impl ToolInvocation {
+    pub(crate) fn context_call_id(&self) -> Option<String> {
+        match &self.source {
+            ToolCallSource::Direct => Some(self.call_id.clone()),
+            ToolCallSource::DirectPlaintextMessage => None,
+            ToolCallSource::CodeMode { .. } => None,
+        }
+    }
+
     /// Returns the item and window that requested this call or started its code-mode cell.
     pub(crate) async fn originating_call(&self) -> Option<ToolCallOrigin> {
         if let ToolCallSource::CodeMode { cell_id, .. } = &self.source {

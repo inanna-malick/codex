@@ -104,16 +104,16 @@ fn is_execution_limited(
 #[path = "execution_tests.rs"]
 mod tests;
 
-impl AgentControl {
+impl LocalAgentControl {
     pub(crate) fn ensure_execution_active(&self) -> CodexResult<()> {
-        if let Some(manager) = self.manager.upgrade() {
+        if let Some(manager) = self.runtime.manager.upgrade() {
             manager.ensure_execution_active()?;
         }
         Ok(())
     }
 
     pub(crate) fn execution_cancellation_token(&self) -> tokio_util::sync::CancellationToken {
-        self.manager
+        self.runtime.manager
             .upgrade()
             .map_or_else(tokio_util::sync::CancellationToken::new, |manager| {
                 manager.execution_fence.child_token()

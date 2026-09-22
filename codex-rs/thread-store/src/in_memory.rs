@@ -543,6 +543,10 @@ pub struct InMemoryThreadStore {
     state: Arc<tokio::sync::Mutex<InMemoryThreadStoreState>>,
     omit_metadata_update_result: Arc<AtomicBool>,
     state_db: Option<codex_rollout::StateDbHandle>,
+    fail_flush: Arc<AtomicBool>,
+    pause_shutdown: Arc<AtomicBool>,
+    shutdown_started: Arc<tokio::sync::Notify>,
+    resume_shutdown: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -575,6 +579,10 @@ impl InMemoryThreadStore {
             state: Arc::clone(&self.state),
             omit_metadata_update_result: Arc::clone(&self.omit_metadata_update_result),
             state_db,
+            fail_flush: Arc::clone(&self.fail_flush),
+            pause_shutdown: Arc::clone(&self.pause_shutdown),
+            shutdown_started: Arc::clone(&self.shutdown_started),
+            resume_shutdown: Arc::clone(&self.resume_shutdown),
         }
     }
 

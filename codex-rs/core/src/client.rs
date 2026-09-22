@@ -183,42 +183,6 @@ pub(crate) struct CompactConversationRequestSettings {
     pub(crate) service_tier: Option<String>,
 }
 
-fn reasoning_effort_for_request(
-    model_info: &ModelInfo,
-    effort: ReasoningEffortConfig,
-) -> ReasoningEffortConfig {
-    match effort {
-        ReasoningEffortConfig::Ultra => model_info
-            .multi_agent_reasoning_effort
-            .as_ref()
-            .filter(|effort| {
-                *effort != &ReasoningEffortConfig::Ultra
-                    && model_info
-                        .supported_reasoning_levels
-                        .iter()
-                        .any(|preset| &preset.effort == *effort)
-            })
-            .cloned()
-            .or_else(|| {
-                let supported_reasoning_levels = &model_info.supported_reasoning_levels;
-                supported_reasoning_levels
-                    .iter()
-                    .find(|preset| preset.effort == ReasoningEffortConfig::Max)
-                    .or_else(|| {
-                        supported_reasoning_levels
-                            .iter()
-                            .rev()
-                            .find(|preset| preset.effort != ReasoningEffortConfig::Ultra)
-                    })
-                    .map(|preset| preset.effort.clone())
-            })
-            .unwrap_or(ReasoningEffortConfig::Medium),
-        // Keep "persistent" in local settings; the Responses API calls it "disabled".
-        ReasoningEffortConfig::Persistent => ReasoningEffortConfig::Custom("disabled".to_string()),
-        effort => effort,
-    }
-}
-
 pub(crate) fn reasoning_effort_for_request(
     model_info: &ModelInfo,
     effort: ReasoningEffortConfig,
@@ -688,7 +652,7 @@ impl ModelClient {
         &self,
         metadata: &CodexResponsesMetadata,
     ) -> HashMap<String, String> {
-        let mut result = metadata.client_metadata();
+        let mut result = metadata.client_metadata(false);
         // The provider routes by this transport field; full Codex identity remains
         // in x-codex-turn-metadata and thread_id.
         result.insert("session_id".to_string(), self.routing_session_id(metadata));
@@ -809,6 +773,7 @@ impl ModelClient {
     /// The model selection and telemetry context are passed explicitly to keep `ModelClient`
     /// session-scoped.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any())]
     pub(crate) async fn compact_conversation_history(
         &self,
         prompt: &Prompt,
@@ -1147,15 +1112,9 @@ impl ModelClient {
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info);
-        if !self.reasoning_effort_override_enabled(model_info) {
-            // Unsupported models and disabled overrides must also accept saved history.
-            // Filter only the request copy; persisted history remains unchanged.
-            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
-        }
-        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
         let supports_configuration =
             codex_models_manager::model_info::supports_reasoning_configuration(model_info);
-        if !supports_configuration {
+        if !self.reasoning_effort_override_enabled(model_info) || !supports_configuration {
             // Keep durable history intact across model switches, but project
             // unsupported controls out of this model's outgoing request.
             input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
@@ -1640,14 +1599,7 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-        let mut input = prompt.get_formatted_input_for_request(model_info);
-        let supports_configuration =
-            codex_models_manager::model_info::supports_reasoning_configuration(model_info);
-        if !self.reasoning_effort_override_enabled(model_info) || !supports_configuration {
-            // Unsupported models and disabled overrides must also accept saved history.
-            // Filter only the request copy; persisted history remains unchanged.
-            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
-        }
+            session_id: Some(self.client.routing_session_id(responses_metadata)),
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {

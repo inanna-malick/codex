@@ -884,43 +884,6 @@ impl MessageProcessor {
         self.thread_processor.shutdown_threads().await;
     }
 
-    pub(crate) async fn connection_closed(
-        &self,
-        connection_id: ConnectionId,
-        session_state: &ConnectionSessionState,
-    ) {
-        session_state.rpc_gate.close().await;
-        self.account_processor
-            .gateway_connection_closed(connection_id);
-        self.request_serialization_queues.discard_closed().await;
-        self.outgoing
-            .disconnect_user_verification_connection(connection_id)
-            .await;
-        session_state.mcp_event_streams.clear().await;
-        if timeout(
-            CONNECTION_RPC_DRAIN_TIMEOUT,
-            session_state.rpc_gate.shutdown(),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                ?connection_id,
-                timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
-                "timed out waiting for connection RPCs to drain"
-            );
-        }
-        self.outgoing.connection_closed(connection_id).await;
-        self.fs_processor.connection_closed(connection_id).await;
-        self.command_exec_processor
-            .connection_closed(connection_id)
-            .await;
-        self.process_exec_processor
-            .connection_closed(connection_id)
-            .await;
-        self.thread_processor.connection_closed(connection_id).await;
-    }
-
     pub(crate) fn subscribe_running_assistant_turn_count(&self) -> watch::Receiver<usize> {
         self.thread_processor
             .subscribe_running_assistant_turn_count()
@@ -1116,7 +1079,10 @@ impl MessageProcessor {
                 panic!("Initialize should be handled before initialized request dispatch");
             }
             ClientRequest::ControlAcquire { params, .. } => {
-                let status = self.outgoing.control.acquire(connection_id, &params.token)?;
+                let status = self
+                    .outgoing
+                    .control
+                    .acquire(connection_id, &params.token)?;
                 self.thread_processor
                     .connection_initialized(
                         connection_id,
@@ -1134,13 +1100,13 @@ impl MessageProcessor {
                     codex_app_server_protocol::ControlAcquireResponse(status),
                 )))
             }
-            ClientRequest::ControlStatusRead { .. } => Ok(Some(
-                ClientResponsePayload::ControlStatusRead(
+            ClientRequest::ControlStatusRead { .. } => {
+                Ok(Some(ClientResponsePayload::ControlStatusRead(
                     codex_app_server_protocol::ControlStatusReadResponse(
                         self.outgoing.control.status()?,
                     ),
-                ),
-            )),
+                )))
+            }
             ClientRequest::ControlPendingList { params, .. } => Ok(Some(
                 self.outgoing.control_pending_list(params).await?.into(),
             )),
