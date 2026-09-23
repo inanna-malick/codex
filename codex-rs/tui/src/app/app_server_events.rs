@@ -529,6 +529,77 @@ impl App {
         request: ServerRequest,
     ) {
         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
+            if let Some(host) = app_server_client.host_dynamic_tools() {
+                match host.routing(params) {
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Forward => {
+                        if self.dynamic_tool_tasks.contains_key(request_id) {
+                            return;
+                        }
+                        let admission = crate::host_dynamic_tools::HostedCallAdmission::default();
+                        let settlement = match host
+                            .begin_cancellable_call(
+                                request_id.clone(),
+                                params,
+                                self.app_event_tx.clone(),
+                                admission.clone(),
+                            )
+                            .await
+                        {
+                            Ok(settlement) => settlement,
+                            Err(error) => {
+                                tracing::warn!(%error, "could not begin hosted tool call");
+                                self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                    request_id: request_id.clone(),
+                                    response: crate::host_dynamic_tools::infrastructure_failure(),
+                                });
+                                return;
+                            }
+                        };
+                        let request_id = request_id.clone();
+                        let task_request_id = request_id.clone();
+                        let params = params.clone();
+                        let task_params = params.clone();
+                        let source_thread_id = params.thread_id.clone();
+                        let app_event_tx = self.app_event_tx.clone();
+                        let task = tokio::spawn(async move {
+                            let _admission_guard = admission.cancel_on_drop();
+                            let response = host
+                                .call_with_admission(&task_params, &admission)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    tracing::warn!(%error, "hosted tool call failed");
+                                    crate::host_dynamic_tools::infrastructure_failure()
+                                });
+                            app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                request_id,
+                                response,
+                            });
+                        });
+                        self.dynamic_tool_tasks.insert(
+                            task_request_id,
+                            super::DynamicToolTask {
+                                source_thread_id,
+                                params,
+                                settlement,
+                                pending_input: Default::default(),
+                                cancellation_task: None,
+                                task,
+                            },
+                        );
+                        return;
+                    }
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Reject => {
+                        self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                            request_id: request_id.clone(),
+                            response: crate::dynamic_tools::failure_response(
+                                "hosted tool call is not authorized for this thread or arguments",
+                            ),
+                        });
+                        return;
+                    }
+                    crate::host_dynamic_tools::HostDynamicToolRouting::Unregistered => {}
+                }
+            }
             if self.dynamic_tool_tasks.contains_key(request_id)
                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
                     && !app_server_client.uses_embedded_app_server())
