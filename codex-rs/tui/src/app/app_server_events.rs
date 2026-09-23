@@ -243,8 +243,11 @@ impl App {
         }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
-                if let Some((_, task)) = self.dynamic_tool_tasks.remove(&notification.request_id) {
-                    task.abort();
+                if let Some(mut entry) = self.dynamic_tool_tasks.remove(&notification.request_id) {
+                    entry.task.abort();
+                    if let Some(task) = entry.cancellation_task.take() {
+                        task.abort();
+                    }
                 }
                 let notification_thread_id =
                     codex_protocol::ThreadId::from_string(&notification.thread_id).ok();
@@ -570,6 +573,7 @@ impl App {
                     .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
                     .is_none_or(|thread_id| app_server_client.task_tools_available(thread_id));
             let params = params.clone();
+            let task_params = params.clone();
             let mut thread_start_params =
                 crate::app_server_session::thread_start_params_from_config(
                     &self.config,
@@ -583,7 +587,7 @@ impl App {
             let task = tokio::spawn(async move {
                 let response = crate::dynamic_tools::execute(
                     request_handle,
-                    params,
+                    task_params,
                     thread_start_params,
                     status_updates,
                     Some(&app_event_tx),
@@ -608,8 +612,17 @@ impl App {
                     response,
                 });
             });
-            self.dynamic_tool_tasks
-                .insert(task_request_id, (source_thread_id, task));
+            self.dynamic_tool_tasks.insert(
+                task_request_id,
+                super::DynamicToolTask {
+                    source_thread_id,
+                    params,
+                    settlement: None,
+                    pending_input: Default::default(),
+                    cancellation_task: None,
+                    task,
+                },
+            );
             return;
         }
 

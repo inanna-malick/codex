@@ -152,6 +152,7 @@ mod goal_display;
 mod goal_files;
 mod history_cell;
 mod hooks_rpc;
+mod host_dynamic_tools;
 mod ide_context;
 mod inline_visualization;
 pub(crate) mod insert_history;

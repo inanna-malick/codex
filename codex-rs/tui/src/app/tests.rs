@@ -5593,7 +5593,7 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
     );
     app.dynamic_tool_tasks.insert(
         AppServerRequestId::Integer(123),
-        (
+        super::DynamicToolTask::test(
             side_thread_id.to_string(),
             tokio::spawn(std::future::pending::<()>()),
         ),

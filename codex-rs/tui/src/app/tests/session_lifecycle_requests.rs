@@ -1920,7 +1920,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
 
     app.dynamic_tool_tasks.insert(
         AppServerRequestId::Integer(105),
-        (thread_id, tokio::spawn(std::future::pending::<()>())),
+        super::DynamicToolTask::test(thread_id, tokio::spawn(std::future::pending::<()>())),
     );
     assert_matches!(
         app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst)
