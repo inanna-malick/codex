@@ -75,6 +75,7 @@ use codex_utils_oss::get_default_model_for_oss_provider;
 use color_eyre::eyre::WrapErr;
 use crossterm::SynchronizedUpdate;
 use cwd_prompt::CwdPromptAction;
+use host_dynamic_tools::HostDynamicTools;
 pub use session_archive_commands::DeleteConfirmation;
 pub use session_archive_commands::SessionArchiveAction;
 pub use session_archive_commands::SessionArchiveCommandOptions;
@@ -1225,8 +1226,23 @@ async fn run_ratatui_app(
             session_log::log_session_end();
             return Err(err.into());
         }
-    }
-    .with_remote_cwd_override(remote_cwd_override.clone());
+    };
+    let host_dynamic_tools = match HostDynamicTools::connect_with_state(
+        cli.host_dynamic_tools_socket.clone(),
+        state_db.clone(),
+    )
+    .await
+    {
+        Ok(host) => host,
+        Err(err) => {
+            shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard).await;
+            session_log::log_session_end();
+            return Err(err);
+        }
+    };
+    let app_server_session = app_server_session
+        .with_remote_cwd_override(remote_cwd_override.clone())
+        .with_host_dynamic_tools(host_dynamic_tools.clone());
     if let Some(provider) = manually_selected_oss_provider.as_deref() {
         match startup_draft
             .run_until(
@@ -1785,6 +1801,7 @@ async fn run_ratatui_app(
                 AppServerSession::new(app_server, app_server_target.thread_params_mode())
                     .with_local_codex_home(&config.codex_home)
                     .with_remote_cwd_override(remote_cwd_override.clone())
+                    .with_host_dynamic_tools(host_dynamic_tools.clone())
             }
             Ok(Err(err)) => {
                 terminal_restore_guard.restore_silently();
@@ -1865,7 +1882,8 @@ async fn run_ratatui_app(
                 )
                 .await?;
                 app_server = AppServerSession::new(client, app_server_target.thread_params_mode())
-                    .with_local_codex_home(&config.codex_home);
+                    .with_local_codex_home(&config.codex_home)
+                    .with_host_dynamic_tools(host_dynamic_tools.clone());
             }
             #[cfg(target_os = "windows")]
             {
