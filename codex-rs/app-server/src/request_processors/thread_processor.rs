@@ -5240,11 +5240,13 @@ impl ThreadRequestProcessor {
             .await?
         };
 
-        let snapshot = if after_call_id.is_some() {
+        let snapshot = if after_call_id.is_some() && !require_client_readiness {
             ForkSnapshot::CompletedCallBoundary
         } else if through_call_id.is_some() {
             ForkSnapshot::InvocationBoundary
         } else {
+            // A destination waiting for its own assignment must not present
+            // the source's unfinished model turn as work to continue.
             ForkSnapshot::Interrupted
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {

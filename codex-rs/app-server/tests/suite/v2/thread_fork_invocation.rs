@@ -454,5 +454,32 @@ async fn destination_forks_completed_invocation(mode: ThreadHistoryMode) -> Resu
                 || item.to_string().contains("<turn_aborted>")
         }));
     }
+    let id = destination
+        .send_thread_fork_request(ThreadForkParams {
+            require_client_readiness: true,
+            ..params
+        })
+        .await?;
+    let child: ThreadForkResponse = destination.read_response(id).await?;
+    let id = destination
+        .send_request("thread/ready", Some(json!({"threadId": child.thread.id})))
+        .await?;
+    let _: serde_json::Value = destination.read_response(id).await?;
+    let request = infer(
+        &mut destination,
+        &server,
+        &child.thread.id,
+        "child assignment",
+    )
+    .await?;
+    let rendered = request
+        .input()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("real result with final bindings"));
+    assert!(rendered.contains("<turn_aborted>"));
+    assert!(!rendered.contains("parent advanced beyond the boundary"));
     Ok(())
 }

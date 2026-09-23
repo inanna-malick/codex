@@ -4436,6 +4436,8 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
     let session_meta = SessionMeta {
         creator_user_id: None,
         creator_account_id: None,
+        cache_affinity: None,
+        require_client_readiness: false,
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
