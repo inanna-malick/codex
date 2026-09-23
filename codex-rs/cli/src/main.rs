@@ -1,3 +1,4 @@
+use clap::ArgGroup;
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;
@@ -57,6 +58,9 @@ mod daemon_install;
 mod daemon_telemetry;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
+#[cfg(test)]
+#[path = "destination_fork_tests.rs"]
+mod destination_fork_tests;
 mod doctor;
 #[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
@@ -413,6 +417,7 @@ struct DeleteCommand {
 }
 
 #[derive(Debug, Parser)]
+#[command(group(ArgGroup::new("fork_boundary").args(["through_call", "after_call"])))]
 struct ForkCommand {
     /// Conversation/session id (UUID). When provided, forks this session.
     /// If omitted, use --last to pick the most recent recorded session.
@@ -426,6 +431,18 @@ struct ForkCommand {
     /// Show all sessions (disables cwd filtering and shows CWD column).
     #[arg(long = "all", default_value_t = false)]
     all: bool,
+
+    /// Run the child in this process's execution environment, without daemon reuse.
+    #[arg(long = "destination-local", requires_all = ["host_dynamic_tools_socket", "fork_boundary"])]
+    destination_local: bool,
+
+    /// Inherit through this recorded hosted invocation, excluding its subsequent result.
+    #[arg(long = "through-call", value_name = "CALL_ID")]
+    through_call: Option<String>,
+
+    /// Inherit through the actual recorded result and its complete tool-call batch.
+    #[arg(long = "after-call", value_name = "CALL_ID")]
+    after_call: Option<String>,
 
     #[clap(flatten)]
     remote: InteractiveRemoteOptions,
@@ -1539,6 +1556,9 @@ async fn cli_main(
             session_id,
             last,
             all,
+            destination_local,
+            through_call,
+            after_call,
             remote,
             config_overrides,
         })) => {
@@ -1549,6 +1569,9 @@ async fn cli_main(
                 session_id,
                 last,
                 all,
+                destination_local,
+                through_call,
+                after_call,
                 config_overrides,
             );
             let exit_info = run_interactive_tui(
@@ -2607,6 +2630,9 @@ fn finalize_fork_interactive(
     session_id: Option<String>,
     last: bool,
     show_all: bool,
+    destination_local: bool,
+    through_call: Option<String>,
+    after_call: Option<String>,
     mut fork_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so fork shares the same
@@ -2623,6 +2649,9 @@ fn finalize_fork_interactive(
     interactive.fork_last = last;
     interactive.fork_session_id = fork_session_id;
     interactive.fork_show_all = show_all;
+    interactive.fork_destination_local = destination_local;
+    interactive.fork_through_call = through_call;
+    interactive.fork_after_call = after_call;
 
     // Merge fork-scoped flags and overrides with highest precedence.
     merge_interactive_cli_flags(&mut interactive, fork_cli);
@@ -2871,6 +2900,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            ..
         } = cli;
         interactive
             .shared
@@ -2908,6 +2938,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            ..
         } = cli;
         interactive
             .shared
@@ -2917,6 +2948,9 @@ mod tests {
             session_id,
             last,
             all,
+            destination_local,
+            through_call,
+            after_call,
             remote: _,
             config_overrides: fork_cli,
         }) = subcommand.expect("fork present")
@@ -2925,7 +2959,17 @@ mod tests {
         };
         let SessionTuiCli(fork_cli) = fork_cli;
 
-        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+        finalize_fork_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all,
+            destination_local,
+            through_call,
+            after_call,
+            fork_cli,
+        )
     }
 
     fn finalize_exec_from_args(args: &[&str]) -> ExecCli {
@@ -2952,6 +2996,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            ..
         } = cli;
 
         let Subcommand::Archive(SessionArchiveCommand {
@@ -4137,6 +4182,27 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork", "--all"].as_ref());
         assert!(interactive.fork_picker);
         assert!(interactive.fork_show_all);
+    }
+
+    #[test]
+    fn destination_fork_flags_reach_tui() {
+        let interactive = finalize_fork_from_args(
+            [
+                "codex",
+                "fork",
+                "source-uuid",
+                "--destination-local",
+                "--after-call",
+                "call_1",
+                "--host-dynamic-tools-socket",
+                "/tmp/host.sock",
+            ]
+            .as_ref(),
+        );
+
+        assert!(interactive.fork_destination_local);
+        assert_eq!(interactive.fork_after_call.as_deref(), Some("call_1"));
+        assert_eq!(interactive.fork_through_call, None);
     }
 
     #[test]

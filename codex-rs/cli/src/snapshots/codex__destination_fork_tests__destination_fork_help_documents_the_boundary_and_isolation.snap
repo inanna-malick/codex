@@ -1,6 +1,5 @@
 ---
 source: cli/src/destination_fork_tests.rs
-assertion_line: 63
 expression: "help.to_string().lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
 ---
 Fork a previous interactive session (picker by default; use --last to fork the
@@ -17,6 +16,12 @@ Arguments:
           Optional user prompt to start the session
 
 Options:
+      --last
+          Fork the most recent session without showing the picker
+
+      --all
+          Show all sessions (disables cwd filtering and shows CWD column)
+
   -c, --config <key=value>
           Override a configuration value that would otherwise be loaded from
           `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override
@@ -34,6 +39,10 @@ Options:
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
 
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c
+          features.<name>=false`
+
       --through-call <CALL_ID>
           Inherit through this recorded hosted invocation, excluding its
           subsequent result
@@ -41,16 +50,6 @@ Options:
       --after-call <CALL_ID>
           Inherit through the actual recorded result and its complete tool-call
           batch
-
-      --disable <FEATURE>
-          Disable a feature (repeatable). Equivalent to `-c
-          features.<name>=false`
-
-      --last
-          Fork the most recent session without showing the picker
-
-      --all
-          Show all sessions (disables cwd filtering and shows CWD column)
 
       --remote <ADDR>
           Connect the TUI to a remote app server endpoint.
@@ -133,6 +132,10 @@ Options:
           Disable alternate screen mode
 
           Runs the TUI in inline mode, preserving terminal scrollback history.
+
+      --no-daemon
+          Run without the shared background server, even if it is already
+          running
 
   -h, --help
           Print help (see a summary with '-h')
