@@ -24,13 +24,14 @@
       cargoToml = builtins.fromTOML (builtins.readFile ./codex-rs/Cargo.toml);
       cargoVersion = cargoToml.workspace.package.version;
 
-      # When building from a release commit the Cargo.toml already carries the
-      # real version (e.g. "0.101.0").  On the main branch it is the placeholder
-      # "0.0.0", so we fall back to a dev version derived from the flake source.
+      # Release commits carry their version in Cargo.toml. The main branch has
+      # the placeholder 0.0.0, but the model endpoint uses the client version
+      # to select its catalog. Use the current compatible release version for
+      # development builds so Sol and Luna receive their real model metadata.
       version =
         if cargoVersion != "0.0.0"
         then cargoVersion
-        else "0.0.0-dev+${self.shortRev or "dirty"}";
+        else "0.155.1";
     in
     {
       packages = forAllSystems (system:
