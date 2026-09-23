@@ -15,25 +15,29 @@ pub(super) struct CliFork {
 
 impl AppServerSession {
     pub(crate) fn with_cli_fork(mut self, cli: &Cli) -> Self {
+        self.cli_fork = CliFork::from_cli(cli);
+        self
+    }
+}
+
+impl CliFork {
+    fn from_cli(cli: &Cli) -> Self {
         let keys: Vec<_> = cli
             .config_overrides
             .raw_overrides
             .iter()
             .filter_map(|item| item.split_once('=').map(|(key, _)| key.trim()))
             .collect();
-        self.cli_fork = CliFork {
+        Self {
             destination_local: cli.fork_destination_local,
             through_call_id: cli.fork_through_call.clone(),
             after_call_id: cli.fork_after_call.clone(),
             override_model: cli.model.is_some() || keys.contains(&"model"),
             override_provider: cli.oss || keys.contains(&"model_provider"),
             override_effort: keys.contains(&"model_reasoning_effort"),
-        };
-        self
+        }
     }
-}
 
-impl CliFork {
     pub(super) fn configure(&self, params: &mut ThreadForkParams) {
         params.through_call_id = self.through_call_id.clone();
         params.after_call_id = self.after_call_id.clone();
@@ -61,3 +65,7 @@ impl CliFork {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cli_fork_tests.rs"]
+mod tests;

@@ -102,6 +102,8 @@ use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadReadyParams;
+use codex_app_server_protocol::ThreadReadyResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
@@ -442,6 +444,14 @@ impl AppServerSession {
             host_dynamic_tools: None,
             cli_fork: cli_fork::CliFork::default(),
         }
+    }
+
+    pub(crate) fn new_for_cli(
+        client: AppServerClient,
+        thread_params_mode: ThreadParamsMode,
+        cli: &crate::cli::Cli,
+    ) -> Self {
+        Self::new(client, thread_params_mode).with_cli_fork(cli)
     }
 
     pub(crate) fn with_host_dynamic_tools(
@@ -1067,6 +1077,29 @@ impl AppServerSession {
             self.thread_params_mode(),
         )
         .await?;
+        if cli_fork.destination_local {
+            let thread_id = started.session.thread_id;
+            if let Some(host) = &self.host_dynamic_tools {
+                host.attach_primary_with_input(thread_id, self.request_handle())
+                    .await?;
+            }
+            let request_id = self.next_request_id();
+            let ready: ThreadReadyResponse = self
+                .client
+                .request_typed(ClientRequest::ThreadReady {
+                    request_id,
+                    params: ThreadReadyParams {
+                        thread_id: thread_id.to_string(),
+                    },
+                })
+                .await
+                .map_err(|err| {
+                    bootstrap_request_error("thread/ready failed during TUI bootstrap", err)
+                })?;
+            if !ready.ready {
+                color_eyre::eyre::bail!("app server did not admit destination-local fork input");
+            }
+        }
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
         if self.task_tools_available(thread_id) {
             started.task_tools_available = true;

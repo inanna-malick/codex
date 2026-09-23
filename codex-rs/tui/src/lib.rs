@@ -1213,8 +1213,12 @@ async fn run_ratatui_app(
     launch_telemetry.record(&app_server_target, matches!(&startup_app_server, Ok(Ok(_))));
     let app_server_session = match startup_app_server {
         Ok(Ok(app_server)) => {
-            AppServerSession::new(app_server, app_server_target.thread_params_mode())
-                .with_local_codex_home(&initial_config.codex_home)
+            AppServerSession::new_for_cli(
+                app_server,
+                app_server_target.thread_params_mode(),
+                &cli,
+            )
+            .with_local_codex_home(&initial_config.codex_home)
         }
         Ok(Err(err)) => {
             terminal_restore_guard.restore_silently();
@@ -1798,7 +1802,11 @@ async fn run_ratatui_app(
             Ok(Ok(app_server)) => {
                 // A picker can replace the server; account reads belong to their original session.
                 startup_account = None;
-                AppServerSession::new(app_server, app_server_target.thread_params_mode())
+                AppServerSession::new_for_cli(
+                    app_server,
+                    app_server_target.thread_params_mode(),
+                    &cli,
+                )
                     .with_local_codex_home(&config.codex_home)
                     .with_remote_cwd_override(remote_cwd_override.clone())
                     .with_host_dynamic_tools(host_dynamic_tools.clone())
@@ -1881,7 +1889,11 @@ async fn run_ratatui_app(
                     embedded_network_policy.clone(),
                 )
                 .await?;
-                app_server = AppServerSession::new(client, app_server_target.thread_params_mode())
+                app_server = AppServerSession::new_for_cli(
+                    client,
+                    app_server_target.thread_params_mode(),
+                    &cli,
+                )
                     .with_local_codex_home(&config.codex_home)
                     .with_host_dynamic_tools(host_dynamic_tools.clone());
             }
