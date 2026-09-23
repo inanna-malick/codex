@@ -560,6 +560,43 @@ mod tests {
         jobs
     }
 
+    #[test]
+    fn parses_client_shaped_command_start_request() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "binding": {
+                "protocolVersion": codex_shoal_protocol::INPUT_CONTROL_PROTOCOL_VERSION,
+                "launchId": "launch",
+                "instanceId": "instance",
+                "generation": 1,
+                "nonce": "nonce"
+            },
+            "threadId": "thread",
+            "id": "command-1",
+            "command": {
+                "operation": "start",
+                "spec": {
+                    "argv": ["echo", "hello"],
+                    "directory": null,
+                    "environment": [],
+                    "memory": 268435456,
+                    "input": "ClosedInput"
+                }
+            }
+        }))
+        .expect("client-shaped command start request should deserialize");
+
+        match request.operation {
+            Operation::Start { spec } => {
+                assert_eq!(spec.argv, ["echo", "hello"]);
+                assert_eq!(spec.directory, None);
+                assert!(spec.environment.is_empty());
+                assert_eq!(spec.memory, 268435456);
+                assert!(matches!(spec.input, Input::Closed));
+            }
+            _ => panic!("expected Start operation"),
+        }
+    }
+
     fn output(jobs: &Jobs, stream: CommandExecOutputStream, bytes: &[u8], end_of_stream: bool) {
         assert!(jobs.output(&CommandExecOutputDeltaNotification {
             process_id: "test".into(),

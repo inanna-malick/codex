@@ -90,9 +90,13 @@ fn manifest_is_stable_machine_readable_compatibility_evidence() {
 fn command_and_workspace_boundaries_reject_unknown_wire_fields() {
     type Command = CommandRequest<serde_json::Value, String, serde_json::Value>;
     let command = serde_json::from_str::<Command>(
-        r#"{"binding":{"protocolVersion":5,"launchId":"launch","instanceId":"instance","generation":1,"nonce":"nonce"},"threadId":"thread-1","id":"job-2","operation":"cancel","extra":true}"#,
+        r#"{"binding":{"protocolVersion":6,"launchId":"launch","instanceId":"instance","generation":1,"nonce":"nonce"},"threadId":"thread-1","id":"job-2","command":{"operation":"cancel"},"extra":true}"#,
     );
     assert!(command.is_err());
+    let command = serde_json::from_str::<Command>(
+        r#"{"binding":{"protocolVersion":6,"launchId":"launch","instanceId":"instance","generation":1,"nonce":"nonce"},"threadId":"thread-1","id":"job-2","command":{"operation":"cancel"}}"#,
+    );
+    assert!(command.is_ok());
 
     let workspace = serde_json::from_str::<WorkspacePublicationRequest>(
         r#"{"binding":{"protocolVersion":5,"launchId":"launch","instanceId":"instance","generation":1,"nonce":"nonce"},"threadId":"thread-1","sequence":1,"operation":"begin","expectedIdentity":null}"#,

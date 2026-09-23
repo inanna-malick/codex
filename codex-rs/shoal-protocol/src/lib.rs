@@ -11,7 +11,7 @@ use sha2::Sha256;
 use std::num::NonZeroU64;
 
 pub const HOST_PROTOCOL_VERSION: u32 = 5;
-pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 5;
+pub const INPUT_CONTROL_PROTOCOL_VERSION: u32 = 6;
 
 pub const REGISTRATION_PATH: &str = "/v1/dynamic-tools/registration";
 pub const SESSION_PATH: &str = "/v1/dynamic-tools/session";
@@ -294,7 +294,7 @@ pub struct CommandRequest<Spec, Stream, Position> {
     pub binding: Binding,
     pub thread_id: String,
     pub id: String,
-    #[serde(flatten)]
+    #[serde(rename = "command")]
     pub operation: CommandOperation<Spec, Stream, Position>,
 }
 
