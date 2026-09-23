@@ -2695,6 +2695,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         web_search,
         no_alt_screen,
         no_daemon,
+        host_dynamic_tools_socket,
         prompt,
         mut config_overrides,
         ..
@@ -2716,6 +2717,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     }
     interactive.no_alt_screen |= no_alt_screen;
     interactive.no_daemon |= no_daemon;
+    if let Some(socket) = host_dynamic_tools_socket {
+        interactive.host_dynamic_tools_socket = Some(socket);
+    }
     if strict_config {
         interactive.strict_config = true;
     }
@@ -4203,6 +4207,13 @@ mod tests {
         assert!(interactive.fork_destination_local);
         assert_eq!(interactive.fork_after_call.as_deref(), Some("call_1"));
         assert_eq!(interactive.fork_through_call, None);
+        assert_eq!(
+            interactive
+                .host_dynamic_tools_socket
+                .as_ref()
+                .map(|socket| socket.as_path()),
+            Some(std::path::Path::new("/tmp/host.sock"))
+        );
     }
 
     #[test]
