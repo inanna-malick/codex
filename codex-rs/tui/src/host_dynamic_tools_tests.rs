@@ -7,6 +7,7 @@ use codex_app_server_client::RemoteAppServerConnectArgs;
 use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::ThreadStartParams;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -18,6 +19,34 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+
+#[tokio::test]
+async fn primary_host_tools_survive_thread_transport_configuration() -> color_eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket_path = directory.path().join("host.sock");
+    let (requests, task) = spawn_host(&socket_path, 1)?;
+    let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(&socket_path)?))
+        .await?
+        .expect("configured host");
+
+    for transport in [
+        crate::dynamic_tools_mcp::ThreadToolTransport::Disabled,
+        crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
+    ] {
+        let mut params = ThreadStartParams::default();
+        transport.configure(&mut params);
+        assert!(host.configure_primary_start(&mut params));
+        let tools = params.dynamic_tools.expect("host tools in thread start");
+        for hosted in &host.registration.dynamic_tools {
+            assert!(tools.contains(hosted));
+        }
+    }
+
+    assert_eq!(requests.recv()?.path, REGISTRATION_PATH);
+    task.join().expect("host thread")?;
+    Ok(())
+}
 
 async fn register_host_tool_completion(
     host: &HostDynamicTools,

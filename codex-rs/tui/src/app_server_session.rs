@@ -809,11 +809,11 @@ impl AppServerSession {
         if self.history_support == ThreadHistorySupport::LegacyOnly {
             params.history_mode = None;
         }
+        self.thread_tool_transport().configure(&mut params);
         let host_tools_required = self
             .host_dynamic_tools
             .as_ref()
             .is_some_and(|host| host.configure_primary_start(&mut params));
-        self.thread_tool_transport().configure(&mut params);
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
             request_thread_start_with_history_fallback(&request_handle, request_id, params)
@@ -1754,10 +1754,10 @@ pub(crate) async fn start_thread_with_request_handle_and_host(
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
     );
+    thread_tool_transport.configure(&mut params);
     let host_tools_required = host_dynamic_tools
         .as_ref()
         .is_some_and(|host| host.configure_primary_start(&mut params));
-    thread_tool_transport.configure(&mut params);
     let (response, _history_support, task_tools_available) =
         request_thread_start_with_history_fallback(&request_handle, request_id, params)
             .await
