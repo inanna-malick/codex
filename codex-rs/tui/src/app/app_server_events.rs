@@ -561,19 +561,28 @@ impl App {
                         let task_params = params.clone();
                         let source_thread_id = params.thread_id.clone();
                         let app_event_tx = self.app_event_tx.clone();
+                        let task_settlement = settlement.clone();
                         let task = tokio::spawn(async move {
                             let _admission_guard = admission.cancel_on_drop();
-                            let response = host
-                                .call_with_admission(&task_params, &admission)
-                                .await
-                                .unwrap_or_else(|error| {
+                            let result = host.call_with_admission(&task_params, &admission).await;
+                            if let Some(settlement) = task_settlement {
+                                match result {
+                                    Ok(response) => settlement.complete_from_call(response).await,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "hosted tool call transport failed");
+                                        settlement.transport_uncertain(error.to_string()).await;
+                                    }
+                                }
+                            } else {
+                                let response = result.unwrap_or_else(|error| {
                                     tracing::warn!(%error, "hosted tool call failed");
                                     crate::host_dynamic_tools::infrastructure_failure()
                                 });
-                            app_event_tx.send(AppEvent::DynamicToolCallCompleted {
-                                request_id,
-                                response,
-                            });
+                                app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                                    request_id,
+                                    response,
+                                });
+                            }
                         });
                         self.dynamic_tool_tasks.insert(
                             task_request_id,

@@ -59,6 +59,9 @@ mod unavailable_commands;
 
 #[path = "tests/history_hydration_tests.rs"]
 mod history_hydration_tests;
+#[cfg(unix)]
+#[path = "tests/host_input.rs"]
+mod host_input;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
@@ -3927,6 +3930,7 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
         ServerRequest::DynamicToolCall {
             request_id: AppServerRequestId::Integer(99),
             params: codex_app_server_protocol::DynamicToolCallParams {
+                context_call_id: None,
                 thread_id: quiet_thread_id.to_string(),
                 turn_id: "turn-quiet".to_string(),
                 call_id: "call-quiet".to_string(),

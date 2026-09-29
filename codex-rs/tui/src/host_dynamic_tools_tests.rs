@@ -260,28 +260,27 @@ pub(crate) fn spawn_host_with_input(
     )
 }
 
-pub(crate) fn spawn_cancellable_host(
-    socket_path: &std::path::Path,
-) -> std::io::Result<(
-    mpsc::Receiver<RecordedRequest>,
-    std::thread::JoinHandle<std::io::Result<()>>,
-)> {
-    spawn_cancellable_host_configured(socket_path, None)
+#[derive(Clone, Copy)]
+pub(crate) enum HostedTerminalSource {
+    Cancellation,
+    CallResponse,
 }
 
 pub(crate) fn spawn_cancellable_host_with_input(
     socket_path: &std::path::Path,
     input_control_socket: std::path::PathBuf,
+    terminal_source: HostedTerminalSource,
 ) -> std::io::Result<(
     mpsc::Receiver<RecordedRequest>,
     std::thread::JoinHandle<std::io::Result<()>>,
 )> {
-    spawn_cancellable_host_configured(socket_path, Some(input_control_socket))
+    spawn_cancellable_host_configured(socket_path, Some(input_control_socket), terminal_source)
 }
 
 fn spawn_cancellable_host_configured(
     socket_path: &std::path::Path,
     input_control_socket: Option<std::path::PathBuf>,
+    terminal_source: HostedTerminalSource,
 ) -> std::io::Result<(
     mpsc::Receiver<RecordedRequest>,
     std::thread::JoinHandle<std::io::Result<()>>,
@@ -292,7 +291,11 @@ fn spawn_cancellable_host_configured(
     let cancellation_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let task = std::thread::spawn(move || {
         let mut handlers = Vec::new();
-        for _ in 0..6 {
+        let request_count = match terminal_source {
+            HostedTerminalSource::Cancellation => 6,
+            HostedTerminalSource::CallResponse => 4,
+        };
+        for _ in 0..request_count {
             let (stream, _) = listener.accept()?;
             let request_tx = request_tx.clone();
             let cancelled = cancelled.clone();
@@ -357,7 +360,9 @@ fn spawn_cancellable_host_configured(
                             }),
                         };
                         write_response(&stream, "200 OK", &serde_json::to_vec(&response)?)?;
-                        if attempt < 2 {
+                        if attempt < 2
+                            && matches!(terminal_source, HostedTerminalSource::Cancellation)
+                        {
                             return Ok(());
                         }
                         let (lock, changed) = &*cancelled;

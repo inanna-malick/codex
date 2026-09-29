@@ -542,7 +542,10 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
         app.local_settings.clone(),
         Some(displayed),
         /*remote_cwd*/ None,
-        session.thread_tool_transport(),
+        ReconnectTooling {
+            task_tools: session.thread_tool_transport(),
+            host_dynamic_tools: None,
+        },
         ReconnectPresentation::Conversation,
     )
     .await?;

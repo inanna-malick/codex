@@ -770,10 +770,8 @@ pub(crate) fn infrastructure_failure() -> DynamicToolCallResponse {
 mod tests;
 
 #[cfg(all(test, unix))]
-pub(crate) use tests::spawn_cancellable_host;
+pub(crate) use tests::HostedTerminalSource;
 #[cfg(all(test, unix))]
 pub(crate) use tests::spawn_cancellable_host_with_input;
-#[cfg(test)]
-pub(crate) use tests::spawn_host;
 #[cfg(all(test, unix))]
 pub(crate) use tests::spawn_host_with_input;

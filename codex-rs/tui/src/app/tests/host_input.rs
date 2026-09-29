@@ -3,6 +3,7 @@ use super::session_lifecycle_requests::make_history_test_app;
 use super::session_lifecycle_requests::start_recording_app_server;
 use crate::app_event::AppEvent;
 use crate::host_dynamic_tools::HostDynamicTools;
+use crate::host_dynamic_tools::HostedTerminalSource;
 use crate::host_dynamic_tools::spawn_cancellable_host_with_input;
 use crate::host_dynamic_tools::spawn_host_with_input;
 use codex_app_server_client::AppServerEvent;
@@ -82,7 +83,10 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
     let thread = started.session.thread_id;
     let _registration = callbacks.recv()?;
     let attachment = callbacks.recv()?;
-    assert_eq!(attachment.body["protocolVersion"], json!(3));
+    assert_eq!(
+        attachment.body["protocolVersion"],
+        json!(codex_shoal_protocol::HOST_PROTOCOL_VERSION)
+    );
     assert_eq!(attachment.body["threadId"], json!(thread));
     assert_eq!(attachment.body["inputControlSocket"], json!(input));
     assert_eq!(attachment.body["launchId"], json!("launch-test"));
@@ -94,7 +98,7 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
             .is_some_and(|value| !value.is_empty())
     );
     let binding = json!({
-        "protocolVersion": 5,
+        "protocolVersion": codex_shoal_protocol::INPUT_CONTROL_PROTOCOL_VERSION,
         "launchId": attachment.body["launchId"],
         "instanceId": attachment.body["applicationInstanceId"],
         "generation": attachment.body["sessionGeneration"],
@@ -203,6 +207,17 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
                         && record["payload"]["item"]["type"] == "UserMessage"
                         && record["payload"]["item"]["client_id"] == "update-7"
                 })
+                // Input presentation precedes inference. Keep the server alive
+                // until the configured response mock has actually been called.
+                && provider
+                    .received_requests()
+                    .await
+                    .is_some_and(|requests| {
+                        requests.iter().any(|request| {
+                            request.method.as_str() == "POST"
+                                && request.url.path().ends_with("/responses")
+                        })
+                    })
             {
                 return Ok::<_, std::io::Error>(());
             }
@@ -225,13 +240,25 @@ async fn hosted_input_reaches_existing_app_server_and_rejects_other_threads()
 #[tokio::test]
 async fn hosted_actor_input_reconciles_early_not_sleeping_before_admission()
 -> color_eyre::Result<()> {
+    check_hosted_actor_input_settlement(HostedTerminalSource::Cancellation).await
+}
+
+#[tokio::test]
+async fn hosted_actor_input_releases_when_only_call_response_proves_terminal()
+-> color_eyre::Result<()> {
+    check_hosted_actor_input_settlement(HostedTerminalSource::CallResponse).await
+}
+
+async fn check_hosted_actor_input_settlement(
+    terminal_source: HostedTerminalSource,
+) -> color_eyre::Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     let directory = tempfile::tempdir()?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
     let host_socket = directory.path().join("host.sock");
     let input_socket = directory.path().join("input.sock");
     let (host_requests, host_task) =
-        spawn_cancellable_host_with_input(&host_socket, input_socket.clone())?;
+        spawn_cancellable_host_with_input(&host_socket, input_socket.clone(), terminal_source)?;
     let host = HostDynamicTools::connect(Some(AbsolutePathBuf::from_absolute_path(host_socket)?))
         .await?
         .expect("configured host");
@@ -249,6 +276,10 @@ async fn hosted_actor_input_reconciles_early_not_sleeping_before_admission()
         /*log_db*/ None,
         state_db,
         Arc::clone(&app.environment_manager),
+        codex_app_server_client::EmbeddedNetworkPolicy::load(
+            &codex_config::LoaderOverrides::without_managed_config_for_tests(),
+        )
+        .await,
         |mut args| {
             args.experimental_api = false;
             codex_app_server_client::InProcessAppServerClient::start(args)
@@ -314,7 +345,7 @@ async fn hosted_actor_input_reconciles_early_not_sleeping_before_admission()
     assert_eq!(call.path, "/v1/dynamic-tools/call");
 
     let binding = json!({
-        "protocolVersion": 5,
+        "protocolVersion": codex_shoal_protocol::INPUT_CONTROL_PROTOCOL_VERSION,
         "launchId": attachment.body["launchId"],
         "instanceId": attachment.body["applicationInstanceId"],
         "generation": attachment.body["sessionGeneration"],
@@ -384,21 +415,33 @@ async fn hosted_actor_input_reconciles_early_not_sleeping_before_admission()
         panic!("expected original dynamic-tool completion")
     };
     assert_eq!(completed_id, request_id);
-    for expected_attempt in 2..=3 {
-        let retry = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
-            loop {
-                if let Ok(request) = host_requests.try_recv() {
-                    break request;
+    assert_eq!(
+        app.dynamic_tool_tasks[&request_id]
+            .settlement
+            .as_ref()
+            .expect("hosted call")
+            .terminal_response()
+            .await,
+        Some(response.clone()),
+        "completion must update the retained settlement before UI resolution",
+    );
+    if matches!(terminal_source, HostedTerminalSource::Cancellation) {
+        for expected_attempt in 2..=3 {
+            let retry = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+                loop {
+                    if let Ok(request) = host_requests.try_recv() {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        assert_eq!(
-            retry.path, "/v1/dynamic-tools/cancel",
-            "attempt {expected_attempt} must re-observe the exact actor evaluation"
-        );
-        assert_eq!(retry.body, first_cancel.body);
+            })
+            .await?;
+            assert_eq!(
+                retry.path, "/v1/dynamic-tools/cancel",
+                "attempt {expected_attempt} must re-observe the exact actor evaluation"
+            );
+            assert_eq!(retry.body, first_cancel.body);
+        }
     }
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
@@ -460,7 +503,7 @@ async fn occupied_input_socket_preserves_tui_thread_and_queue_attachment() -> co
     let attachment = callbacks.recv()?;
     assert_eq!(
         attachment.body,
-        json!({"protocolVersion":3,"threadId":started.session.thread_id})
+        json!({"protocolVersion":codex_shoal_protocol::HOST_PROTOCOL_VERSION,"threadId":started.session.thread_id})
     );
     // The foreign socket still owns its path; startup did not unlink it.
     let connection = tokio::net::UnixStream::connect(input).await?;
