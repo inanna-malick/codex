@@ -7,6 +7,7 @@ use sha1::digest::Output;
 use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -321,8 +322,20 @@ impl TurnDiffTracker {
             .set(self.rendered_diff_count.get() + 1);
 
         // Git diff paths always use `/`, even when the displayed target path is Windows-native.
-        let left_display = self.display_path(left_path).replace('\\', "/");
-        let right_display = self.display_path(right_path).replace('\\', "/");
+        let left_display = self.display_path(left_path);
+        let left_display =
+            if left_path.path.infer_path_convention() == Some(PathConvention::Windows) {
+                left_display.replace('\\', "/")
+            } else {
+                left_display
+            };
+        let right_display = self.display_path(right_path);
+        let right_display =
+            if right_path.path.infer_path_convention() == Some(PathConvention::Windows) {
+                right_display.replace('\\', "/")
+            } else {
+                right_display
+            };
         let left_oid = left_content.map_or_else(
             || ZERO_OID.to_string(),
             |content| git_blob_oid(content.as_bytes()),
