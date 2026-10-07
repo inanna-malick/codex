@@ -194,8 +194,32 @@ pub async fn unified_diff_from_chunks_with_context(
         new_contents,
     } = derive_new_contents_from_chunks(path, chunks, fs, /*follow_symlinks*/ true, sandbox)
         .await?;
-    let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
-    let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
+    let original_lines = original_contents.split_inclusive('\n').collect::<Vec<_>>();
+    let new_lines = new_contents.split_inclusive('\n').collect::<Vec<_>>();
+    let diff_config = TextDiff::configure();
+    let text_diff = diff_config.diff_slices(&original_lines, &new_lines);
+    let mut unified = String::new();
+    for hunk in text_diff
+        .unified_diff()
+        .context_radius(context)
+        .iter_hunks()
+    {
+        unified.push_str(&format!("{}\n", hunk.header()));
+        for change in hunk.iter_changes() {
+            let prefix = match change.tag() {
+                similar::ChangeTag::Equal => ' ',
+                similar::ChangeTag::Delete => '-',
+                similar::ChangeTag::Insert => '+',
+            };
+            let value = change.value();
+            unified.push(prefix);
+            unified.push_str(value);
+            if !value.ends_with('\n') {
+                unified.push_str("\n\\ No newline at end of file\n");
+            }
+        }
+    }
+    let unified_diff = unified;
     Ok(ApplyPatchFileUpdate {
         unified_diff,
         original_content: original_contents,
