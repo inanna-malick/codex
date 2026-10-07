@@ -43,6 +43,10 @@ use codex_protocol::protocol::MultiAgentVersion;
 
 const MAX_ROOT_MESSAGES: usize = 16;
 
+#[cfg(test)]
+#[path = "user_authorization_source_tests.rs"]
+mod source_tests;
+
 impl LocalAgentControl {
     /// Returns bounded root conversation and authorization state for a MultiAgent V2 worker.
     pub(crate) async fn root_user_authorization(
