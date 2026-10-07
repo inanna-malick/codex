@@ -3410,3 +3410,194 @@ fn text_only_items_count_decoded_content() {
 
     assert_eq!(estimated, "Hello, \"world\"!\nこんにちは".len() as i64);
 }
+
+// A corrected omitted source must not borrow an earlier version's text.
+mod source_version_recovery {
+    use super::super::ContextManager;
+    use codex_history::CodexHarnessMetadata;
+    use codex_history::GuardianHistoryCheckpoint;
+    use codex_history::ResponseItemEnvelope;
+    use codex_history::RetainedContext;
+    use codex_history::RetainedContextEntry;
+    use codex_history::RetainedInputSource;
+    use codex_history::RetainedSource;
+    use codex_history::RetainedUserMessage;
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+    use codex_protocol::models::ResponseItem;
+    use codex_utils_output_truncation::TruncationPolicy;
+
+    fn original(text: &str, source: RetainedSource) -> ResponseItemEnvelope {
+        ResponseItemEnvelope {
+            item: ResponseItem::Message {
+                id: Some(ResponseItemId::from_server(source.id.message_id.clone())),
+                role: "user".to_owned(),
+                content: vec![ContentItem::InputText {
+                    text: text.to_owned(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: Some(
+                    InternalChatMessageMetadataPassthrough {
+                        turn_id: Some(source.id.turn_id.clone()),
+                        ..Default::default()
+                    },
+                ),
+            },
+            metadata: Some(CodexHarnessMetadata {
+                user_input_order: Some(0),
+                retained_source: Some(source),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn record_version(context: &mut RetainedContext, text: &str) -> RetainedSource {
+        context
+            .record_user_message(
+                RetainedUserMessage {
+                    message_id: Some("corrected-source".to_owned()),
+                    turn_id: "same-turn".to_owned(),
+                    text: text.to_owned(),
+                    complete: true,
+                    phase: None,
+                    origin: codex_history::UserInputOrigin::User,
+                },
+                RetainedInputSource::Local(Some(0)),
+            )
+            .expect("known original has a host version")
+    }
+
+    #[test]
+    fn corrected_omitted_excerpt_recovers_its_own_host_version() {
+        let mut context = RetainedContext::default();
+        let old_text = "Original instruction: keep the old choice.";
+        let new_text = format!(
+            "Corrected instruction: revoke the old choice. {}",
+            "x".repeat(20_000)
+        );
+        let old_source = record_version(&mut context, old_text);
+        let new_source = record_version(&mut context, &new_text);
+        assert_ne!(old_source.revision, new_source.revision);
+        assert!(!new_source.complete);
+        let entry = context.ordered_entries().next().unwrap().1;
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            panic!("user source");
+        };
+        assert!(message.text.is_empty());
+        assert_eq!(context.source(entry), Some(new_source.clone()));
+        let checkpoint = GuardianHistoryCheckpoint(vec![
+            original(old_text, old_source),
+            original(&new_text, new_source.clone()),
+        ]);
+        let mut history = ContextManager::new();
+        history.restore_review_context(Some(&context), Some(&checkpoint), None);
+        let recovered = history.retained_context();
+        let (order, entry) = recovered.ordered_entries().next().unwrap();
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            panic!("user source");
+        };
+        assert!(
+            message
+                .text
+                .starts_with("Corrected instruction: revoke the old choice.")
+        );
+        assert!(!message.complete);
+        assert_eq!(order, codex_history::RetainedContextOrder::Local(0));
+        assert_eq!(recovered.source(entry), Some(new_source));
+        assert!(!recovered.has_missing_user_messages());
+    }
+
+    #[test]
+    fn omitted_excerpt_does_not_recover_an_unavailable_current_version() {
+        let mut context = RetainedContext::default();
+        let old_source = record_version(&mut context, "Old instruction.");
+        let current = record_version(
+            &mut context,
+            &format!("New correction. {}", "x".repeat(20_000)),
+        );
+        let checkpoint = GuardianHistoryCheckpoint(vec![original("Old instruction.", old_source)]);
+        let mut history = ContextManager::new();
+        history.restore_review_context(Some(&context), Some(&checkpoint), None);
+        let retained = history.retained_context();
+        let entry = retained.ordered_entries().next().unwrap().1;
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            unreachable!()
+        };
+        assert!(message.text.is_empty());
+        assert!(!message.complete);
+        assert_eq!(retained.source(entry), Some(current));
+    }
+
+    #[test]
+    fn modern_json_expansion_omission_does_not_recover_a_stale_source_version() {
+        let mut captured = ContextManager::new();
+        let mut originals = Vec::new();
+        for text in [
+            "Old instruction.".to_owned(),
+            format!("Current restriction. {}", "\0".repeat(6_000)),
+        ] {
+            let mut envelope = ResponseItemEnvelope::new(ResponseItem::Message {
+                id: Some(ResponseItemId::from_server("escaped-source".to_owned())),
+                role: "user".to_owned(),
+                content: vec![ContentItem::InputText { text }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: Some(
+                    InternalChatMessageMetadataPassthrough {
+                        turn_id: Some("escaped-turn".to_owned()),
+                        content_item_kinds: Some(vec![codex_protocol::models::ContentItemKind(
+                            "user.text".to_owned(),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            });
+            envelope.metadata = Some(CodexHarnessMetadata {
+                user_input_order: Some(0),
+                ..Default::default()
+            });
+            captured.record_annotated_items(
+                std::slice::from_mut(&mut envelope),
+                TruncationPolicy::Tokens(10_000),
+            );
+            originals.push(envelope);
+        }
+        let first = originals[0]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .retained_source
+            .as_ref()
+            .unwrap();
+        let current = originals[1]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .retained_source
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_ne!(first.revision, current.revision);
+        assert!(first.complete && !current.complete);
+        let snapshot = captured.retained_context().clone();
+        let entry = snapshot.ordered_entries().next().unwrap().1;
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            unreachable!()
+        };
+        assert!(message.text.is_empty());
+        let checkpoint = GuardianHistoryCheckpoint(originals);
+        let mut restored = ContextManager::new();
+        restored.restore_review_context(Some(&snapshot), Some(&checkpoint), None);
+        let retained = restored.retained_context();
+        let (order, entry) = retained.ordered_entries().next().unwrap();
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            unreachable!()
+        };
+        // Its exact excerpt still exceeds JSON storage limits. Conservative omission
+        // is valid; borrowing the older, smaller instruction would misbind evidence.
+        assert!(message.text.is_empty());
+        assert!(!message.complete);
+        assert_eq!(order, codex_history::RetainedContextOrder::Local(0));
+        assert_eq!(retained.source(entry), Some(current));
+    }
+}

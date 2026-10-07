@@ -425,11 +425,29 @@ impl RetainedContext {
         &mut self,
         mut excerpt_for_id: impl FnMut(&str) -> Option<String>,
     ) {
+        self.recover_user_message_excerpts_from_source(|message, _| {
+            message.message_id.as_deref().and_then(&mut excerpt_for_id)
+        });
+    }
+
+    /// Supplies the retained host version when recovering an omitted excerpt.
+    /// A revision-bearing record must be recovered from that version of its source;
+    /// Legacy records without revisions can recover text without establishing
+    /// modern delivery proof.
+    pub fn recover_user_message_excerpts_from_source(
+        &mut self,
+        mut excerpt_for_source: impl FnMut(
+            &RetainedUserMessage,
+            Option<&RetainedSource>,
+        ) -> Option<String>,
+    ) {
         for entry in &mut self.user_messages {
+            let source = entry.source(RetainedSourceRole::User);
             let message = &mut entry.value;
             if message.text.is_empty()
                 && !message.complete
-                && let Some(text) = message.message_id.as_deref().and_then(&mut excerpt_for_id)
+                && message.message_id.is_some()
+                && let Some(text) = excerpt_for_source(message, source.as_ref())
             {
                 message.text = text;
                 message.bound();
