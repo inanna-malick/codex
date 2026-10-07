@@ -591,7 +591,7 @@ fn tracker_diff_normalizes_windows_convention_separators() {
         Some(codex_utils_path_uri::PathConvention::Windows)
     );
     let tracked_path = TrackedPath::new("", &path_uri);
-    let tracker = tracker_with_root(std::path::Path::new("/unused"));
+    let tracker = TurnDiffTracker::new();
     let diff = tracker
         .render_diff(
             &tracked_path,
