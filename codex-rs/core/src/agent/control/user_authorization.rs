@@ -148,14 +148,20 @@ impl LocalAgentControl {
                     let text = if message.text.is_empty() && !message.complete {
                         // Older records may omit a large instruction. Recover that exact
                         // source while it remains available in the parent context.
-                        let original = message.message_id.as_deref().and_then(|id| {
-                            root_history
-                                .raw_items()
-                                .chain(root_history.guardian_history_items().into_iter().flatten())
-                                .find(|item| {
-                                    item.id().is_some_and(|item_id| item_id.as_str() == id)
-                                })
-                        });
+                        let source = retained_context.source(entry);
+                        let checkpoint = root_history.guardian_history_checkpoint();
+                        let originals = root_history.annotated_items().iter().chain(
+                            checkpoint
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|checkpoint| checkpoint.0.iter()),
+                        );
+                        let original =
+                            crate::context_manager::ContextManager::retained_original_user_message(
+                                message,
+                                source.as_ref(),
+                                originals,
+                            );
                         let Some(TurnItem::UserMessage(original)) =
                             original.and_then(parse_turn_item)
                         else {
