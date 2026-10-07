@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
@@ -217,9 +218,11 @@ impl LocalAgentControl {
         let mut missing_assistant_context = retained_context.has_omitted_assistant_messages();
         // Prefer a renderable retained original over a shortened checkpoint copy.
         // Otherwise preserve the bounded live evidence, including confirmed messaging sends.
-        let live_assistant_messages = root_history
+        let mut seen_sources = HashSet::new();
+        let mut live_assistant_messages = root_history
             .annotated_items()
             .iter()
+            .rev()
             .filter(|envelope| {
                 !envelope
                     .metadata
@@ -232,6 +235,11 @@ impl LocalAgentControl {
                     .item
                     .id()
                     .map(codex_protocol::ResponseItemId::as_str);
+                // Persisted originals can be replayed repeatedly. Keep the latest
+                // eligible copy once; anonymous deliveries remain separate occurrences.
+                if id.is_some_and(|id| !seen_sources.insert(id)) {
+                    return None;
+                }
                 let retained = reconciled.ordered_entries().find_map(|(order, entry)| {
                     let RetainedContextEntry::AssistantMessage(message) = entry else {
                         return None;
@@ -259,6 +267,7 @@ impl LocalAgentControl {
                 Some((id, order, message))
             })
             .collect::<Vec<_>>();
+        live_assistant_messages.reverse();
         let mut assistant_messages = reconciled
             .ordered_entries()
             .filter_map(|(order, entry)| {
