@@ -111,3 +111,50 @@ fn realtime_user_verification_notice_excludes_request_payload() {
         )),
     );
 }
+
+#[tokio::test]
+async fn citation_contained_plan_does_not_replace_the_completed_visible_plan() {
+    let text = "<proposed_plan>\nvisible step\n</proposed_plan>\n<oai-mem-citation>\n<proposed_plan>\ncitation example\n</proposed_plan>\n</oai-mem-citation>";
+    let chunks = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let mut parsers = AssistantMessageStreamParsers::new(true);
+    let mut state = PlanModeStreamState::new(&turn.sub_id);
+    let item_id = "plan-source";
+    for (index, chunk) in chunks.iter().enumerate() {
+        let parsed = if index == 0 {
+            parsers.seed_item_text(item_id, chunk)
+        } else {
+            parsers.parse_delta(item_id, chunk)
+        };
+        emit_streamed_assistant_text_delta(&session, &turn, Some(&mut state), item_id, parsed)
+            .await;
+    }
+    let tail = parsers.finish_item(item_id);
+    emit_streamed_assistant_text_delta(&session, &turn, Some(&mut state), item_id, tail).await;
+    assert!(parsers.finish_item(item_id).is_empty());
+    let item = ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(item_id.to_owned())),
+        role: "assistant".to_owned(),
+        content: vec![ContentItem::OutputText {
+            text: text.to_owned(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    maybe_complete_plan_item_from_message(&session, &turn, &mut state, &item).await;
+    let mut streamed = String::new();
+    let mut completed = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event.msg {
+            EventMsg::PlanDelta(delta) => streamed.push_str(&delta.delta),
+            EventMsg::ItemCompleted(done) => {
+                if let TurnItem::Plan(plan) = done.item {
+                    completed.push(plan.text);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(streamed, "visible step\n");
+    assert_eq!(completed, vec!["visible step\n"]);
+}
