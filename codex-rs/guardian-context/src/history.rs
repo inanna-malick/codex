@@ -183,17 +183,31 @@ impl TranscriptHistory {
 
     /// Removes a rolled-back boundary and everything after it. If retention already
     /// evicted the boundary, discard the remaining evidence rather than keep later grants.
+    /// Local acceptance order distinguishes repeated items whose IDs are absent.
+    /// A unique ID still identifies legacy entries without acceptance metadata.
     pub fn truncate_before(&mut self, boundary: &ResponseItemEnvelope) {
+        let boundary_order =
+            RetainedInputSource::from(boundary.metadata.as_ref()).acceptance_order();
         let index = self.items.iter().position(|(item, _)| {
-            item.id()
+            let same_id = item
+                .id()
                 .zip(boundary.id())
-                .is_some_and(|(item_id, boundary_id)| item_id == boundary_id)
-                || item.item == boundary.item
+                .is_some_and(|(item_id, boundary_id)| item_id == boundary_id);
+            let same_item = same_id || item.item == boundary.item;
+            match (
+                boundary_order,
+                RetainedInputSource::from(item.metadata.as_ref()),
+            ) {
+                (Some(boundary_order), RetainedInputSource::Local(Some(order))) => {
+                    order == boundary_order && same_item
+                }
+                (Some(_), RetainedInputSource::Local(None)) => same_id,
+                (Some(_), RetainedInputSource::Inherited) => false,
+                (None, _) => same_item,
+            }
         });
         self.items.truncate(index.unwrap_or(0));
-        if let Some(boundary_order) =
-            RetainedInputSource::from(boundary.metadata.as_ref()).acceptance_order()
-        {
+        if let Some(boundary_order) = boundary_order {
             self.items.retain(|(entry, _)| {
                 match RetainedInputSource::from(entry.metadata.as_ref()) {
                     RetainedInputSource::Local(Some(order)) => order < boundary_order,
