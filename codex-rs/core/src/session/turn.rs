@@ -2323,8 +2323,8 @@ async fn maybe_complete_plan_item_from_message(
                 text.push_str(chunk);
             }
         }
+        let (text, _citations) = strip_citations(&text);
         if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            let (plan_text, _citations) = strip_citations(&plan_text);
             if !state.plan_item_state.started {
                 state.plan_item_state.start(sess, turn_context).await;
             }
