@@ -166,3 +166,28 @@ async fn recovery_uses_pending_pastes_from_the_actual_queued_result() {
     })
     .await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn recovery_after_handoff_preserves_pending_vim_replace_semantics() {
+    scope(async {
+        let (mut chat, _sender, _rx, _op_rx) =
+            crate::chatwidget::tests::make_chatwidget_manual_with_sender().await;
+        chat.local_settings.tui.vim_mode_default = true;
+        let mut draft = snapshot("abcd");
+        draft.cursor = 0;
+        remember(draft.clone());
+        let mut pending = Some(draft);
+        let mut confirmed = false;
+        chat.restore_startup_input_when_ready(&mut pending, &mut confirmed);
+        assert!(pending.is_none());
+        // The handed-off composer starts in Insert; normal editing enters Replace.
+        for code in [KeyCode::Esc, KeyCode::Char('R')] {
+            chat.handle_key_event(KeyEvent::from(code));
+        }
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('X')));
+        assert_eq!(chat.composer_text_with_pending(), "abcd");
+        // This is the exact unsent text printed if initialization fails before the next tick.
+        assert_eq!(take_unsent_text(), Some("Xbcd".to_owned()));
+    })
+    .await;
+}
