@@ -3410,3 +3410,116 @@ fn text_only_items_count_decoded_content() {
 
     assert_eq!(estimated, "Hello, \"world\"!\nこんにちは".len() as i64);
 }
+
+#[test_case(GuardianContextMode::Independent, false; "independent compaction only")]
+#[test_case(GuardianContextMode::Legacy, false; "legacy compaction only")]
+#[test_case(GuardianContextMode::Independent, true; "independent repeated rollback")]
+#[test_case(GuardianContextMode::Legacy, true; "legacy repeated rollback")]
+fn rollback_without_visible_user_boundary_preserves_review_and_state(
+    mode: GuardianContextMode,
+    after_visible_rollback: bool,
+) {
+    let mut history = ContextManager::new();
+    history.guardian_review_mode = mode;
+    if mode == GuardianContextMode::Independent {
+        history.review_history = Some(TranscriptHistory::default());
+    }
+    let input = |id: &str, text: &str, order| ResponseItemEnvelope {
+        item: ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(id.to_owned())),
+            role: "user".to_owned(),
+            content: vec![ContentItem::InputText {
+                text: text.to_owned(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    turn_id: Some(id.to_owned()),
+                    content_item_kinds: Some(vec![ContentItemKind("user.text".to_owned())]),
+                    ..Default::default()
+                },
+            ),
+        },
+        metadata: Some(CodexHarnessMetadata {
+            user_input_order: Some(order),
+            ..Default::default()
+        }),
+    };
+    let original = input("original", "Keep the private data local.", 0);
+    history.record_annotated_items(&mut [original.clone()], TruncationPolicy::Tokens(10_000));
+    let checkpoint = ResponseItemEnvelope::new(ResponseItem::Compaction {
+        id: Some(ResponseItemId::from_server("checkpoint".to_owned())),
+        encrypted_content: "opaque checkpoint".to_owned(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    history.replace_compacted(vec![checkpoint.clone()], None);
+    let held = history.conversation_history_snapshot();
+    let held_retained = serde_json::to_value(held.retained_context().expect("retained context"))
+        .expect("serialize retained context");
+    if after_visible_rollback {
+        let later = input("later", "Inspect the summary.", 1);
+        history.record_annotated_items(&mut [later], TruncationPolicy::Tokens(10_000));
+        history.drop_last_n_user_turns(1);
+    }
+    assert_eq!(history.annotated_items(), &[checkpoint]);
+    assert_eq!(
+        held.review_items().cloned().collect::<Vec<_>>(),
+        vec![original.item.clone()]
+    );
+    history.set_world_state_baseline(WorldStateSnapshot::default());
+    for count in [0, 1, 2, u32::MAX] {
+        let window = history.annotated_items().to_vec();
+        let retained =
+            serde_json::to_value(history.retained_context()).expect("serialize retained context");
+        let versions = (
+            history.history_version,
+            history.reset_version,
+            history.user_message_revision,
+            history.guardian_review_context_revision,
+            history
+                .review_history
+                .as_ref()
+                .expect("review history")
+                .generation(),
+        );
+        let baseline = history.world_state_baseline.clone();
+        history.drop_last_n_user_turns(count);
+        assert_eq!(history.annotated_items(), window);
+        assert_eq!(
+            history
+                .guardian_history_items()
+                .expect("review history")
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![original.item.clone()]
+        );
+        assert_eq!(
+            serde_json::to_value(history.retained_context()).expect("serialize retained context"),
+            retained
+        );
+        assert_eq!(
+            (
+                history.history_version,
+                history.reset_version,
+                history.user_message_revision,
+                history.guardian_review_context_revision,
+                history
+                    .review_history
+                    .as_ref()
+                    .expect("review history")
+                    .generation()
+            ),
+            versions
+        );
+        assert_eq!(history.world_state_baseline, baseline);
+        assert_eq!(
+            held.review_items().cloned().collect::<Vec<_>>(),
+            vec![original.item.clone()]
+        );
+        assert_eq!(
+            serde_json::to_value(held.retained_context().expect("retained context"))
+                .expect("serialize retained context"),
+            held_retained
+        );
+    }
+}

@@ -777,9 +777,6 @@ impl ContextManager {
         let snapshot = self.items.clone();
         let user_positions = user_message_positions(&snapshot);
         let Some(&first_instruction_turn_idx) = user_positions.first() else {
-            let retained_context = Arc::clone(&self.retained_context);
-            self.replace_annotated(Arc::unwrap_or_clone(snapshot));
-            self.retained_context = retained_context;
             return;
         };
 
