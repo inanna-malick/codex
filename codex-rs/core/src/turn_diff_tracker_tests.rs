@@ -7,8 +7,10 @@ use codex_git_utils::apply_git_patch;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::tempdir;
@@ -516,5 +518,199 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
     assert_eq!(
         fs::read_to_string(path).expect("read large file"),
         new_content
+    );
+}
+
+#[tokio::test]
+async fn tracker_diff_for_mixed_line_endings_applies_to_the_original_tree() {
+    let workspace = tempdir().expect("workspace");
+    let original = b"first\r\nleft\rright\nlast";
+    fs::write(workspace.path().join("mixed.txt"), original).expect("seed mixed-ending file");
+    let mut tracker = tracker_with_root(workspace.path());
+
+    let patch = "*** Begin Patch\n*** Update File: mixed.txt\n@@\n first\n left\n-right\n+changed\n*** End Patch";
+    let delta = apply_verified_patch(workspace.path(), patch).await;
+    assert!(delta.is_exact());
+    assert_eq!(delta.changes().len(), 1);
+    match &delta.changes()[0].change {
+        codex_apply_patch::AppliedPatchFileChange::Update {
+            move_path: None,
+            old_content,
+            new_content,
+            ..
+        } => {
+            assert_eq!(old_content.as_bytes(), original);
+            assert_eq!(
+                new_content.as_bytes(),
+                b"first\r\nleft\rchanged\r\nlast\r\n"
+            );
+        }
+        other => panic!("expected mixed-ending update delta, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read(workspace.path().join("mixed.txt")).expect("read patched workspace"),
+        b"first\r\nleft\rchanged\r\nlast\r\n",
+    );
+    tracker.track_delta("", &delta);
+
+    let baseline = tempdir().expect("baseline");
+    fs::write(baseline.path().join("mixed.txt"), original).expect("seed baseline");
+    let diff = tracker.get_unified_diff().expect("mixed update has a diff");
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.whitespace=cr-at-eol",
+            "apply",
+            "--",
+        ])
+        .current_dir(baseline.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch git apply");
+    child
+        .stdin
+        .take()
+        .expect("git apply stdin")
+        .write_all(diff.as_bytes())
+        .expect("write diff");
+    let output = child.wait_with_output().expect("wait for git apply");
+    assert!(
+        output.status.success(),
+        "tracker diff should apply to the original mixed-ending tree: {}\nraw diff: {diff:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        fs::read(baseline.path().join("mixed.txt")).expect("read reconstructed file"),
+        fs::read(workspace.path().join("mixed.txt")).expect("read actual patched file"),
+    );
+}
+
+#[test]
+fn tracker_diff_preserves_final_bare_cr_for_add_delete_update_and_move() {
+    let cases = [
+        ("add", None, Some("tail\r"), "a.txt", "a.txt"),
+        ("delete", Some("tail\r"), None, "a.txt", "a.txt"),
+        ("update", Some("before\r"), Some("tail\r"), "a.txt", "a.txt"),
+        ("move", Some("before\r"), Some("tail\r"), "a.txt", "b.txt"),
+    ];
+
+    for (name, old_content, new_content, left, right) in cases {
+        let baseline = tempdir().expect("baseline");
+        if let Some(old_content) = old_content {
+            fs::write(baseline.path().join(left), old_content.as_bytes()).expect("seed old file");
+        }
+        let tracker = tracker_with_root(baseline.path());
+        let left_uri =
+            PathUri::from_host_native_path(&baseline.path().join(left)).expect("left tracked path");
+        let right_uri = PathUri::from_host_native_path(&baseline.path().join(right))
+            .expect("right tracked path");
+        let left_path = TrackedPath::new("", &left_uri);
+        let right_path = TrackedPath::new("", &right_uri);
+        let diff = tracker
+            .render_diff(&left_path, old_content, &right_path, new_content)
+            .expect("different final tree has a diff");
+
+        let mut child = Command::new("git")
+            .args([
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.whitespace=cr-at-eol",
+                "apply",
+                "--",
+            ])
+            .current_dir(baseline.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch git apply");
+        child
+            .stdin
+            .take()
+            .expect("git apply stdin")
+            .write_all(diff.as_bytes())
+            .expect("write diff");
+        let output = child.wait_with_output().expect("wait for git apply");
+        assert!(
+            output.status.success(),
+            "{name} diff should apply: {}\nraw diff: {diff:?}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        match (old_content, new_content, left == right) {
+            (None, Some(content), _) => {
+                assert_eq!(
+                    fs::read(baseline.path().join(right)).unwrap(),
+                    content.as_bytes()
+                );
+            }
+            (Some(_), None, _) => assert!(!baseline.path().join(left).exists()),
+            (Some(_), Some(content), true) => {
+                assert_eq!(
+                    fs::read(baseline.path().join(left)).unwrap(),
+                    content.as_bytes()
+                );
+            }
+            (Some(_), Some(content), false) => {
+                assert!(!baseline.path().join(left).exists());
+                assert_eq!(
+                    fs::read(baseline.path().join(right)).unwrap(),
+                    content.as_bytes()
+                );
+            }
+            _ => unreachable!("generated cases always change file state"),
+        }
+    }
+}
+
+#[test]
+fn tracker_diff_preserves_private_use_characters_in_paths_and_content() {
+    let baseline = tempdir().expect("baseline");
+    let name = "\u{e000}.txt";
+    let old = "before \u{e000}\n";
+    let new = "after \u{e000}\n";
+    fs::write(baseline.path().join(name), old).expect("seed PUA path");
+    let tracker = tracker_with_root(baseline.path());
+    let path = PathUri::from_host_native_path(&baseline.path().join(name)).expect("PUA path URI");
+    let tracked_path = TrackedPath::new("", &path);
+    let diff = tracker
+        .render_diff(&tracked_path, Some(old), &tracked_path, Some(new))
+        .expect("PUA update diff");
+
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.whitespace=cr-at-eol",
+            "apply",
+            "--",
+        ])
+        .current_dir(baseline.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch git apply");
+    child
+        .stdin
+        .take()
+        .expect("git apply stdin")
+        .write_all(diff.as_bytes())
+        .expect("write diff");
+    let output = child.wait_with_output().expect("wait for git apply");
+    assert!(
+        output.status.success(),
+        "PUA path/content diff should apply: {}\nraw diff: {diff:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        fs::read(baseline.path().join(name)).expect("read PUA file"),
+        new.as_bytes(),
     );
 }
