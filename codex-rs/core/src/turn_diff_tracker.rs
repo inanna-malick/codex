@@ -332,7 +332,9 @@ impl TurnDiffTracker {
             |content| git_blob_oid(content.as_bytes()),
         );
 
-        let mut diff = format!("diff --git a/{left_display} b/{right_display}\n");
+        let left_header = quote_git_path(&format!("a/{left_display}"));
+        let right_header = quote_git_path(&format!("b/{right_display}"));
+        let mut diff = format!("diff --git {left_header} {right_header}\n");
         match (left_content, right_content) {
             (None, Some(_)) => diff.push_str(&format!("new file mode {REGULAR_FILE_MODE}\n")),
             (Some(_), None) => diff.push_str(&format!("deleted file mode {REGULAR_FILE_MODE}\n")),
@@ -343,12 +345,12 @@ impl TurnDiffTracker {
         diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
 
         let old_header = if left_content.is_some() {
-            format!("a/{left_display}")
+            left_header
         } else {
             DEV_NULL.to_string()
         };
         let new_header = if right_content.is_some() {
-            format!("b/{right_display}")
+            right_header
         } else {
             DEV_NULL.to_string()
         };
@@ -382,6 +384,30 @@ impl TurnDiffTracker {
             display
         }
     }
+}
+
+/// Git interprets quoted patch paths using C-style escapes, not shell quoting.
+fn quote_git_path(path: &str) -> String {
+    if !path
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || matches!(byte, b' ' | b'"' | b'\\'))
+    {
+        return path.to_string();
+    }
+    let mut quoted = String::from("\"");
+    for ch in path.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            ch if ch.is_ascii_control() => quoted.push_str(&format!("\\{:03o}", u32::from(ch))),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn git_blob_oid(data: &[u8]) -> String {

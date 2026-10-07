@@ -518,3 +518,54 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
         new_content
     );
 }
+
+#[cfg(unix)]
+fn check_diff_filename(name: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let baseline = tempdir().expect("baseline");
+    let path = baseline.path().join(name);
+    fs::write(&path, b"before\n").expect("seed file");
+    let tracker = tracker_with_root(baseline.path());
+    let uri = PathUri::from_host_native_path(&path).expect("absolute path");
+    let tracked = TrackedPath::new("", &uri);
+    let diff = tracker
+        .render_diff(&tracked, Some("before\n"), &tracked, Some("after\n"))
+        .expect("changed text");
+    let mut child = Command::new("git")
+        .args(["-c", "core.autocrlf=false", "apply", "--"])
+        .current_dir(baseline.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("git apply");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(diff.as_bytes())
+        .expect("diff input");
+    let output = child.wait_with_output().expect("git result");
+    assert!(
+        output.status.success(),
+        "filename {name:?}: {}\ndiff {diff:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&path).expect("same filename"), b"after\n");
+    assert_eq!(fs::read_dir(baseline.path()).expect("directory").count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn tracker_diff_preserves_quoted_filenames() {
+    for name in [
+        "plain.txt",
+        "two words.txt",
+        "a\tb.txt",
+        "a\"b.txt",
+        "λ🦀.txt",
+    ] {
+        check_diff_filename(name);
+    }
+}
