@@ -188,7 +188,7 @@ fn vim_replace_recovery_snapshot_matches_pending_key_flush() {
         }
     }
 
-    // A marker at the Replace cursor is skipped consistently in both scratch and live editors.
+    // Recovery should preserve the live editor's atomic-marker placement.
     let (mut composer, _rx) = new_test_composer();
     composer.set_image_paste_enabled(false);
     composer.insert_str("a");
