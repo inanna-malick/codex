@@ -6,10 +6,83 @@ use codex_exec_server::LOCAL_FS;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::fs;
+use std::io::Write;
+use std::process::Command;
+use std::process::Stdio;
 use tempfile::tempdir;
 
 fn wrap_patch(body: &str) -> String {
     format!("*** Begin Patch\n{body}\n*** End Patch")
+}
+
+#[tokio::test]
+async fn headerless_unified_diff_replays_bare_carriage_return_exactly() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bare-cr.txt");
+    fs::write(&path, b"first\r\nleft\rright\nlast").unwrap();
+    let patch = wrap_patch(&format!(
+        "*** Update File: {}\n@@\n first\n left\n-right\n+changed",
+        path.display()
+    ));
+    let parsed = parse_patch(&patch).unwrap();
+    let chunks = match parsed.hunks.as_slice() {
+        [Hunk::UpdateFile { chunks, .. }] => chunks,
+        other => panic!("expected one update hunk, got {other:?}"),
+    };
+    let uri = PathUri::from_host_native_path(&path).unwrap();
+    let update = unified_diff_from_chunks(&uri, chunks, LOCAL_FS.as_ref(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        update.original_content.as_bytes(),
+        b"first\r\nleft\rright\nlast"
+    );
+    assert_eq!(
+        update.content.as_bytes(),
+        b"first\r\nleft\rchanged\r\nlast\r\n"
+    );
+
+    let baseline = tempdir().unwrap();
+    fs::write(
+        baseline.path().join("bare-cr.txt"),
+        update.original_content.as_bytes(),
+    )
+    .unwrap();
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.whitespace=cr-at-eol",
+            "apply",
+            "--",
+        ])
+        .current_dir(baseline.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let diff = format!(
+        "--- a/bare-cr.txt\n+++ b/bare-cr.txt\n{}",
+        update.unified_diff
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "headerless unified diff must apply to its source bytes: {}\n{diff}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(baseline.path().join("bare-cr.txt")).unwrap(),
+        update.content.as_bytes()
+    );
 }
 
 #[tokio::test]
