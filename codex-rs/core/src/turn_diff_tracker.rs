@@ -353,14 +353,39 @@ impl TurnDiffTracker {
             DEV_NULL.to_string()
         };
 
+        // Git patches are delimited by `\n`, while `diff_lines` also treats `\r` as a
+        // separator. Split on LF and format hunks using LF-only termination checks.
+        let old_content = left_content.unwrap_or("");
+        let new_content = right_content.unwrap_or("");
+        let old_lines = old_content.split_inclusive('\n').collect::<Vec<_>>();
+        let new_lines = new_content.split_inclusive('\n').collect::<Vec<_>>();
         let mut config = similar::TextDiff::configure();
         config.timeout(DIFF_TIMEOUT);
-        let unified = config
-            .diff_lines(left_content.unwrap_or(""), right_content.unwrap_or(""))
-            .unified_diff()
+        let text_diff = config.diff_slices(&old_lines, &new_lines);
+        let mut unified_diff = text_diff.unified_diff();
+        unified_diff
             .context_radius(3)
-            .header(&old_header, &new_header)
-            .to_string();
+            .header(&old_header, &new_header);
+        let mut unified = String::new();
+        for hunk in unified_diff.iter_hunks() {
+            if unified.is_empty() {
+                unified.push_str(&format!("--- {old_header}\n+++ {new_header}\n"));
+            }
+            unified.push_str(&format!("{}\n", hunk.header()));
+            for change in hunk.iter_changes() {
+                let prefix = match change.tag() {
+                    similar::ChangeTag::Equal => ' ',
+                    similar::ChangeTag::Delete => '-',
+                    similar::ChangeTag::Insert => '+',
+                };
+                let value = change.value();
+                unified.push(prefix);
+                unified.push_str(value);
+                if !value.ends_with('\n') {
+                    unified.push_str("\n\\ No newline at end of file\n");
+                }
+            }
+        }
         diff.push_str(&unified);
         Some(diff)
     }
