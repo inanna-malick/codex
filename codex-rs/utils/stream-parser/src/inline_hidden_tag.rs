@@ -96,27 +96,9 @@ where
     }
 
     fn earliest_ambiguous_open_start(&self, pending: &str, through: usize) -> Option<usize> {
-        let mut earliest = None;
-        for start in pending
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .chain(std::iter::once(pending.len()))
-            .take_while(|start| *start <= through)
-        {
-            let suffix = &pending[start..];
-            if suffix.is_empty() {
-                continue;
-            }
-            if self
-                .specs
-                .iter()
-                .any(|spec| suffix.len() < spec.open.len() && spec.open.starts_with(suffix))
-            {
-                earliest = Some(start);
-                break;
-            }
-        }
-        earliest
+        let keep = self.max_open_prefix_suffix_len(pending);
+        let start = pending.len().saturating_sub(keep);
+        (keep > 0 && start <= through).then_some(start)
     }
 
     fn push_internal(
@@ -158,6 +140,17 @@ where
                 }
 
                 let keep = longest_suffix_prefix_len(pending, close);
+                if resolve_ambiguous {
+                    if let Some(mut active) = self.active.take() {
+                        active.content.push_str(pending);
+                        out.extracted.push(ExtractedInlineTag {
+                            tag: active.tag,
+                            content: active.content,
+                        });
+                    }
+                    consumed = self.pending.len();
+                    break;
+                }
                 let take = pending.len().saturating_sub(keep);
                 if take > 0 {
                     if let Some(active) = self.active.as_mut() {
@@ -186,17 +179,6 @@ where
                     close: spec.close,
                     content: String::new(),
                 });
-                if resolve_ambiguous {
-                    if let Some(mut active) = self.active.take() {
-                        active.content.push_str(&self.pending[consumed..]);
-                        out.extracted.push(ExtractedInlineTag {
-                            tag: active.tag,
-                            content: active.content,
-                        });
-                    }
-                    consumed = self.pending.len();
-                    break;
-                }
                 continue;
             }
 
@@ -352,6 +334,32 @@ mod tests {
         assert!(parser.push_str("<a>").is_empty());
         assert_eq!(
             parser.finish().extracted,
+            vec![super::ExtractedInlineTag {
+                tag: Tag::A,
+                content: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn finish_scans_close_and_visible_suffix_after_a_delayed_opener() {
+        let specs = vec![
+            InlineTagSpec {
+                tag: Tag::A,
+                open: "a",
+                close: "b",
+            },
+            InlineTagSpec {
+                tag: Tag::B,
+                open: "abcde",
+                close: "!",
+            },
+        ];
+        let result = collect_chunks(&mut InlineHiddenTagParser::new(specs), &["abc"]);
+
+        assert_eq!(result.visible_text, "c");
+        assert_eq!(
+            result.extracted,
             vec![super::ExtractedInlineTag {
                 tag: Tag::A,
                 content: String::new(),
