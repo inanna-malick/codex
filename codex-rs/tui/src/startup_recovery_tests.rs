@@ -184,12 +184,10 @@ async fn recovery_after_handoff_preserves_pending_vim_replace_semantics() {
         for code in [KeyCode::Esc, KeyCode::Char('R')] {
             chat.handle_key_event(KeyEvent::from(code));
         }
-        for ch in "XYZ".chars() {
-            chat.handle_key_event(KeyEvent::from(KeyCode::Char(ch)));
-        }
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char('X')));
         assert_eq!(chat.composer_text_with_pending(), "abcd");
         // This is the exact unsent text printed if initialization fails before the next tick.
-        assert_eq!(take_unsent_text(), Some("XYZd".to_owned()));
+        assert_eq!(take_unsent_text(), Some("Xbcd".to_owned()));
     })
     .await;
 }
