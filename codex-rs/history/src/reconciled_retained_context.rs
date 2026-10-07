@@ -51,6 +51,14 @@ impl<'a> ReconciledRetainedContext<'a> {
                 });
         let recover = retained_context.is_none_or(|context| !context.user_messages_complete());
         let mut matched_entries = HashSet::new();
+        let mut matched_ids = retained_entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                RetainedContextEntry::UserMessage(message) => message.message_id.clone(),
+                RetainedContextEntry::AssistantMessage(_)
+                | RetainedContextEntry::VerifiedAnswer(_) => None,
+            })
+            .collect::<HashSet<_>>();
         let mut used_orders = retained_entries
             .iter()
             .map(|(order, _)| *order)
@@ -66,6 +74,15 @@ impl<'a> ReconciledRetainedContext<'a> {
             if !recover {
                 continue;
             }
+            // An exact identity proves a replay before anonymous occurrence matching.
+            // Known sources can appear more than once in the surviving model history.
+            if message
+                .message_id
+                .as_ref()
+                .is_some_and(|id| matched_ids.contains(id))
+            {
+                continue;
+            }
             if retained_entries
                 .iter()
                 .enumerate()
@@ -73,9 +90,14 @@ impl<'a> ReconciledRetainedContext<'a> {
                     let RetainedContextEntry::UserMessage(retained) = entry else {
                         return false;
                     };
-                    same_user_message_source(retained, &message) && matched_entries.insert(index)
+                    retained.message_id.is_none()
+                        && same_user_message_source(retained, &message)
+                        && matched_entries.insert(index)
                 })
             {
+                if let Some(id) = &message.message_id {
+                    matched_ids.insert(id.clone());
+                }
                 continue;
             }
             // Queued steering can enter raw history after a later-accepted answer.
@@ -88,6 +110,9 @@ impl<'a> ReconciledRetainedContext<'a> {
                 missing_user_messages = true;
                 continue;
             };
+            if let Some(id) = &message.message_id {
+                matched_ids.insert(id.clone());
+            }
             recovered.push((order, message));
         }
         Self {

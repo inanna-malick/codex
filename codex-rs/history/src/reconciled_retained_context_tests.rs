@@ -237,3 +237,56 @@ fn heartbeat_versions_survive_retention_restore_and_reconciliation() {
         assert_eq!(retained, checkpoint);
     }
 }
+
+#[test]
+fn live_known_identity_replay_does_not_invent_missing_occurrences() {
+    let message = RetainedUserMessage {
+        message_id: Some("original".to_owned()),
+        ..instruction("Inspect the deployment.")
+    };
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(message.clone(), RetainedInputSource::Local(Some(0)));
+    assert!(!retained.user_messages_complete());
+    assert!(!retained.has_missing_user_messages());
+    let reconciled = ReconciledRetainedContext::new(
+        Some(&retained),
+        [(Some(0), message.clone()), (Some(0), message)],
+    );
+    assert_eq!(reconciled.ordered_entries().count(), 1);
+    assert!(!reconciled.missing_user_messages);
+}
+
+#[test]
+fn live_exact_identity_does_not_consume_anonymous_occurrence() {
+    let anonymous = instruction("Inspect the deployment.");
+    let known = RetainedUserMessage {
+        message_id: Some("original".to_owned()),
+        ..anonymous.clone()
+    };
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(anonymous.clone(), RetainedInputSource::Local(Some(0)));
+    retained.record_user_message(known.clone(), RetainedInputSource::Local(Some(1)));
+    let reconciled =
+        ReconciledRetainedContext::new(Some(&retained), [(Some(1), known), (Some(0), anonymous)]);
+    assert_eq!(reconciled.ordered_entries().count(), 2);
+    assert!(!reconciled.missing_user_messages);
+}
+
+#[test]
+fn live_recovered_identity_replay_does_not_invent_missing_occurrences() {
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(
+        instruction("Initial request."),
+        RetainedInputSource::Local(Some(0)),
+    );
+    let message = RetainedUserMessage {
+        message_id: Some("surviving-original".to_owned()),
+        ..instruction("Inspect the deployment.")
+    };
+    let reconciled = ReconciledRetainedContext::new(
+        Some(&retained),
+        [(Some(1), message.clone()), (Some(1), message)],
+    );
+    assert_eq!(reconciled.ordered_entries().count(), 2);
+    assert!(!reconciled.missing_user_messages);
+}
