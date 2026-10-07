@@ -518,3 +518,88 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
         new_content
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn tracker_diff_preserves_posix_literal_backslash_in_filename() {
+    let dir = tempdir().expect("workspace");
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .expect("run git init")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir.path())
+            .status()
+            .expect("disable line ending conversion")
+            .success()
+    );
+    let filename = r"a\b.txt";
+    let path = dir.path().join(filename);
+    fs::write(&path, b"before\n").expect("seed literal-backslash filename");
+    assert!(
+        Command::new("git")
+            .args(["add", "--", filename])
+            .current_dir(dir.path())
+            .status()
+            .expect("run git add")
+            .success()
+    );
+    let root = PathUri::from_host_native_path(dir.path()).expect("absolute root");
+    let path_uri = PathUri::from_host_native_path(&path).expect("absolute file path");
+    assert_eq!(
+        path_uri.relative_path_from(&root).as_deref(),
+        Some(filename),
+        "POSIX relative path preserves a backslash inside one filename segment"
+    );
+
+    let tracker = tracker_with_root(dir.path());
+    let tracked_path = TrackedPath::new("", &path_uri);
+    let diff = tracker
+        .render_diff(
+            &tracked_path,
+            Some("before\n"),
+            &tracked_path,
+            Some("after\n"),
+        )
+        .expect("content change produces diff");
+    let result = apply_git_patch(&ApplyGitRequest {
+        cwd: dir.path().to_path_buf(),
+        diff,
+        revert: false,
+        preflight: false,
+    })
+    .expect("apply tracker diff");
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    assert_eq!(
+        fs::read(&path).expect("read literal-backslash filename"),
+        b"after\n"
+    );
+    assert!(!dir.path().join("a/b.txt").exists());
+}
+
+#[test]
+fn tracker_diff_normalizes_windows_convention_separators() {
+    let path_uri = PathUri::parse("file:///C:/workspace/file.txt").expect("Windows file URI");
+    assert_eq!(
+        path_uri.infer_path_convention(),
+        Some(codex_utils_path_uri::PathConvention::Windows)
+    );
+    let tracked_path = TrackedPath::new("", &path_uri);
+    let tracker = TurnDiffTracker::new();
+    let diff = tracker
+        .render_diff(
+            &tracked_path,
+            Some("before\n"),
+            &tracked_path,
+            Some("after\n"),
+        )
+        .expect("content change produces diff");
+
+    assert!(diff.contains("a/C:/workspace/file.txt b/C:/workspace/file.txt"));
+}
