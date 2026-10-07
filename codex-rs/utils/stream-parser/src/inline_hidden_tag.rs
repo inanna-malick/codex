@@ -95,23 +95,31 @@ where
             .map_or(0, std::convert::identity)
     }
 
-    fn push_visible_prefix(out: &mut StreamTextChunk<ExtractedInlineTag<T>>, pending: &str) {
-        if !pending.is_empty() {
-            out.visible_text.push_str(pending);
-        }
+    fn earliest_ambiguous_open_start(&self, pending: &str, through: usize) -> Option<usize> {
+        let keep = self.max_open_prefix_suffix_len(pending);
+        let start = pending.len().saturating_sub(keep);
+        (keep > 0 && start <= through).then_some(start)
     }
-}
 
-impl<T> StreamTextParser for InlineHiddenTagParser<T>
-where
-    T: Clone + Eq,
-{
-    type Extracted = ExtractedInlineTag<T>;
-
-    fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted> {
+    fn push_internal(
+        &mut self,
+        chunk: &str,
+        resolve_ambiguous: bool,
+    ) -> StreamTextChunk<ExtractedInlineTag<T>> {
         self.pending.push_str(chunk);
         let mut out = StreamTextChunk::default();
         let mut consumed = 0;
+
+        // At EOF, preserve the existing auto-close contract for an active tag.
+        if resolve_ambiguous && let Some(mut active) = self.active.take() {
+            active.content.push_str(&self.pending);
+            self.pending.clear();
+            out.extracted.push(ExtractedInlineTag {
+                tag: active.tag,
+                content: active.content,
+            });
+            return out;
+        }
 
         loop {
             let pending = &self.pending[consumed..];
@@ -130,6 +138,17 @@ where
                 }
 
                 let keep = longest_suffix_prefix_len(pending, close);
+                if resolve_ambiguous {
+                    if let Some(mut active) = self.active.take() {
+                        active.content.push_str(pending);
+                        out.extracted.push(ExtractedInlineTag {
+                            tag: active.tag,
+                            content: active.content,
+                        });
+                    }
+                    consumed = self.pending.len();
+                    break;
+                }
                 let take = pending.len().saturating_sub(keep);
                 if take > 0 {
                     if let Some(active) = self.active.as_mut() {
@@ -141,6 +160,14 @@ where
             }
 
             if let Some((open_idx, spec_idx)) = self.find_next_open(pending) {
+                if !resolve_ambiguous
+                    && let Some(ambiguous_start) =
+                        self.earliest_ambiguous_open_start(pending, open_idx)
+                {
+                    Self::push_visible_prefix(&mut out, &pending[..ambiguous_start]);
+                    consumed += ambiguous_start;
+                    break;
+                }
                 Self::push_visible_prefix(&mut out, &pending[..open_idx]);
                 let spec = &self.specs[spec_idx];
                 consumed += open_idx + spec.open.len();
@@ -150,6 +177,12 @@ where
                     content: String::new(),
                 });
                 continue;
+            }
+
+            if resolve_ambiguous {
+                Self::push_visible_prefix(&mut out, pending);
+                consumed = self.pending.len();
+                break;
             }
 
             let keep = self.max_open_prefix_suffix_len(pending);
@@ -164,27 +197,25 @@ where
         out
     }
 
+    fn push_visible_prefix(out: &mut StreamTextChunk<ExtractedInlineTag<T>>, pending: &str) {
+        if !pending.is_empty() {
+            out.visible_text.push_str(pending);
+        }
+    }
+}
+
+impl<T> StreamTextParser for InlineHiddenTagParser<T>
+where
+    T: Clone + Eq,
+{
+    type Extracted = ExtractedInlineTag<T>;
+
+    fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted> {
+        self.push_internal(chunk, false)
+    }
+
     fn finish(&mut self) -> StreamTextChunk<Self::Extracted> {
-        let mut out = StreamTextChunk::default();
-
-        if let Some(mut active) = self.active.take() {
-            if !self.pending.is_empty() {
-                active.content.push_str(&self.pending);
-                self.pending.clear();
-            }
-            out.extracted.push(ExtractedInlineTag {
-                tag: active.tag,
-                content: active.content,
-            });
-            return out;
-        }
-
-        if !self.pending.is_empty() {
-            out.visible_text.push_str(&self.pending);
-            self.pending.clear();
-        }
-
-        out
+        self.push_internal("", true)
     }
 }
 
@@ -251,6 +282,85 @@ mod tests {
         assert_eq!(out.extracted[0].content, "x");
         assert_eq!(out.extracted[1].tag, Tag::B);
         assert_eq!(out.extracted[1].content, "y");
+    }
+
+    #[test]
+    fn opener_precedence_is_independent_of_chunk_boundaries() {
+        let specs = vec![
+            InlineTagSpec {
+                tag: Tag::A,
+                open: "<a>",
+                close: "</a>",
+            },
+            InlineTagSpec {
+                tag: Tag::B,
+                open: "<a>:",
+                close: "</long>",
+            },
+        ];
+        let whole = collect_chunks(
+            &mut InlineHiddenTagParser::new(specs.clone()),
+            &["<a>:payload</long>"],
+        );
+        let split = collect_chunks(
+            &mut InlineHiddenTagParser::new(specs),
+            &["<a>", ":payload</long>"],
+        );
+
+        assert_eq!(whole, split);
+        assert_eq!(whole.extracted[0].tag, Tag::B);
+        assert_eq!(whole.extracted[0].content, "payload");
+    }
+
+    #[test]
+    fn finish_resolves_a_complete_short_opener_when_a_longer_one_is_partial() {
+        let mut parser = InlineHiddenTagParser::new(vec![
+            InlineTagSpec {
+                tag: Tag::A,
+                open: "<a>",
+                close: "</a>",
+            },
+            InlineTagSpec {
+                tag: Tag::B,
+                open: "<a>:",
+                close: "</b>",
+            },
+        ]);
+
+        assert!(parser.push_str("<a>").is_empty());
+        assert_eq!(
+            parser.finish().extracted,
+            vec![super::ExtractedInlineTag {
+                tag: Tag::A,
+                content: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn finish_scans_close_and_visible_suffix_after_a_delayed_opener() {
+        let specs = vec![
+            InlineTagSpec {
+                tag: Tag::A,
+                open: "a",
+                close: "b",
+            },
+            InlineTagSpec {
+                tag: Tag::B,
+                open: "abcde",
+                close: "!",
+            },
+        ];
+        let result = collect_chunks(&mut InlineHiddenTagParser::new(specs), &["abc"]);
+
+        assert_eq!(result.visible_text, "c");
+        assert_eq!(
+            result.extracted,
+            vec![super::ExtractedInlineTag {
+                tag: Tag::A,
+                content: String::new(),
+            }]
+        );
     }
 
     #[test]
