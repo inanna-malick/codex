@@ -153,10 +153,28 @@ impl<'a> ReconciledRetainedContext<'a> {
                 | RetainedContextEntry::VerifiedAnswer(_) => None,
             })
             .collect::<Vec<_>>();
+        let mut matched_anonymous = HashSet::new();
+        let mut matched_ids = HashSet::new();
         messages.filter(move |message| {
-            !sources
-                .iter()
-                .any(|source| same_user_message_source(source, message))
+            // A known identity proves a replay without consuming an anonymous
+            // occurrence that may represent another input with the same text.
+            if message.message_id.as_ref().is_some_and(|id| {
+                matched_ids.contains(id)
+                    || sources
+                        .iter()
+                        .any(|source| source.message_id.as_ref() == Some(id))
+            }) {
+                return false;
+            }
+            let matched = sources.iter().enumerate().any(|(index, source)| {
+                source.message_id.is_none()
+                    && same_user_message_source(source, message)
+                    && matched_anonymous.insert(index)
+            });
+            if matched && let Some(id) = &message.message_id {
+                matched_ids.insert(id.clone());
+            }
+            !matched
         })
     }
 }

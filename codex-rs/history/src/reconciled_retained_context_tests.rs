@@ -17,6 +17,83 @@ fn instruction(text: &str) -> RetainedUserMessage {
 }
 
 #[test]
+fn legacy_reconciliation_preserves_second_identical_idless_occurrence() {
+    let message = instruction("Inspect the deployment.");
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(message.clone(), RetainedInputSource::Local(Some(0)));
+    retained.mark_user_messages_incomplete();
+    let reconciled = ReconciledRetainedContext::new(Some(&retained), std::iter::empty());
+    assert_eq!(
+        reconciled
+            .unmatched_user_messages([message.clone(), message.clone()].into_iter())
+            .collect::<Vec<_>>(),
+        vec![message],
+    );
+}
+
+#[test]
+fn legacy_exact_identity_matches_before_anonymous_occurrence() {
+    let anonymous = instruction("Inspect the deployment.");
+    let known = RetainedUserMessage {
+        message_id: Some("known-B".to_owned()),
+        ..anonymous.clone()
+    };
+    let other = RetainedUserMessage {
+        message_id: Some("known-A".to_owned()),
+        ..anonymous.clone()
+    };
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(anonymous, RetainedInputSource::Local(Some(0)));
+    retained.record_user_message(known.clone(), RetainedInputSource::Local(Some(1)));
+    let reconciled = ReconciledRetainedContext::new(Some(&retained), std::iter::empty());
+    assert_eq!(
+        reconciled
+            .unmatched_user_messages([known, other].into_iter())
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn known_replay_consumes_only_one_anonymous_occurrence() {
+    let anonymous = instruction("Inspect the deployment.");
+    let known = RetainedUserMessage {
+        message_id: Some("known-A".to_owned()),
+        ..anonymous.clone()
+    };
+    let mut retained = RetainedContext::default();
+    retained.record_user_message(anonymous.clone(), RetainedInputSource::Local(Some(0)));
+    retained.record_user_message(anonymous.clone(), RetainedInputSource::Local(Some(1)));
+    let reconciled = ReconciledRetainedContext::new(Some(&retained), std::iter::empty());
+    assert_eq!(
+        reconciled
+            .unmatched_user_messages(
+                [known.clone(), known, anonymous.clone(), anonymous.clone()].into_iter()
+            )
+            .collect::<Vec<_>>(),
+        vec![anonymous]
+    );
+}
+
+#[test]
+fn evicted_idless_occurrence_remains_a_legacy_candidate() {
+    let message = instruction("Inspect the deployment.");
+    let mut retained = RetainedContext::default();
+    for order in 0..9 {
+        retained.record_user_message(message.clone(), RetainedInputSource::Local(Some(order)));
+    }
+    assert!(retained.has_missing_user_messages());
+    assert_eq!(retained.ordered_entries().count(), 8);
+    let reconciled = ReconciledRetainedContext::new(Some(&retained), std::iter::empty());
+    assert_eq!(
+        reconciled
+            .unmatched_user_messages((0..9).map(|_| message.clone()))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn recovery_preserves_source_identity_acceptance_order_and_checkpoint_gaps() {
     let initial = instruction("Inspect the deployment.");
     let retained_excerpt = RetainedUserMessage {
