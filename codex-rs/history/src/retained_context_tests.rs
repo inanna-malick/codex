@@ -92,6 +92,68 @@ fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() 
 }
 
 #[test]
+fn oversized_user_correction_gets_a_new_revision_after_bounding() {
+    let mut context = RetainedContext::default();
+    let record = |text: String| RetainedUserMessage {
+        turn_id: "same-turn".to_owned(),
+        message_id: Some("corrected-source".to_owned()),
+        text,
+        complete: true,
+        origin: crate::UserInputOrigin::User,
+        phase: None,
+    };
+
+    let first = context
+        .record_user_message(
+            record(format!("First correction. {}", "a".repeat(20_000))),
+            RetainedInputSource::Local(Some(0)),
+        )
+        .expect("first user source");
+    let second = context
+        .record_user_message(
+            record(format!("Second correction. {}", "b".repeat(20_000))),
+            RetainedInputSource::Local(Some(0)),
+        )
+        .expect("corrected user source");
+
+    assert_eq!(first.id, second.id);
+    assert!(!first.complete);
+    assert!(!second.complete);
+    assert_ne!(first.revision, second.revision);
+}
+
+#[test]
+fn oversized_assistant_correction_gets_a_new_revision_after_bounding() {
+    let mut context = RetainedContext::default();
+    let record = |text: String| RetainedUserMessage {
+        turn_id: "same-turn".to_owned(),
+        message_id: Some("corrected-assistant".to_owned()),
+        text,
+        complete: true,
+        origin: crate::UserInputOrigin::User,
+        phase: None,
+    };
+
+    let first = context
+        .record_assistant_message(
+            record(format!("First correction. {}", "a".repeat(20_000))),
+            RetainedInputSource::Local(Some(0)),
+        )
+        .expect("first assistant source");
+    let second = context
+        .record_assistant_message(
+            record(format!("Second correction. {}", "b".repeat(20_000))),
+            RetainedInputSource::Local(Some(0)),
+        )
+        .expect("corrected assistant source");
+
+    assert_eq!(first.id, second.id);
+    assert!(!first.complete);
+    assert!(!second.complete);
+    assert_ne!(first.revision, second.revision);
+}
+
+#[test]
 fn retained_families_enforce_storage_limits_without_changing_snapshots() {
     let mut context = RetainedContext::default();
     let first = publish_answer();
