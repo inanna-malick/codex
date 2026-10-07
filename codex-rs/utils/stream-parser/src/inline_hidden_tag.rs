@@ -111,16 +111,14 @@ where
         let mut consumed = 0;
 
         // At EOF, preserve the existing auto-close contract for an active tag.
-        if resolve_ambiguous {
-            if let Some(mut active) = self.active.take() {
-                active.content.push_str(&self.pending);
-                self.pending.clear();
-                out.extracted.push(ExtractedInlineTag {
-                    tag: active.tag,
-                    content: active.content,
-                });
-                return out;
-            }
+        if resolve_ambiguous && let Some(mut active) = self.active.take() {
+            active.content.push_str(&self.pending);
+            self.pending.clear();
+            out.extracted.push(ExtractedInlineTag {
+                tag: active.tag,
+                content: active.content,
+            });
+            return out;
         }
 
         loop {
@@ -162,14 +160,13 @@ where
             }
 
             if let Some((open_idx, spec_idx)) = self.find_next_open(pending) {
-                if !resolve_ambiguous {
-                    if let Some(ambiguous_start) =
+                if !resolve_ambiguous
+                    && let Some(ambiguous_start) =
                         self.earliest_ambiguous_open_start(pending, open_idx)
-                    {
-                        Self::push_visible_prefix(&mut out, &pending[..ambiguous_start]);
-                        consumed += ambiguous_start;
-                        break;
-                    }
+                {
+                    Self::push_visible_prefix(&mut out, &pending[..ambiguous_start]);
+                    consumed += ambiguous_start;
+                    break;
                 }
                 Self::push_visible_prefix(&mut out, &pending[..open_idx]);
                 let spec = &self.specs[spec_idx];
@@ -195,6 +192,7 @@ where
             break;
         }
 
+        // Compact once per chunk rather than shifting the tail after every delimiter.
         self.pending.drain(..consumed);
         out
     }
@@ -213,9 +211,7 @@ where
     type Extracted = ExtractedInlineTag<T>;
 
     fn push_str(&mut self, chunk: &str) -> StreamTextChunk<Self::Extracted> {
-        let out = self.push_internal(chunk, false);
-        // push_internal compacts once per chunk rather than shifting the tail per delimiter.
-        out
+        self.push_internal(chunk, false)
     }
 
     fn finish(&mut self) -> StreamTextChunk<Self::Extracted> {
