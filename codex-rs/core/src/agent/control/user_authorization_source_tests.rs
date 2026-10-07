@@ -53,8 +53,7 @@ async fn resumed_snapshot(user_count: u64, assistant_copies: usize) -> GuardianR
     let home = tempfile::tempdir().unwrap();
     config.codex_home = home.path().to_path_buf().try_into().unwrap();
     config.cwd = home.path().to_path_buf().try_into().unwrap();
-    let features = crate::config::ManagedFeatures::from(config.features.clone());
-    let mut history = ContextManager::for_session(&SessionSource::Cli, &features);
+    let mut history = ContextManager::for_session(&SessionSource::Cli, &config.features);
     let mut originals = (0..user_count)
         .map(|index| evidence("user", index))
         .collect::<Vec<_>>();
