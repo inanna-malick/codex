@@ -34,6 +34,83 @@ fn rollback_keeps_the_earlier_prefix_or_clears_an_evicted_boundary() {
 }
 
 #[test]
+fn rollback_identifies_repeated_idless_input_by_acceptance_order() {
+    let ordered = |text, order| ResponseItemEnvelope {
+        item: message(text),
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            user_input_order: Some(order),
+            ..Default::default()
+        }),
+    };
+    let items = [ordered("A", 0), ordered("B", 1), ordered("A", 2)];
+    let mut history = TranscriptHistory::default();
+    history.reset(&items);
+
+    history.truncate_before(&items[2]);
+
+    assert_eq!(history.checkpoint().0, items[..2]);
+}
+
+#[test]
+fn rollback_does_not_use_an_inherited_counter_to_identify_local_input() {
+    let inherited = ResponseItemEnvelope {
+        item: message("A"),
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            inherited_user_message: true,
+            user_input_order: Some(2),
+            ..Default::default()
+        }),
+    };
+    let boundary = ResponseItemEnvelope {
+        item: message("A"),
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            user_input_order: Some(2),
+            ..Default::default()
+        }),
+    };
+    let mut history = TranscriptHistory::default();
+    history.reset([&inherited, &boundary]);
+    history.truncate_before(&boundary);
+    assert_eq!(history.checkpoint().0, vec![inherited]);
+}
+
+#[test]
+fn rollback_preserves_unique_id_lookup_for_a_legacy_entry() {
+    let keep = ResponseItemEnvelope::new(message("keep"));
+    let mut legacy = ResponseItemEnvelope::new(message("A"));
+    if let ResponseItem::Message { id, .. } = &mut legacy.item {
+        *id = Some(codex_protocol::ResponseItemId::from_server(
+            "boundary".to_owned(),
+        ));
+    }
+    let mut boundary = legacy.clone();
+    boundary.metadata = Some(codex_history::CodexHarnessMetadata {
+        user_input_order: Some(2),
+        ..Default::default()
+    });
+    let mut history = TranscriptHistory::default();
+    history.reset([&keep, &legacy]);
+    history.truncate_before(&boundary);
+    assert_eq!(history.checkpoint().0, vec![keep]);
+}
+
+#[test]
+fn rollback_clears_when_only_a_different_ordered_occurrence_remains() {
+    let envelope = |text, order| ResponseItemEnvelope {
+        item: message(text),
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            user_input_order: Some(order),
+            ..Default::default()
+        }),
+    };
+    let items = [envelope("keep", 0), envelope("A", 1)];
+    let mut history = TranscriptHistory::default();
+    history.reset(&items);
+    history.truncate_before(&envelope("A", 2));
+    assert_eq!(history.checkpoint().0, Vec::<ResponseItemEnvelope>::new());
+}
+
+#[test]
 fn each_kind_evicts_its_own_oldest_entries_without_reordering() {
     let users = [message("first"), message("second"), message("third")];
     let tools: Vec<_> = (0..MAX_ITEMS_PER_KIND)
