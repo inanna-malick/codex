@@ -145,3 +145,62 @@ fn paste_burst_modified_queue_binding_still_dispatches() {
         }
     );
 }
+
+#[test]
+fn vim_replace_recovery_snapshot_matches_pending_key_flush() {
+    for (initial, cursor, replace, payload, expected) in [
+        ("abcd", 0, true, "XYZ", "XYZd"),
+        ("abcd", 0, true, "X", "Xbcd"),
+        ("prefix abcd", 7, true, "XYZ", "prefix XYZd"),
+        ("abcd", 0, false, "XYZ", "XYZabcd"),
+        ("abcd", 2, false, "X", "abXcd"),
+    ] {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content(initial.to_owned(), Vec::new(), Vec::new());
+        composer.set_vim_enabled(true);
+        composer.draft.textarea.set_cursor(cursor);
+        composer.handle_key_event(KeyCode::Char(if replace { 'R' } else { 'i' }).into());
+        let now = Instant::now();
+        for ch in payload.chars() {
+            composer.handle_input_basic_with_time(KeyCode::Char(ch).into(), now);
+        }
+        assert!(composer.is_in_paste_burst());
+        let before = composer.draft_snapshot();
+        let recovery = composer.recovery_snapshot();
+        assert_eq!(
+            composer.draft_snapshot(),
+            before,
+            "snapshot must not edit live text"
+        );
+        assert!(
+            composer.is_in_paste_burst(),
+            "snapshot must not consume pending keys"
+        );
+        composer.handle_paste_burst_flush(now + PasteBurst::recommended_active_flush_delay());
+        assert_eq!(composer.current_text(), expected);
+        assert_eq!(recovery.text, composer.current_text());
+    }
+
+    // A marker at the Replace cursor is skipped consistently in both scratch and live editors.
+    let (mut composer, _rx) = new_test_composer();
+    composer.insert_str("a");
+    composer.draft.textarea.insert_element("<image>");
+    composer.insert_str("bcde");
+    composer.set_vim_enabled(true);
+    composer.draft.textarea.set_cursor(1);
+    composer.handle_key_event(KeyCode::Char('R').into());
+    let now = Instant::now();
+    for ch in "XYZ".chars() {
+        composer.handle_input_basic_with_time(KeyCode::Char(ch).into(), now);
+    }
+    let before = composer.draft_snapshot();
+    let recovery = composer.recovery_snapshot();
+    assert_eq!(composer.draft_snapshot(), before);
+    composer.handle_paste_burst_flush(now + PasteBurst::recommended_active_flush_delay());
+    assert_eq!(composer.current_text(), "a<image>XYZe");
+    assert_eq!(recovery.text, composer.current_text());
+    assert_eq!(
+        recovery.text_elements,
+        composer.draft_snapshot().text_elements
+    );
+}
