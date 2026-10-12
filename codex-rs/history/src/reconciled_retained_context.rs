@@ -4,6 +4,7 @@
 //! Legacy candidates use the same source matching without inventing an acceptance order.
 //! Heartbeat versions coalesce after ordering; the latest input turn remains independent.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -51,10 +52,13 @@ impl<'a> ReconciledRetainedContext<'a> {
                 });
         let recover = retained_context.is_none_or(|context| !context.user_messages_complete());
         let mut matched_entries = HashSet::new();
-        let mut matched_ids = retained_entries
+        // Seed with retained identities; grow as live sources are matched or recovered.
+        let mut known_message_ids = retained_entries
             .iter()
             .filter_map(|(_, entry)| match entry {
-                RetainedContextEntry::UserMessage(message) => message.message_id.clone(),
+                RetainedContextEntry::UserMessage(message) => {
+                    message.message_id.as_deref().map(Cow::Borrowed)
+                }
                 RetainedContextEntry::AssistantMessage(_)
                 | RetainedContextEntry::VerifiedAnswer(_) => None,
             })
@@ -79,7 +83,7 @@ impl<'a> ReconciledRetainedContext<'a> {
             if message
                 .message_id
                 .as_ref()
-                .is_some_and(|id| matched_ids.contains(id))
+                .is_some_and(|id| known_message_ids.contains(id.as_str()))
             {
                 continue;
             }
@@ -96,7 +100,7 @@ impl<'a> ReconciledRetainedContext<'a> {
                 })
             {
                 if let Some(id) = &message.message_id {
-                    matched_ids.insert(id.clone());
+                    known_message_ids.insert(Cow::Owned(id.clone()));
                 }
                 continue;
             }
@@ -111,7 +115,7 @@ impl<'a> ReconciledRetainedContext<'a> {
                 continue;
             };
             if let Some(id) = &message.message_id {
-                matched_ids.insert(id.clone());
+                known_message_ids.insert(Cow::Owned(id.clone()));
             }
             recovered.push((order, message));
         }
