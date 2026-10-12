@@ -4,6 +4,7 @@
 //! Legacy candidates use the same source matching without inventing an acceptance order.
 //! Heartbeat versions coalesce after ordering; the latest input turn remains independent.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -51,6 +52,17 @@ impl<'a> ReconciledRetainedContext<'a> {
                 });
         let recover = retained_context.is_none_or(|context| !context.user_messages_complete());
         let mut matched_entries = HashSet::new();
+        // Seed with retained identities; grow as live sources are matched or recovered.
+        let mut known_message_ids = retained_entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                RetainedContextEntry::UserMessage(message) => {
+                    message.message_id.as_deref().map(Cow::Borrowed)
+                }
+                RetainedContextEntry::AssistantMessage(_)
+                | RetainedContextEntry::VerifiedAnswer(_) => None,
+            })
+            .collect::<HashSet<_>>();
         let mut used_orders = retained_entries
             .iter()
             .map(|(order, _)| *order)
@@ -66,6 +78,15 @@ impl<'a> ReconciledRetainedContext<'a> {
             if !recover {
                 continue;
             }
+            // An exact identity proves a replay before anonymous occurrence matching.
+            // Known sources can appear more than once in the surviving model history.
+            if message
+                .message_id
+                .as_ref()
+                .is_some_and(|id| known_message_ids.contains(id.as_str()))
+            {
+                continue;
+            }
             if retained_entries
                 .iter()
                 .enumerate()
@@ -73,9 +94,14 @@ impl<'a> ReconciledRetainedContext<'a> {
                     let RetainedContextEntry::UserMessage(retained) = entry else {
                         return false;
                     };
-                    same_user_message_source(retained, &message) && matched_entries.insert(index)
+                    retained.message_id.is_none()
+                        && same_user_message_source(retained, &message)
+                        && matched_entries.insert(index)
                 })
             {
+                if let Some(id) = &message.message_id {
+                    known_message_ids.insert(Cow::Owned(id.clone()));
+                }
                 continue;
             }
             // Queued steering can enter raw history after a later-accepted answer.
@@ -88,6 +114,9 @@ impl<'a> ReconciledRetainedContext<'a> {
                 missing_user_messages = true;
                 continue;
             };
+            if let Some(id) = &message.message_id {
+                known_message_ids.insert(Cow::Owned(id.clone()));
+            }
             recovered.push((order, message));
         }
         Self {
