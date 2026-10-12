@@ -10,6 +10,7 @@
 //! Handoff projection preserves saved heartbeat instructions and the active turn's skills.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
@@ -141,6 +142,7 @@ impl LocalAgentControl {
         );
         let mut latest_user_turn_id = reconciled.latest_user_turn_id.clone();
         let mut missing_root_instructions = reconciled.missing_user_messages;
+        let checkpoint = OnceCell::new();
         let mut messages = reconciled
             .ordered_entries()
             .filter_map(|(order, entry)| match entry {
@@ -149,19 +151,21 @@ impl LocalAgentControl {
                         // Older records may omit a large instruction. Recover that exact
                         // source while it remains available in the parent context.
                         let source = retained_context.source(entry);
-                        let checkpoint = root_history.guardian_history_checkpoint();
-                        let originals = root_history.annotated_items().iter().chain(
-                            checkpoint
-                                .as_ref()
-                                .into_iter()
-                                .flat_map(|checkpoint| checkpoint.0.iter()),
-                        );
                         let original =
                             crate::context_manager::ContextManager::retained_original_user_message(
                                 message,
                                 source.as_ref(),
-                                originals,
-                            );
+                                root_history.annotated_items().iter(),
+                            )
+                            .or_else(|| {
+                                let checkpoint = checkpoint
+                                    .get_or_init(|| root_history.guardian_history_checkpoint());
+                                crate::context_manager::ContextManager::retained_original_user_message(
+                                    message,
+                                    source.as_ref(),
+                                    checkpoint.as_ref().into_iter().flat_map(|checkpoint| checkpoint.0.iter()),
+                                )
+                            });
                         let Some(TurnItem::UserMessage(original)) =
                             original.and_then(parse_turn_item)
                         else {

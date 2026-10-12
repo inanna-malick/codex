@@ -539,7 +539,9 @@ impl ContextManager {
         I::Item: Deref<Target = ResponseItem>,
     {
         for item in items {
-            self.record_item_with_metadata(&item, /*metadata*/ None, policy);
+            self.record_item_with_metadata(
+                &item, /*metadata*/ None, policy, /*replay*/ false,
+            );
         }
     }
 
@@ -551,9 +553,12 @@ impl ContextManager {
         policy: TruncationPolicy,
     ) {
         for envelope in items {
-            if let Some(source) =
-                self.record_item_with_metadata(&envelope.item, envelope.metadata.as_ref(), policy)
-            {
+            if let Some(source) = self.record_item_with_metadata(
+                &envelope.item,
+                envelope.metadata.as_ref(),
+                policy,
+                /*replay*/ false,
+            ) {
                 envelope.metadata.get_or_insert_default().retained_source = Some(source);
             }
         }
@@ -565,20 +570,12 @@ impl ContextManager {
         envelope: &ResponseItemEnvelope,
         policy: TruncationPolicy,
     ) {
-        let captured =
-            self.record_item_with_metadata(&envelope.item, envelope.metadata.as_ref(), policy);
-        if let Some(source) = envelope
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.retained_source.as_ref())
-            && captured.as_ref().is_some_and(|captured| {
-                captured.id == source.id && captured.complete == source.complete
-            })
-            && Arc::make_mut(&mut self.retained_context).restore_source_revision(source)
-            && let Some(recorded) = Arc::make_mut(&mut self.items).last_mut()
-        {
-            recorded.metadata.get_or_insert_default().retained_source = Some(source.clone());
-        }
+        self.record_item_with_metadata(
+            &envelope.item,
+            envelope.metadata.as_ref(),
+            policy,
+            /*replay*/ true,
+        );
     }
 
     fn record_item_with_metadata(
@@ -586,6 +583,7 @@ impl ContextManager {
         item: &ResponseItem,
         metadata: Option<&CodexHarnessMetadata>,
         policy: TruncationPolicy,
+        replay: bool,
     ) -> Option<codex_history::RetainedSource> {
         if !is_api_message(item, metadata) {
             return None;
@@ -604,23 +602,34 @@ impl ContextManager {
                 .unwrap_or_else(|| with_serialization_allowance(policy));
             truncate_function_output_payload(output, policy, estimate_audio_token_count);
         }
-        if let Some(review_history) = &mut self.review_history
-            && !is_guardian_context_message(item)
-        {
-            review_history.record(&processed);
-        }
         if let Some(metadata) = metadata
             && Arc::make_mut(&mut self.retained_context).record_sender_user_messages(metadata)
         {
             self.user_message_revision = self.user_message_revision.saturating_add(1);
         }
-        let source = self.record_retained_message(
+        let mut source = self.record_retained_message(
             item,
             metadata,
             user_authorization::RetainedMessageSource::Original,
         );
+        if replay
+            && let Some(persisted) = metadata.and_then(|metadata| metadata.retained_source.as_ref())
+            && source.as_ref().is_some_and(|captured| {
+                captured.id == persisted.id && captured.complete == persisted.complete
+            })
+            && Arc::make_mut(&mut self.retained_context).restore_source_revision(persisted)
+        {
+            source = Some(persisted.clone());
+        }
         if let Some(source) = &source {
             processed.metadata.get_or_insert_default().retained_source = Some(source.clone());
+        }
+        // Both live history and its independent backup need the final source version,
+        // including a persisted revision restored during replay.
+        if let Some(review_history) = &mut self.review_history
+            && !is_guardian_context_message(item)
+        {
+            review_history.record(&processed);
         }
         Arc::make_mut(&mut self.items).push(processed);
         source

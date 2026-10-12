@@ -3468,6 +3468,75 @@ mod source_version_recovery {
             .expect("known original has a host version")
     }
 
+    #[test_case::test_case(false; "recorded")]
+    #[test_case::test_case(true; "replayed")]
+    fn recorded_checkpoint_recovers_omitted_source_after_live_history_eviction(replay: bool) {
+        let mut features =
+            crate::config::ManagedFeatures::from(codex_features::Features::with_defaults());
+        features
+            .disable(codex_features::Feature::GuardianReuseParentCompaction)
+            .unwrap();
+        let mut history =
+            ContextManager::for_session(&codex_protocol::protocol::SessionSource::Cli, &features);
+        let text = format!("Keep this instruction. {}", "\0".repeat(6_000));
+        let mut envelope = ResponseItemEnvelope::new(ResponseItem::Message {
+            id: Some(ResponseItemId::from_server("checkpoint-source".to_owned())),
+            role: "user".to_owned(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    turn_id: Some("checkpoint-turn".to_owned()),
+                    content_item_kinds: Some(vec![codex_protocol::models::ContentItemKind(
+                        "user.text".to_owned(),
+                    )]),
+                    ..Default::default()
+                },
+            ),
+        });
+        envelope.metadata = Some(CodexHarnessMetadata {
+            user_input_order: Some(0),
+            ..Default::default()
+        });
+        history.record_annotated_items(
+            std::slice::from_mut(&mut envelope),
+            TruncationPolicy::Tokens(10_000),
+        );
+        if replay {
+            history = ContextManager::for_session(
+                &codex_protocol::protocol::SessionSource::Cli,
+                &features,
+            );
+            history.replay_annotated_item(&envelope, TruncationPolicy::Tokens(10_000));
+            assert_eq!(
+                history.annotated_items()[0]
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .retained_source,
+                envelope.metadata.as_ref().unwrap().retained_source,
+            );
+        }
+        history.remove_first_item();
+        assert!(history.annotated_items().is_empty());
+        let context = history.retained_context();
+        let entry = context.ordered_entries().next().unwrap().1;
+        let RetainedContextEntry::UserMessage(message) = entry else {
+            panic!("expected retained user message");
+        };
+        assert!(message.text.is_empty() && !message.complete);
+        let source = context.source(entry).unwrap();
+        let checkpoint = history.guardian_history_checkpoint().unwrap();
+        assert_eq!(
+            ContextManager::retained_original_user_message(
+                message,
+                Some(&source),
+                checkpoint.0.iter(),
+            ),
+            Some(&envelope.item),
+        );
+    }
+
     #[test]
     fn corrected_omitted_excerpt_recovers_its_own_host_version() {
         let mut context = RetainedContext::default();
