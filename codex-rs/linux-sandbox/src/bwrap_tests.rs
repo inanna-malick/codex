@@ -1553,6 +1553,21 @@ fn unclosed_character_classes_are_escaped_for_ripgrep() {
     assert_eq!(glob, r"\[*.env");
 }
 
+#[test]
+fn brace_and_escaped_globs_split_for_ripgrep_at_first_metacharacter() {
+    let (brace_root, brace_glob) =
+        split_pattern_for_ripgrep("/tmp/repo/{.env,secrets.yml}", Path::new("/"))
+            .expect("brace alternation glob should split");
+    assert_eq!(brace_root.as_path(), Path::new("/tmp/repo"));
+    assert_eq!(brace_glob, "{.env,secrets.yml}");
+
+    let (escaped_root, escaped_glob) =
+        split_pattern_for_ripgrep(r"/tmp/repo/config\?.env", Path::new("/"))
+            .expect("backslash-escaped glob should split");
+    assert_eq!(escaped_root.as_path(), Path::new("/tmp/repo"));
+    assert_eq!(escaped_glob, r"config\?.env");
+}
+
 fn ripgrep_available() -> bool {
     Command::new(GLOB_SCAN_PROGRAM)
         .arg("--version")

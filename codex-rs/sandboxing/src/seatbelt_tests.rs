@@ -1163,6 +1163,19 @@ fn unreadable_globs_treat_unclosed_character_classes_as_literals() {
     assert!(!regex.is_match("/tmp/repo/local.env"));
 }
 
+#[test]
+fn unreadable_glob_policy_protects_descendants_when_scoped_glob_matches_directory() {
+    let policy = build_seatbelt_unreadable_glob_policy(&[
+        "/tmp/repo/**/secrets".to_string(),
+        "/tmp/repo/*/.aws".to_string(),
+        "/tmp/repo/{.aws,.ssh}".to_string(),
+    ]);
+
+    assert!(policy.contains(r#"(deny file-read* (regex #"^/tmp/repo/(.*/)?secrets(/.*)?$"))"#));
+    assert!(policy.contains(r#"(deny file-read* (regex #"^/tmp/repo/[^/]*/\.aws(/.*)?$"))"#));
+    assert!(policy.contains(r#"(deny file-read* (regex #"^/tmp/repo/(\.aws|\.ssh)(/.*)?$"))"#));
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_glob_policy_includes_canonicalized_static_prefix() {

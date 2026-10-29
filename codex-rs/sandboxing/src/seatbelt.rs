@@ -650,9 +650,9 @@ fn build_seatbelt_unreadable_glob_policy(
             let Some(mut regex) = seatbelt_regex_for_unreadable_glob(&pattern) else {
                 continue;
             };
-            if global_literal_basename {
+            if !regex.ends_with("(/.*)?$") {
                 // Replace the compiler's end anchor to also protect descendants
-                // when the matching basename belongs to a directory.
+                // when a matched entry is a directory.
                 regex.pop();
                 regex.push_str("(/.*)?$");
             }

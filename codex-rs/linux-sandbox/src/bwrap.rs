@@ -964,7 +964,7 @@ fn split_pattern_for_ripgrep(pattern: &str, cwd: &Path) -> Option<(AbsolutePathB
     let pattern = absolute_pattern.to_string_lossy();
     let first_glob_index = pattern
         .char_indices()
-        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))?;
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '\\').then_some(index))?;
     let static_prefix = &pattern[..first_glob_index];
     if static_prefix.is_empty() || static_prefix == "/" {
         return None;

@@ -534,7 +534,7 @@ fn callback_bind_host(callback_url: Option<&str>) -> &'static str {
     };
 
     match parsed.host_str() {
-        Some("localhost" | "127.0.0.1" | "::1") | None => "127.0.0.1",
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]") | None => "127.0.0.1",
         Some(_) => "0.0.0.0",
     }
 }
@@ -1603,5 +1603,26 @@ mod tests {
         let url = append_query_param("not a url", "resource", Some("api/resource"));
 
         assert_eq!(url, "not a url?resource=api%2Fresource");
+    }
+
+    #[test]
+    fn callback_bind_host_recognizes_bracketed_ipv6_loopback_urls() {
+        assert_eq!(callback_bind_host(None), "127.0.0.1");
+        assert_eq!(
+            callback_bind_host(Some("http://localhost:8080/callback")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            callback_bind_host(Some("http://127.0.0.1:8080/callback")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            callback_bind_host(Some("http://[::1]:8080/callback")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            callback_bind_host(Some("https://devbox.example.com/callback")),
+            "0.0.0.0"
+        );
     }
 }
